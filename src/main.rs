@@ -170,7 +170,7 @@ impl ClearEmailApp {
             labels.push(TextLabel {
                 text: badge_text,
                 x: 8.0 + (40.0 - est_w) / 2.0,
-                y: 97.0,
+                y: 84.0,
                 font_size: 10.0,
                 color: [0xff, 0xff, 0xff],
             });
@@ -405,9 +405,9 @@ impl Application for ClearEmailApp {
     fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
         let btn_compose = Button::new(10.0, 15.0, 36.0, 36.0).with_label("+");
         let mut paginator = Paginator::new(56.0, vec![
-            "📥 Inbox".to_string(),
-            "📤 Sent".to_string(),
-            "🗑️ Trash".to_string(),
+            "Inbox".to_string(),
+            "Sent".to_string(),
+            "Trash".to_string(),
         ]);
         paginator.tabs_rotated = true;
         paginator.tabs_at_top = false;
@@ -780,7 +780,7 @@ impl Application for ClearEmailApp {
         if inbox_unread > 0 {
             let bx = 8.0;
             let by = 70.0;
-            quads.push((bx + (40.0 - 22.0) / 2.0, by + 25.0, 22.0, 16.0, [0.20, 0.45, 0.85, 0.8]));
+            quads.push((bx + (40.0 - 22.0) / 2.0, by + 12.0, 22.0, 16.0, [0.20, 0.45, 0.85, 0.8]));
         }
 
         // 3. Email List Panel Separator
