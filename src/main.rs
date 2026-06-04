@@ -11,6 +11,15 @@ enum Folder {
     Inbox,
     Sent,
     Trash,
+    Accounts,
+}
+
+#[derive(Debug, Clone)]
+struct AccountInfo {
+    email: String,
+    imap: String,
+    smtp: String,
+    is_default: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -36,6 +45,9 @@ enum AppMessage {
     Reply,
     DeleteSelected,
     ToggleUnread,
+    SelectAccount(usize),
+    AddAccount,
+    MakeDefaultAccount,
 }
 
 struct ClearEmailApp {
@@ -60,6 +72,12 @@ struct ClearEmailApp {
     compose_body: TextBox,
     btn_compose_send: Button,
     btn_compose_cancel: Button,
+
+    // Accounts Management
+    accounts: Vec<AccountInfo>,
+    selected_account_idx: usize,
+    btn_add_account: Button,
+    btn_make_default: Button,
 
     // Application state
     emails: Vec<Email>,
@@ -176,87 +194,140 @@ impl ClearEmailApp {
             });
         }
 
-        // 2. Search box labels
-        self.search_box.prepare_text(font_system);
-        for (label, bounds) in self.search_box.text_labels_with_bounds() {
-            let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
-            let mut buf = Buffer::new(font_system, metrics);
-            buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
-            buf.shape_until_scroll(font_system, true);
-            self.text_items.push(TextItem {
-                buffer: buf,
-                x: label.x,
-                y: label.y,
-                color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
-                bounds,
-            });
-        }
-
-        // 3. Email List Labels
-        let current_folder_str = match self.current_folder {
-            Folder::Inbox => "inbox",
-            Folder::Sent => "sent",
-            Folder::Trash => "trash",
-        };
-        let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
-        let search_lower = search_text.to_lowercase();
-        let filtered: Vec<&Email> = self.emails.iter()
-            .filter(|e| e.folder == current_folder_str)
-            .filter(|e| {
-                if search_lower.is_empty() {
-                    true
-                } else {
-                    e.from.to_lowercase().contains(&search_lower) ||
-                    e.subject.to_lowercase().contains(&search_lower) ||
-                    e.body.to_lowercase().contains(&search_lower)
-                }
-            })
-            .collect();
-
-        for (idx, email) in filtered.iter().enumerate() {
-            if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                // Sender name
-                labels.push(TextLabel {
-                    text: if email.from.len() > 24 { format!("{}...", &email.from[..21]) } else { email.from.clone() },
-                    x: 86.0,
-                    y: draw_y + 6.0,
-                    font_size: 11.0,
-                    color: if !email.read { [0xff, 0xff, 0xff] } else { [0xb0, 0xb0, 0xb8] },
-                });
-
-                // Date
-                labels.push(TextLabel {
-                    text: email.date.clone(),
-                    x: 316.0,
-                    y: draw_y + 7.0,
-                    font_size: 9.0,
-                    color: [0x70, 0x70, 0x75],
-                });
-
-                // Subject
-                labels.push(TextLabel {
-                    text: if email.subject.len() > 32 { format!("{}...", &email.subject[..29]) } else { email.subject.clone() },
-                    x: 86.0,
-                    y: draw_y + 20.0,
-                    font_size: 10.0,
-                    color: if !email.read { [0x3a, 0x9a, 0xff] } else { [0x83, 0x83, 0x8a] },
-                });
-
-                // Snippet
-                let snippet_raw = email.body.replace('\n', " ");
-                let snippet = if snippet_raw.len() > 40 { format!("{}...", &snippet_raw[..37]) } else { snippet_raw };
-                labels.push(TextLabel {
-                    text: snippet,
-                    x: 86.0,
-                    y: draw_y + 34.0,
-                    font_size: 9.0,
-                    color: [0x60, 0x60, 0x65],
+        // 2. Search box labels / Accounts add button
+        if self.current_folder == Folder::Accounts {
+            labels.extend(self.btn_add_account.text_labels());
+        } else {
+            self.search_box.prepare_text(font_system);
+            for (label, bounds) in self.search_box.text_labels_with_bounds() {
+                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
+                let mut buf = Buffer::new(font_system, metrics);
+                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
+                buf.shape_until_scroll(font_system, true);
+                self.text_items.push(TextItem {
+                    buffer: buf,
+                    x: label.x,
+                    y: label.y,
+                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
+                    bounds,
                 });
             }
         }
 
+        // 3. Email List Labels / Accounts list labels
+        if self.current_folder == Folder::Accounts {
+            for (idx, acc) in self.accounts.iter().enumerate() {
+                if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
+                    labels.push(TextLabel {
+                        text: acc.email.clone(),
+                        x: 86.0,
+                        y: draw_y + 12.0,
+                        font_size: 11.0,
+                        color: [0xff, 0xff, 0xff],
+                    });
+
+                    labels.push(TextLabel {
+                        text: if acc.is_default { "Default Account".to_string() } else { "Secondary Account".to_string() },
+                        x: 86.0,
+                        y: draw_y + 28.0,
+                        font_size: 9.0,
+                        color: if acc.is_default { [0x3a, 0xff, 0x80] } else { [0x70, 0x70, 0x75] },
+                    });
+                }
+            }
+        } else {
+            let current_folder_str = match self.current_folder {
+                Folder::Inbox => "inbox",
+                Folder::Sent => "sent",
+                Folder::Trash => "trash",
+                _ => "inbox",
+            };
+            let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
+            let search_lower = search_text.to_lowercase();
+            let filtered: Vec<&Email> = self.emails.iter()
+                .filter(|e| e.folder == current_folder_str)
+                .filter(|e| {
+                    if search_lower.is_empty() {
+                        true
+                    } else {
+                        e.from.to_lowercase().contains(&search_lower) ||
+                        e.subject.to_lowercase().contains(&search_lower) ||
+                        e.body.to_lowercase().contains(&search_lower)
+                    }
+                })
+                .collect();
+
+            for (idx, email) in filtered.iter().enumerate() {
+                if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
+                    // Sender name
+                    labels.push(TextLabel {
+                        text: if email.from.len() > 24 { format!("{}...", &email.from[..21]) } else { email.from.clone() },
+                        x: 86.0,
+                        y: draw_y + 6.0,
+                        font_size: 11.0,
+                        color: if !email.read { [0xff, 0xff, 0xff] } else { [0xb0, 0xb0, 0xb8] },
+                    });
+
+                    // Date
+                    labels.push(TextLabel {
+                        text: email.date.clone(),
+                        x: 316.0,
+                        y: draw_y + 7.0,
+                        font_size: 9.0,
+                        color: [0x70, 0x70, 0x75],
+                    });
+
+                    // Subject
+                    labels.push(TextLabel {
+                        text: if email.subject.len() > 32 { format!("{}...", &email.subject[..29]) } else { email.subject.clone() },
+                        x: 86.0,
+                        y: draw_y + 20.0,
+                        font_size: 10.0,
+                        color: if !email.read { [0x3a, 0x9a, 0xff] } else { [0x83, 0x83, 0x8a] },
+                    });
+
+                    // Snippet
+                    let snippet_raw = email.body.replace('\n', " ");
+                    let snippet = if snippet_raw.len() > 40 { format!("{}...", &snippet_raw[..37]) } else { snippet_raw };
+                    labels.push(TextLabel {
+                        text: snippet,
+                        x: 86.0,
+                        y: draw_y + 34.0,
+                        font_size: 9.0,
+                        color: [0x60, 0x60, 0x65],
+                    });
+                }
+            }
+        }
+
         // 4. Detail View Content
-        if let Some(selected_id) = self.selected_email_id {
+        if self.current_folder == Folder::Accounts {
+            if self.selected_account_idx < self.accounts.len() {
+                let acc = &self.accounts[self.selected_account_idx];
+                labels.extend(self.btn_make_default.text_labels());
+
+                // Subject Header (Account email)
+                labels.push(TextLabel {
+                    text: acc.email.clone(),
+                    x: 391.0,
+                    y: 60.0,
+                    font_size: 15.0,
+                    color: [0xff, 0xff, 0xff],
+                });
+
+                // Settings details
+                labels.push(TextLabel { text: format!("Incoming Server (IMAP): {}", acc.imap), x: 391.0, y: 95.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
+                labels.push(TextLabel { text: format!("Outgoing Server (SMTP): {}", acc.smtp), x: 391.0, y: 120.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
+                labels.push(TextLabel { text: format!("Authentication:          SSL/TLS, Normal Password"), x: 391.0, y: 145.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                labels.push(TextLabel {
+                    text: format!("Default Account:         {}", if acc.is_default { "Yes" } else { "No" }),
+                    x: 391.0,
+                    y: 170.0,
+                    font_size: 11.0,
+                    color: if acc.is_default { [0x3a, 0xff, 0x80] } else { [0x83, 0x83, 0x8a] },
+                });
+            }
+        } else if let Some(selected_id) = self.selected_email_id {
             if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
                 labels.extend(self.btn_reply.text_labels());
                 labels.extend(self.btn_delete.text_labels());
@@ -408,6 +479,7 @@ impl Application for ClearEmailApp {
             "Inbox".to_string(),
             "Sent".to_string(),
             "Trash".to_string(),
+            "Accounts".to_string(),
         ]);
         paginator.tabs_rotated = true;
         paginator.tabs_at_top = false;
@@ -421,6 +493,23 @@ impl Application for ClearEmailApp {
         let btn_reply = Button::new(391.0, 8.0, 70.0, 26.0).with_label("Reply");
         let btn_delete = Button::new_reset(471.0, 8.0, 80.0, 26.0).with_label("Delete");
         let btn_unread = Button::new(561.0, 8.0, 110.0, 26.0).with_label("Mark Unread");
+
+        let accounts = vec![
+            AccountInfo {
+                email: "lsgalante@clear-ui.org".to_string(),
+                imap: "imap.clear-ui.org:993".to_string(),
+                smtp: "smtp.clear-ui.org:465".to_string(),
+                is_default: true,
+            },
+            AccountInfo {
+                email: "lucas.galante@codeberg.org".to_string(),
+                imap: "mail.codeberg.org:993".to_string(),
+                smtp: "mail.codeberg.org:465".to_string(),
+                is_default: false,
+            },
+        ];
+        let btn_add_account = Button::new(66.0, 15.0, 300.0, 26.0).with_label("+ Add Account");
+        let btn_make_default = Button::new(391.0, 8.0, 120.0, 26.0).with_label("Make Default");
 
         let mut detail_body = TextBox::new(String::new()).with_multiline(true).with_draw_bg_border(false);
         detail_body.font_size = 12.0;
@@ -454,6 +543,10 @@ impl Application for ClearEmailApp {
             compose_body,
             btn_compose_send,
             btn_compose_cancel,
+            accounts,
+            selected_account_idx: 0,
+            btn_add_account,
+            btn_make_default,
             emails,
             current_folder: Folder::Inbox,
             selected_email_id: None,
@@ -603,6 +696,31 @@ impl Application for ClearEmailApp {
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
+            AppMessage::SelectAccount(idx) => {
+                self.selected_account_idx = idx;
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::AddAccount => {
+                let next_idx = self.accounts.len() + 1;
+                self.accounts.push(AccountInfo {
+                    email: format!("user{}@clear-ui.org", next_idx),
+                    imap: format!("imap{}.clear-ui.org:993", next_idx),
+                    smtp: format!("smtp{}.clear-ui.org:465", next_idx),
+                    is_default: false,
+                });
+                self.status_message = Some(("New Mock Account Added".to_string(), 4.0));
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::MakeDefaultAccount => {
+                for (i, acc) in self.accounts.iter_mut().enumerate() {
+                    acc.is_default = i == self.selected_account_idx;
+                }
+                self.status_message = Some(("Default Account Changed".to_string(), 4.0));
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
         }
     }
 
@@ -636,6 +754,7 @@ impl Application for ClearEmailApp {
             Folder::Inbox => "inbox",
             Folder::Sent => "sent",
             Folder::Trash => "trash",
+            Folder::Accounts => "accounts",
         };
 
         if self.needs_rebuild || size_changed {
@@ -649,19 +768,23 @@ impl Application for ClearEmailApp {
                 Folder::Inbox => 0,
                 Folder::Sent => 1,
                 Folder::Trash => 2,
+                Folder::Accounts => 3,
             };
             self.paginator.set_selected_page(folder_idx);
 
-            // Search box and Scrolling list
-            self.search_box.set_rect(66.0, 15.0, 300.0, 26.0);
-
-            // Get filtered emails count for bounds setup
-            let filtered_count = {
-                let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
-                let search_lower = search_text.to_lowercase();
+            // Search box / Add Account and Scrolling list
+            let list_count = if self.current_folder == Folder::Accounts {
+                self.btn_add_account.set_rect(66.0, 15.0, 300.0, 26.0);
+                self.accounts.len()
+            } else {
+                self.search_box.set_rect(66.0, 15.0, 300.0, 26.0);
+                
+                // Get filtered emails count for bounds setup
                 self.emails.iter()
                     .filter(|e| e.folder == current_folder_str)
                     .filter(|e| {
+                        let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
+                        let search_lower = search_text.to_lowercase();
                         if search_lower.is_empty() {
                             true
                         } else {
@@ -674,10 +797,10 @@ impl Application for ClearEmailApp {
             };
 
             self.email_list.set_rect(66.0, 55.0, 300.0, h_f32 - 70.0);
-            self.email_list.update_bounds(filtered_count, 55.0, h_f32 - 70.0);
+            self.email_list.update_bounds(list_count, 55.0, h_f32 - 70.0);
 
-            if self.email_buttons.len() != filtered_count {
-                self.email_buttons = (0..filtered_count)
+            if self.email_buttons.len() != list_count {
+                self.email_buttons = (0..list_count)
                     .map(|_| Button::new_list_row(0.0, 0.0, 0.0, 0.0))
                     .collect();
             }
@@ -690,7 +813,9 @@ impl Application for ClearEmailApp {
             };
 
             // Get filtered email IDs and selection states
-            let filtered_email_ids: Vec<(usize, bool)> = {
+            let filtered_email_ids: Vec<(usize, bool)> = if self.current_folder == Folder::Accounts {
+                Vec::new()
+            } else {
                 let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
                 let search_lower = search_text.to_lowercase();
                 self.emails.iter()
@@ -708,27 +833,43 @@ impl Application for ClearEmailApp {
                     .collect()
             };
 
-            for (idx, &(_email_id, is_selected)) in filtered_email_ids.iter().enumerate() {
-                self.email_buttons[idx].selected = is_selected;
-                if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                    self.email_buttons[idx].set_rect(66.0, draw_y, 300.0, 54.0);
-                } else {
-                    self.email_buttons[idx].set_rect(-9999.0, -9999.0, 0.0, 0.0);
-                }
-            }
-
-            // Detail View
-            if let Some((read, body)) = selected_email_state {
-                self.btn_reply.set_rect(391.0, 8.0, 70.0, 26.0);
-                self.btn_delete.set_rect(471.0, 8.0, 80.0, 26.0);
-                self.btn_unread.set_rect(561.0, 8.0, 110.0, 26.0);
-                if let Some(base) = self.btn_unread.base_mut() {
-                    base.label = Some((if read { "Mark Unread" } else { "Mark Read" }).to_string());
+            if self.current_folder == Folder::Accounts {
+                for idx in 0..self.accounts.len() {
+                    self.email_buttons[idx].selected = idx == self.selected_account_idx;
+                    if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
+                        self.email_buttons[idx].set_rect(66.0, draw_y, 300.0, 54.0);
+                    } else {
+                        self.email_buttons[idx].set_rect(-9999.0, -9999.0, 0.0, 0.0);
+                    }
                 }
 
-                let detail_w = (w_f32 - 406.0).max(100.0);
-                self.detail_body.set_rect(391.0, 170.0, detail_w, (h_f32 - 190.0).max(100.0));
-                self.detail_body.text = body;
+                // Detail View for selected account
+                if self.selected_account_idx < self.accounts.len() {
+                    self.btn_make_default.set_rect(391.0, 8.0, 120.0, 26.0);
+                }
+            } else {
+                for (idx, &(_email_id, is_selected)) in filtered_email_ids.iter().enumerate() {
+                    self.email_buttons[idx].selected = is_selected;
+                    if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
+                        self.email_buttons[idx].set_rect(66.0, draw_y, 300.0, 54.0);
+                    } else {
+                        self.email_buttons[idx].set_rect(-9999.0, -9999.0, 0.0, 0.0);
+                    }
+                }
+
+                // Detail View
+                if let Some((read, body)) = selected_email_state {
+                    self.btn_reply.set_rect(391.0, 8.0, 70.0, 26.0);
+                    self.btn_delete.set_rect(471.0, 8.0, 80.0, 26.0);
+                    self.btn_unread.set_rect(561.0, 8.0, 110.0, 26.0);
+                    if let Some(base) = self.btn_unread.base_mut() {
+                        base.label = Some((if read { "Mark Unread" } else { "Mark Read" }).to_string());
+                    }
+
+                    let detail_w = (w_f32 - 406.0).max(100.0);
+                    self.detail_body.set_rect(391.0, 170.0, detail_w, (h_f32 - 190.0).max(100.0));
+                    self.detail_body.text = body;
+                }
             }
 
             // Compose inputs layout
@@ -749,20 +890,24 @@ impl Application for ClearEmailApp {
         }
 
         // Now compute `filtered` only for rendering (immutable borrow of self)
-        let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
-        let search_lower = search_text.to_lowercase();
-        let filtered: Vec<&Email> = self.emails.iter()
-            .filter(|e| e.folder == current_folder_str)
-            .filter(|e| {
-                if search_lower.is_empty() {
-                    true
-                } else {
-                    e.from.to_lowercase().contains(&search_lower) ||
-                    e.subject.to_lowercase().contains(&search_lower) ||
-                    e.body.to_lowercase().contains(&search_lower)
-                }
-            })
-            .collect();
+        let filtered: Vec<&Email> = if self.current_folder == Folder::Accounts {
+            Vec::new()
+        } else {
+            let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
+            let search_lower = search_text.to_lowercase();
+            self.emails.iter()
+                .filter(|e| e.folder == current_folder_str)
+                .filter(|e| {
+                    if search_lower.is_empty() {
+                        true
+                    } else {
+                        e.from.to_lowercase().contains(&search_lower) ||
+                        e.subject.to_lowercase().contains(&search_lower) ||
+                        e.body.to_lowercase().contains(&search_lower)
+                    }
+                })
+                .collect()
+        };
 
         // 1. General window background (deep slate blue)
         quads.push((0.0, 0.0, w_f32, h_f32, [0.05, 0.05, 0.07, 1.0]));
@@ -786,17 +931,26 @@ impl Application for ClearEmailApp {
         // 3. Email List Panel Separator
         quads.push((376.0, 0.0, 1.0, h_f32, [0.18, 0.18, 0.22, 1.0]));
 
-        // Search box and List
-        quads.extend(self.search_box.extra_quads());
+        // Search box / Add Account and List
+        if self.current_folder == Folder::Accounts {
+            quads.extend(self.btn_add_account.extra_quads());
+        } else {
+            quads.extend(self.search_box.extra_quads());
+        }
         quads.extend(self.email_list.extra_quads());
 
-        // Visible Email List Item Buttons
-        for (idx, _) in filtered.iter().enumerate() {
+        // Visible List Item Buttons
+        let list_len = if self.current_folder == Folder::Accounts {
+            self.accounts.len()
+        } else {
+            filtered.len()
+        };
+        for idx in 0..list_len {
             if self.email_list.get_item_draw_y(idx, 0.0).is_some() {
                 quads.extend(self.email_buttons[idx].extra_quads());
 
-                // Blue dot/unread indicator for this row
-                if !filtered[idx].read {
+                // Blue dot/unread indicator for this row (emails only)
+                if self.current_folder != Folder::Accounts && !filtered[idx].read {
                     if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
                         quads.push((74.0, draw_y + 12.0, 6.0, 6.0, [0.20, 0.45, 0.85, 1.0]));
                     }
@@ -805,7 +959,15 @@ impl Application for ClearEmailApp {
         }
 
         // 4. Detail View Area
-        if let Some(selected_id) = self.selected_email_id {
+        if self.current_folder == Folder::Accounts {
+            if self.selected_account_idx < self.accounts.len() {
+                // Top action toolbar background
+                quads.push((377.0, 0.0, w_f32 - 377.0, 42.0, [0.08, 0.08, 0.12, 1.0]));
+                quads.push((377.0, 42.0, w_f32 - 377.0, 1.0, [0.18, 0.18, 0.22, 1.0]));
+
+                quads.extend(self.btn_make_default.extra_quads());
+            }
+        } else if let Some(selected_id) = self.selected_email_id {
             if self.emails.iter().any(|e| e.id == selected_id) {
                 // Top action toolbar background
                 quads.push((377.0, 0.0, w_f32 - 377.0, 42.0, [0.08, 0.08, 0.12, 1.0]));
@@ -865,8 +1027,12 @@ impl Application for ClearEmailApp {
                 if self.paginator.on_cursor_moved(px, py) { changed = true; }
             }
 
-            // Search and lists
-            if self.search_box.on_cursor_moved(px, py) { changed = true; }
+            // Search / Add account and lists
+            if self.current_folder == Folder::Accounts {
+                if self.btn_add_account.on_cursor_moved(px, py) { changed = true; }
+            } else {
+                if self.search_box.on_cursor_moved(px, py) { changed = true; }
+            }
             if self.email_list.on_cursor_moved(px, py) { changed = true; }
 
             for btn in &mut self.email_buttons {
@@ -876,7 +1042,11 @@ impl Application for ClearEmailApp {
             }
 
             // Detail view buttons
-            if self.selected_email_id.is_some() {
+            if self.current_folder == Folder::Accounts {
+                if self.selected_account_idx < self.accounts.len() {
+                    if self.btn_make_default.on_cursor_moved(px, py) { changed = true; }
+                }
+            } else if self.selected_email_id.is_some() {
                 if self.btn_reply.on_cursor_moved(px, py) { changed = true; }
                 if self.btn_delete.on_cursor_moved(px, py) { changed = true; }
                 if self.btn_unread.on_cursor_moved(px, py) { changed = true; }
@@ -945,6 +1115,7 @@ impl Application for ClearEmailApp {
                             0 => Folder::Inbox,
                             1 => Folder::Sent,
                             2 => Folder::Trash,
+                            3 => Folder::Accounts,
                             _ => Folder::Inbox,
                         };
                         msg_out = Some(AppMessage::SwitchFolder(folder));
@@ -952,50 +1123,75 @@ impl Application for ClearEmailApp {
                 }
             }
 
-            // Search input
-            if self.search_box.mouse_input(button, state, px, py) {
-                changed = true;
-                if self.search_box.take_change() {
-                    msg_out = Some(AppMessage::SearchChanged);
-                }
-            } else if state == ElementState::Pressed && button == MouseButton::Left {
-                self.search_box.unfocus();
-                changed = true;
-            }
-
-            // Scrolling list items
-            let current_folder_str = match self.current_folder {
-                Folder::Inbox => "inbox",
-                Folder::Sent => "sent",
-                Folder::Trash => "trash",
-            };
-            let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
-            let search_lower = search_text.to_lowercase();
-            let filtered: Vec<&Email> = self.emails.iter()
-                .filter(|e| e.folder == current_folder_str)
-                .filter(|e| {
-                    if search_lower.is_empty() {
-                        true
-                    } else {
-                        e.from.to_lowercase().contains(&search_lower) ||
-                        e.subject.to_lowercase().contains(&search_lower) ||
-                        e.body.to_lowercase().contains(&search_lower)
+            if self.current_folder == Folder::Accounts {
+                if self.btn_add_account.mouse_input(button, state, px, py) {
+                    changed = true;
+                    if state == ElementState::Released && self.btn_add_account.take_click() {
+                        msg_out = Some(AppMessage::AddAccount);
                     }
-                })
-                .collect();
+                }
+            } else {
+                // Search input
+                if self.search_box.mouse_input(button, state, px, py) {
+                    changed = true;
+                    if self.search_box.take_change() {
+                        msg_out = Some(AppMessage::SearchChanged);
+                    }
+                } else if state == ElementState::Pressed && button == MouseButton::Left {
+                    self.search_box.unfocus();
+                    changed = true;
+                }
+            }
 
             if self.email_list.mouse_input(button, state, px, py) {
                 changed = true;
             }
 
-            for (idx, email) in filtered.iter().enumerate() {
-                if idx < self.email_buttons.len() {
-                    let btn = &mut self.email_buttons[idx];
-                    if btn.rect().0 > -9000.0 {
-                        if btn.mouse_input(button, state, px, py) {
-                            changed = true;
-                            if state == ElementState::Released && btn.take_click() {
-                                msg_out = Some(AppMessage::SelectEmail(email.id));
+            if self.current_folder == Folder::Accounts {
+                for (idx, _) in self.accounts.iter().enumerate() {
+                    if idx < self.email_buttons.len() {
+                        let btn = &mut self.email_buttons[idx];
+                        if btn.rect().0 > -9000.0 {
+                            if btn.mouse_input(button, state, px, py) {
+                                changed = true;
+                                if state == ElementState::Released && btn.take_click() {
+                                    msg_out = Some(AppMessage::SelectAccount(idx));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                let current_folder_str = match self.current_folder {
+                    Folder::Inbox => "inbox",
+                    Folder::Sent => "sent",
+                    Folder::Trash => "trash",
+                    _ => "inbox",
+                };
+                let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
+                let search_lower = search_text.to_lowercase();
+                let filtered: Vec<&Email> = self.emails.iter()
+                    .filter(|e| e.folder == current_folder_str)
+                    .filter(|e| {
+                        if search_lower.is_empty() {
+                            true
+                        } else {
+                            e.from.to_lowercase().contains(&search_lower) ||
+                            e.subject.to_lowercase().contains(&search_lower) ||
+                            e.body.to_lowercase().contains(&search_lower)
+                        }
+                    })
+                    .collect();
+
+                for (idx, email) in filtered.iter().enumerate() {
+                    if idx < self.email_buttons.len() {
+                        let btn = &mut self.email_buttons[idx];
+                        if btn.rect().0 > -9000.0 {
+                            if btn.mouse_input(button, state, px, py) {
+                                changed = true;
+                                if state == ElementState::Released && btn.take_click() {
+                                    msg_out = Some(AppMessage::SelectEmail(email.id));
+                                }
                             }
                         }
                     }
@@ -1003,7 +1199,16 @@ impl Application for ClearEmailApp {
             }
 
             // Detail View action buttons
-            if self.selected_email_id.is_some() {
+            if self.current_folder == Folder::Accounts {
+                if self.selected_account_idx < self.accounts.len() {
+                    if self.btn_make_default.mouse_input(button, state, px, py) {
+                        changed = true;
+                        if state == ElementState::Released && self.btn_make_default.take_click() {
+                            msg_out = Some(AppMessage::MakeDefaultAccount);
+                        }
+                    }
+                }
+            } else if self.selected_email_id.is_some() {
                 if self.btn_reply.mouse_input(button, state, px, py) {
                     changed = true;
                     if state == ElementState::Released && self.btn_reply.take_click() {
@@ -1083,15 +1288,17 @@ impl Application for ClearEmailApp {
                             handled = true;
                         }
                         "f" => {
-                            self.search_box.focus();
-                            handled = true;
+                            if self.current_folder != Folder::Accounts {
+                                self.search_box.focus();
+                                handled = true;
+                            }
                         }
                         _ => {}
                     }
                 }
             }
 
-            if !handled && self.search_box.editing {
+            if !handled && self.current_folder != Folder::Accounts && self.search_box.editing {
                 if self.search_box.keyboard_input(event) {
                     handled = true;
                     if self.search_box.take_change() {
@@ -1102,7 +1309,7 @@ impl Application for ClearEmailApp {
 
             // Escape unfocuses search
             if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(clear_ui::widget::NamedKey::Escape) {
-                if self.search_box.editing {
+                if self.current_folder != Folder::Accounts && self.search_box.editing {
                     self.search_box.unfocus();
                     handled = true;
                 }
