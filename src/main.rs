@@ -3,7 +3,7 @@ use glyphon::{FontSystem, Buffer, Metrics, Attrs};
 use clear_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use clear_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, TextItem, Widget,
-    TextBox, Button, TextLabel, Key, ScrollingList
+    TextBox, Button, TextLabel, Key, ScrollingList, Paginator
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -41,9 +41,7 @@ enum AppMessage {
 struct ClearEmailApp {
     // Navigation / Sidebar
     btn_compose: Button,
-    btn_inbox: Button,
-    btn_sent: Button,
-    btn_trash: Button,
+    paginator: Paginator,
 
     // Search and List View
     search_box: TextBox,
@@ -162,9 +160,7 @@ impl ClearEmailApp {
 
         // 1. Sidebar Buttons text labels
         labels.extend(self.btn_compose.text_labels());
-        labels.extend(self.btn_inbox.text_labels());
-        labels.extend(self.btn_sent.text_labels());
-        labels.extend(self.btn_trash.text_labels());
+        labels.extend(self.paginator.text_labels());
 
         // Sidebar Folder Badges
         let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
@@ -172,7 +168,7 @@ impl ClearEmailApp {
             labels.push(TextLabel {
                 text: inbox_unread.to_string(),
                 x: 145.0,
-                y: 77.0,
+                y: 82.0,
                 font_size: 10.0,
                 color: [0xff, 0xff, 0xff],
             });
@@ -403,9 +399,14 @@ impl Application for ClearEmailApp {
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
         let btn_compose = Button::new(15.0, 20.0, 150.0, 32.0).with_label("+ Compose");
-        let btn_inbox = Button::new(15.0, 70.0, 150.0, 28.0).with_label("📥 Inbox");
-        let btn_sent = Button::new(15.0, 105.0, 150.0, 28.0).with_label("📤 Sent");
-        let btn_trash = Button::new(15.0, 140.0, 150.0, 28.0).with_label("🗑️ Trash");
+        let mut paginator = Paginator::new(180.0, vec![
+            "📥 Inbox".to_string(),
+            "📤 Sent".to_string(),
+            "🗑️ Trash".to_string(),
+        ]);
+        paginator.tabs_rotated = false;
+        paginator.tabs_at_top = false;
+        paginator.tab_y_offset = 70.0;
 
         let mut search_box = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
         search_box.font_size = 11.0;
@@ -435,9 +436,7 @@ impl Application for ClearEmailApp {
 
         Self {
             btn_compose,
-            btn_inbox,
-            btn_sent,
-            btn_trash,
+            paginator,
             search_box,
             email_list,
             email_buttons: Vec::new(),
@@ -611,6 +610,10 @@ impl Application for ClearEmailApp {
                 self.needs_rebuild = true;
             }
         }
+        if self.paginator.tick(dt) {
+            *needs_rebuild = true;
+            self.needs_rebuild = true;
+        }
     }
 
     fn view(&mut self, quads: &mut Vec<(f32, f32, f32, f32, [f32; 4])>, size: LogicalSize, scale: f64) {
@@ -633,14 +636,16 @@ impl Application for ClearEmailApp {
         if self.needs_rebuild || size_changed {
             // Sidebar buttons layout
             self.btn_compose.set_rect(15.0, 20.0, 150.0, 32.0);
-            self.btn_inbox.set_rect(15.0, 70.0, 150.0, 28.0);
-            self.btn_sent.set_rect(15.0, 105.0, 150.0, 28.0);
-            self.btn_trash.set_rect(15.0, 140.0, 150.0, 28.0);
 
-            // Selection states
-            self.btn_inbox.selected = self.current_folder == Folder::Inbox;
-            self.btn_sent.selected = self.current_folder == Folder::Sent;
-            self.btn_trash.selected = self.current_folder == Folder::Trash;
+            // Set paginator layout
+            self.paginator.set_scale_factor(scale as f32);
+            self.paginator.set_rect(0.0, 0.0, 180.0, h_f32);
+            let folder_idx = match self.current_folder {
+                Folder::Inbox => 0,
+                Folder::Sent => 1,
+                Folder::Trash => 2,
+            };
+            self.paginator.set_selected_page(folder_idx);
 
             // Search box and Scrolling list
             self.search_box.set_rect(190.0, 15.0, 300.0, 26.0);
@@ -763,9 +768,7 @@ impl Application for ClearEmailApp {
 
         // Compose Button and Folders Graphics
         quads.extend(self.btn_compose.extra_quads());
-        quads.extend(self.btn_inbox.extra_quads());
-        quads.extend(self.btn_sent.extra_quads());
-        quads.extend(self.btn_trash.extra_quads());
+        quads.extend(self.paginator.extra_quads());
 
         // Draw badge pill for inbox unread
         let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
@@ -851,9 +854,9 @@ impl Application for ClearEmailApp {
         } else {
             // Sidebar buttons
             if self.btn_compose.on_cursor_moved(px, py) { changed = true; }
-            if self.btn_inbox.on_cursor_moved(px, py) { changed = true; }
-            if self.btn_sent.on_cursor_moved(px, py) { changed = true; }
-            if self.btn_trash.on_cursor_moved(px, py) { changed = true; }
+            if px < 180.0 {
+                if self.paginator.on_cursor_moved(px, py) { changed = true; }
+            }
 
             // Search and lists
             if self.search_box.on_cursor_moved(px, py) { changed = true; }
@@ -926,22 +929,19 @@ impl Application for ClearEmailApp {
                     msg_out = Some(AppMessage::ComposeNew);
                 }
             }
-            if self.btn_inbox.mouse_input(button, state, px, py) {
-                changed = true;
-                if state == ElementState::Released && self.btn_inbox.take_click() {
-                    msg_out = Some(AppMessage::SwitchFolder(Folder::Inbox));
-                }
-            }
-            if self.btn_sent.mouse_input(button, state, px, py) {
-                changed = true;
-                if state == ElementState::Released && self.btn_sent.take_click() {
-                    msg_out = Some(AppMessage::SwitchFolder(Folder::Sent));
-                }
-            }
-            if self.btn_trash.mouse_input(button, state, px, py) {
-                changed = true;
-                if state == ElementState::Released && self.btn_trash.take_click() {
-                    msg_out = Some(AppMessage::SwitchFolder(Folder::Trash));
+            if px < 180.0 {
+                if self.paginator.mouse_input(button, state, px, py) {
+                    changed = true;
+                    if self.paginator.take_click() {
+                        let page = self.paginator.selected_page();
+                        let folder = match page {
+                            0 => Folder::Inbox,
+                            1 => Folder::Sent,
+                            2 => Folder::Trash,
+                            _ => Folder::Inbox,
+                        };
+                        msg_out = Some(AppMessage::SwitchFolder(folder));
+                    }
                 }
             }
 
