@@ -24,6 +24,18 @@ struct AccountInfo {
     smtp: String,
     is_default: bool,
     password: String,
+    #[serde(default)]
+    is_oauth: bool,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    token_expiry: Option<u64>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -56,6 +68,9 @@ enum AppMessage {
     EmailsSynced(String, Vec<Email>),
     AddAccountSave,
     AddAccountCancel,
+    AddAccountOAuth,
+    AddAccountSaveOAuth(AccountInfo),
+    UpdateAccountTokens(String, Option<String>, Option<u64>),
 }
 
 struct ClearEmailApp {
@@ -95,6 +110,7 @@ struct ClearEmailApp {
     add_acc_smtp: TextBox,
     btn_add_acc_save: Button,
     btn_add_acc_cancel: Button,
+    btn_add_acc_oauth: Button,
 
     // Application state
     emails: Vec<Email>,
@@ -137,6 +153,12 @@ fn load_accounts() -> Vec<AccountInfo> {
             smtp: "smtp.clear-ui.org:465".to_string(),
             is_default: true,
             password: "mock_password".to_string(),
+            is_oauth: false,
+            access_token: None,
+            refresh_token: None,
+            token_expiry: None,
+            client_id: None,
+            client_secret: None,
         },
     ]
 }
@@ -216,11 +238,176 @@ fn clean_body(body: &str) -> String {
     cleaned
 }
 
-fn sync_imap(account: AccountInfo, sender: calloop::channel::Sender<AppMessage>) {
+const GOOGLE_CLIENT_ID: &str = "946029775684-m4u4mme60a6a0qj3p5m5jvea8d2987o9.apps.googleusercontent.com";
+const GOOGLE_CLIENT_SECRET: &str = "GOCSPX-dummysecret";
+
+async fn exchange_code_for_tokens(code: String, sender: calloop::channel::Sender<AppMessage>) {
+    let client = reqwest::Client::new();
+    let params = [
+        ("code", code.as_str()),
+        ("client_id", GOOGLE_CLIENT_ID),
+        ("client_secret", GOOGLE_CLIENT_SECRET),
+        ("redirect_uri", "http://127.0.0.1:8080"),
+        ("grant_type", "authorization_code"),
+    ];
+    
+    match client.post("https://oauth2.googleapis.com/token")
+        .form(&params)
+        .send()
+        .await 
+    {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    let access_token = json.get("access_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let refresh_token = json.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let expires_in = json.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
+                    
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let expiry = now + expires_in;
+
+                    // Request user profile info to get the email address
+                    if let Ok(email_resp) = client.get("https://www.googleapis.com/oauth2/v2/userinfo")
+                        .bearer_auth(&access_token)
+                        .send()
+                        .await 
+                    {
+                        if let Ok(email_json) = email_resp.json::<serde_json::Value>().await {
+                            if let Some(email) = email_json.get("email").and_then(|v| v.as_str()) {
+                                let new_acc = AccountInfo {
+                                    email: email.to_string(),
+                                    imap: "imap.gmail.com:993".to_string(),
+                                    smtp: "smtp.gmail.com:465".to_string(),
+                                    is_default: false,
+                                    password: String::new(),
+                                    is_oauth: true,
+                                    access_token: Some(access_token),
+                                    refresh_token: Some(refresh_token),
+                                    token_expiry: Some(expiry),
+                                    client_id: Some(GOOGLE_CLIENT_ID.to_string()),
+                                    client_secret: Some(GOOGLE_CLIENT_SECRET.to_string()),
+                                };
+                                let _ = sender.send(AppMessage::AddAccountSaveOAuth(new_acc));
+                                return;
+                            }
+                        }
+                    }
+                }
+                let _ = sender.send(AppMessage::Status("Failed to parse Google profile".to_string()));
+            } else {
+                let err_text = resp.text().await.unwrap_or_default();
+                let _ = sender.send(AppMessage::Status(format!("Token exchange failed: {}", err_text)));
+            }
+        }
+        Err(e) => {
+            let _ = sender.send(AppMessage::Status(format!("Token request failed: {}", e)));
+        }
+    }
+}
+
+async fn refresh_access_token(account: &mut AccountInfo) -> Result<String, String> {
+    if !account.is_oauth {
+        return Err("Not an OAuth account".to_string());
+    }
+    
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Check if token is still valid (with a 5 minute safety buffer)
+    if let (Some(token), Some(expiry)) = (&account.access_token, account.token_expiry) {
+        if expiry > now + 300 {
+            return Ok(token.clone());
+        }
+    }
+
+    let refresh_token = match &account.refresh_token {
+        Some(t) => t,
+        None => return Err("No refresh token".to_string()),
+    };
+
+    let client_id = account.client_id.as_deref().unwrap_or(GOOGLE_CLIENT_ID);
+    let client_secret = account.client_secret.as_deref().unwrap_or(GOOGLE_CLIENT_SECRET);
+
+    let client = reqwest::Client::new();
+    let params = [
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+        ("refresh_token", refresh_token.as_str()),
+        ("grant_type", "refresh_token"),
+    ];
+
+    match client.post("https://oauth2.googleapis.com/token")
+        .form(&params)
+        .send()
+        .await 
+    {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    let access_token = json.get("access_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let expires_in = json.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
+                    let expiry = now + expires_in;
+
+                    account.access_token = Some(access_token.clone());
+                    account.token_expiry = Some(expiry);
+                    return Ok(access_token);
+                }
+                Err("Failed to parse refresh token JSON response".to_string())
+            } else {
+                let status = resp.status();
+                let err_text = resp.text().await.unwrap_or_default();
+                Err(format!("Refresh request failed status: {}, error: {}", status, err_text))
+            }
+        }
+        Err(e) => Err(format!("Refresh request request failed: {}", e)),
+    }
+}
+
+struct ImapOAuth2 {
+    user: String,
+    access_token: String,
+}
+
+impl imap::Authenticator for ImapOAuth2 {
+    type Response = String;
+    #[inline]
+    fn process(&self, _data: &[u8]) -> Self::Response {
+        format!("user={}\x01auth=Bearer {}\x01\x01", self.user, self.access_token)
+    }
+}
+
+fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessage>) {
     std::thread::spawn(move || {
         // Skip connecting for mock credentials
         if account.password == "mock_password" || account.email == "lsgalante@clear-ui.org" {
             return;
+        }
+
+        let mut access_token = account.password.clone();
+        if account.is_oauth {
+            let mut acc = account.clone();
+            match pollster::block_on(refresh_access_token(&mut acc)) {
+                Ok(token) => {
+                    access_token = token;
+                    // Send refreshed tokens back to main thread to save them
+                    let _ = sender.send(AppMessage::UpdateAccountTokens(
+                        acc.email.clone(),
+                        acc.access_token.clone(),
+                        acc.token_expiry,
+                    ));
+                    account.access_token = acc.access_token;
+                    account.token_expiry = acc.token_expiry;
+                }
+                Err(e) => {
+                    let _ = sender.send(AppMessage::Status(format!("OAuth Refresh Failed: {}", e)));
+                    return;
+                }
+            }
         }
 
         let domain = match account.imap.split(':').next() {
@@ -250,11 +437,25 @@ fn sync_imap(account: AccountInfo, sender: calloop::channel::Sender<AppMessage>)
             }
         };
 
-        let mut session = match client.login(&account.email, &account.password) {
-            Ok(s) => s,
-            Err((e, _)) => {
-                let _ = sender.send(AppMessage::Status(format!("IMAP Login failed: {}", e)));
-                return;
+        let mut session = if account.is_oauth {
+            let auth = ImapOAuth2 {
+                user: account.email.clone(),
+                access_token: access_token.clone(),
+            };
+            match client.authenticate("XOAUTH2", &auth) {
+                Ok(s) => s,
+                Err((e, _)) => {
+                    let _ = sender.send(AppMessage::Status(format!("IMAP OAuth Login failed: {}", e)));
+                    return;
+                }
+            }
+        } else {
+            match client.login(&account.email, &account.password) {
+                Ok(s) => s,
+                Err((e, _)) => {
+                    let _ = sender.send(AppMessage::Status(format!("IMAP Login failed: {}", e)));
+                    return;
+                }
             }
         };
 
@@ -343,11 +544,32 @@ fn sync_imap(account: AccountInfo, sender: calloop::channel::Sender<AppMessage>)
     });
 }
 
-fn send_smtp(account: AccountInfo, to: String, subject: String, body: String, sender: calloop::channel::Sender<AppMessage>) {
+fn send_smtp(mut account: AccountInfo, to: String, subject: String, body: String, sender: calloop::channel::Sender<AppMessage>) {
     std::thread::spawn(move || {
         if account.password == "mock_password" {
             let _ = sender.send(AppMessage::Status("Mock Email Sent Successfully".to_string()));
             return;
+        }
+
+        let mut access_token = account.password.clone();
+        if account.is_oauth {
+            let mut acc = account.clone();
+            match pollster::block_on(refresh_access_token(&mut acc)) {
+                Ok(token) => {
+                    access_token = token;
+                    let _ = sender.send(AppMessage::UpdateAccountTokens(
+                        acc.email.clone(),
+                        acc.access_token.clone(),
+                        acc.token_expiry,
+                    ));
+                    account.access_token = acc.access_token;
+                    account.token_expiry = acc.token_expiry;
+                }
+                Err(e) => {
+                    let _ = sender.send(AppMessage::Status(format!("OAuth Refresh Failed: {}", e)));
+                    return;
+                }
+            }
         }
 
         let domain = match account.smtp.split(':').next() {
@@ -388,21 +610,19 @@ fn send_smtp(account: AccountInfo, to: String, subject: String, body: String, se
                 }
             };
 
-        let creds = Credentials::new(account.email.clone(), account.password.clone());
+        let creds = Credentials::new(account.email.clone(), access_token);
 
-        let mailer = if port == 465 {
-            SmtpTransport::relay(domain)
-                .unwrap()
-                .port(port)
-                .credentials(creds)
-                .build()
+        let mut mailer_builder = if port == 465 {
+            SmtpTransport::relay(domain).unwrap().port(port)
         } else {
-            SmtpTransport::starttls_relay(domain)
-                .unwrap()
-                .port(port)
-                .credentials(creds)
-                .build()
+            SmtpTransport::starttls_relay(domain).unwrap().port(port)
         };
+
+        if account.is_oauth {
+            mailer_builder = mailer_builder.authentication(vec![lettre::transport::smtp::authentication::Mechanism::Xoauth2]);
+        }
+
+        let mailer = mailer_builder.credentials(creds).build();
 
         match mailer.send(&email) {
             Ok(_) => {
@@ -787,6 +1007,7 @@ impl ClearEmailApp {
 
             labels.extend(self.btn_add_acc_save.text_labels());
             labels.extend(self.btn_add_acc_cancel.text_labels());
+            labels.extend(self.btn_add_acc_oauth.text_labels());
 
             // 7a. Add Account Inputs text labels
             self.add_acc_email.prepare_text(font_system);
@@ -924,6 +1145,7 @@ impl Application for ClearEmailApp {
 
         let btn_add_acc_save = Button::new(0.0, 0.0, 75.0, 28.0).with_label("Save");
         let btn_add_acc_cancel = Button::new_reset(0.0, 0.0, 75.0, 28.0).with_label("Cancel");
+        let btn_add_acc_oauth = Button::new(0.0, 0.0, 160.0, 28.0).with_label("Sign in with Google");
 
         let emails = if let Some(acc) = accounts.get(selected_account_idx) {
             load_emails_for_account(&acc.email)
@@ -961,6 +1183,7 @@ impl Application for ClearEmailApp {
             add_acc_smtp,
             btn_add_acc_save,
             btn_add_acc_cancel,
+            btn_add_acc_oauth,
             emails,
             current_folder: Folder::Inbox,
             selected_email_id: None,
@@ -1197,6 +1420,12 @@ impl Application for ClearEmailApp {
                         smtp,
                         is_default,
                         password,
+                        is_oauth: false,
+                        access_token: None,
+                        refresh_token: None,
+                        token_expiry: None,
+                        client_id: None,
+                        client_secret: None,
                     };
                     self.accounts.push(new_acc.clone());
                     save_accounts(&self.accounts);
@@ -1217,6 +1446,78 @@ impl Application for ClearEmailApp {
                 self.account_dialog_open = false;
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
+            }
+            AppMessage::AddAccountOAuth => {
+                let sender = self.sender.clone();
+                tokio::spawn(async move {
+                    let listener = match tokio::net::TcpListener::bind("127.0.0.1:8080").await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            let _ = sender.send(AppMessage::Status(format!("Failed to bind port 8080: {}", e)));
+                            return;
+                        }
+                    };
+                    
+                    let _ = sender.send(AppMessage::Status("Waiting for browser login...".to_string()));
+                    
+                    let auth_url = format!(
+                        "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080&response_type=code&scope=https%3A%2F%2Fmail.google.com%2F&access_type=offline&prompt=consent",
+                        GOOGLE_CLIENT_ID
+                    );
+                    let _ = std::process::Command::new("xdg-open").arg(&auth_url).spawn();
+
+                    if let Ok((mut stream, _)) = listener.accept().await {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buffer = [0; 1024];
+                        if let Ok(n) = stream.read(&mut buffer).await {
+                            let req_str = String::from_utf8_lossy(&buffer[..n]);
+                            if let Some(code_idx) = req_str.find("code=") {
+                                let rest = &req_str[code_idx + 5..];
+                                let end_idx = rest.find(|c: char| c == ' ' || c == '&' || c == '\r' || c == '\n').unwrap_or(rest.len());
+                                let code = rest[..end_idx].to_string();
+                                
+                                let _ = sender.send(AppMessage::Status("Exchanging code for token...".to_string()));
+                                exchange_code_for_tokens(code, sender.clone()).await;
+                                
+                                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                                                <html><head><style>body { font-family: sans-serif; background-color: #08080c; color: #fff; text-align: center; padding-top: 50px; }</style></head><body><h2>Clear Mail Authentication Successful!</h2><p>You can close this tab and return to the application.</p></body></html>";
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.flush().await;
+                            } else {
+                                let _ = sender.send(AppMessage::Status("OAuth Error: No code received".to_string()));
+                                let response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                                                <html><head><style>body { font-family: sans-serif; background-color: #08080c; color: #ff6060; text-align: center; padding-top: 50px; }</style></head><body><h2>Clear Mail Authentication Failed</h2><p>No authorization code was found.</p></body></html>";
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.flush().await;
+                            }
+                        }
+                    }
+                });
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::AddAccountSaveOAuth(new_acc) => {
+                let mut acc = new_acc;
+                acc.is_default = self.accounts.is_empty();
+                self.accounts.push(acc.clone());
+                save_accounts(&self.accounts);
+
+                self.selected_account_idx = self.accounts.len() - 1;
+                self.emails = load_emails_for_account(&acc.email);
+                
+                sync_imap(acc, self.sender.clone());
+                
+                self.account_dialog_open = false;
+                self.status_message = Some(("Google Account Added".to_string(), 4.0));
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::UpdateAccountTokens(email, access_token, expiry) => {
+                if let Some(acc) = self.accounts.iter_mut().find(|a| a.email == email) {
+                    acc.access_token = access_token;
+                    acc.token_expiry = expiry;
+                    save_accounts(&self.accounts);
+                }
             }
         }
     }
@@ -1394,6 +1695,7 @@ impl Application for ClearEmailApp {
 
                 self.btn_add_acc_save.set_rect(modal_x + 320.0, modal_y + 310.0, 75.0, 28.0);
                 self.btn_add_acc_cancel.set_rect(modal_x + 410.0, modal_y + 310.0, 75.0, 28.0);
+                self.btn_add_acc_oauth.set_rect(modal_x + 15.0, modal_y + 310.0, 160.0, 28.0);
             }
 
             self.rebuild_text_items();
@@ -1536,6 +1838,7 @@ impl Application for ClearEmailApp {
             quads.extend(self.add_acc_smtp.extra_quads());
             quads.extend(self.btn_add_acc_save.extra_quads());
             quads.extend(self.btn_add_acc_cancel.extra_quads());
+            quads.extend(self.btn_add_acc_oauth.extra_quads());
         }
     }
 
@@ -1555,6 +1858,7 @@ impl Application for ClearEmailApp {
             if self.add_acc_smtp.on_cursor_moved(px, py) { changed = true; }
             if self.btn_add_acc_save.on_cursor_moved(px, py) { changed = true; }
             if self.btn_add_acc_cancel.on_cursor_moved(px, py) { changed = true; }
+            if self.btn_add_acc_oauth.on_cursor_moved(px, py) { changed = true; }
         } else if self.compose_open {
             if self.compose_to.on_cursor_moved(px, py) { changed = true; }
             if self.compose_subject.on_cursor_moved(px, py) { changed = true; }
@@ -1623,6 +1927,12 @@ impl Application for ClearEmailApp {
                 changed = true;
                 if state == ElementState::Released && self.btn_add_acc_cancel.take_click() {
                     msg_out = Some(AppMessage::AddAccountCancel);
+                }
+            }
+            if self.btn_add_acc_oauth.mouse_input(button, state, px, py) {
+                changed = true;
+                if state == ElementState::Released && self.btn_add_acc_oauth.take_click() {
+                    msg_out = Some(AppMessage::AddAccountOAuth);
                 }
             }
 
