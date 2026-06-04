@@ -101,6 +101,7 @@ struct ClearEmailApp {
     selected_account_idx: usize,
     btn_add_account: Button,
     btn_make_default: Button,
+    btn_login_oauth: Button,
 
     // Add Account Dialog
     account_dialog_open: bool,
@@ -837,7 +838,12 @@ impl ClearEmailApp {
                 // Settings details
                 labels.push(TextLabel { text: format!("Incoming Server (IMAP): {}", acc.imap), x: 391.0, y: 95.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
                 labels.push(TextLabel { text: format!("Outgoing Server (SMTP): {}", acc.smtp), x: 391.0, y: 120.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
-                labels.push(TextLabel { text: format!("Authentication:          SSL/TLS, Normal Password"), x: 391.0, y: 145.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                let auth_text = if acc.is_oauth {
+                    "Authentication:          OAuth2 (Google)"
+                } else {
+                    "Authentication:          SSL/TLS, Normal Password"
+                };
+                labels.push(TextLabel { text: auth_text.to_string(), x: 391.0, y: 145.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
                 labels.push(TextLabel {
                     text: format!("Default Account:         {}", if acc.is_default { "Yes" } else { "No" }),
                     x: 391.0,
@@ -845,6 +851,9 @@ impl ClearEmailApp {
                     font_size: 11.0,
                     color: if acc.is_default { [0x3a, 0xff, 0x80] } else { [0x83, 0x83, 0x8a] },
                 });
+                if acc.is_oauth {
+                    labels.extend(self.btn_login_oauth.text_labels());
+                }
             }
         } else if let Some(selected_id) = self.selected_email_id {
             if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
@@ -991,7 +1000,7 @@ impl ClearEmailApp {
             labels.push(TextLabel { text: "SMTP Host:port:".to_string(), x: modal_x + 15.0, y: modal_y + 174.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
 
             labels.push(TextLabel {
-                text: "Note: For Gmail & iCloud, you must use an App Password.".to_string(),
+                text: "Note: For Gmail, use 'Click to Login (Google)' below. iCloud requires App PW.".to_string(),
                 x: modal_x + 15.0,
                 y: modal_y + 215.0,
                 font_size: 9.5,
@@ -1145,7 +1154,8 @@ impl Application for ClearEmailApp {
 
         let btn_add_acc_save = Button::new(0.0, 0.0, 75.0, 28.0).with_label("Save");
         let btn_add_acc_cancel = Button::new_reset(0.0, 0.0, 75.0, 28.0).with_label("Cancel");
-        let btn_add_acc_oauth = Button::new(0.0, 0.0, 160.0, 28.0).with_label("Sign in with Google");
+        let btn_add_acc_oauth = Button::new(0.0, 0.0, 180.0, 28.0).with_label("Click to Login (Google)");
+        let btn_login_oauth = Button::new(0.0, 0.0, 180.0, 28.0).with_label("Click to Login (Browser)");
 
         let emails = if let Some(acc) = accounts.get(selected_account_idx) {
             load_emails_for_account(&acc.email)
@@ -1176,6 +1186,7 @@ impl Application for ClearEmailApp {
             selected_account_idx,
             btn_add_account,
             btn_make_default,
+            btn_login_oauth,
             account_dialog_open: false,
             add_acc_email,
             add_acc_password,
@@ -1498,17 +1509,25 @@ impl Application for ClearEmailApp {
             }
             AppMessage::AddAccountSaveOAuth(new_acc) => {
                 let mut acc = new_acc;
-                acc.is_default = self.accounts.is_empty();
-                self.accounts.push(acc.clone());
+                if let Some(existing_idx) = self.accounts.iter().position(|a| a.email == acc.email) {
+                    let is_default = self.accounts[existing_idx].is_default;
+                    acc.is_default = is_default;
+                    self.accounts[existing_idx] = acc.clone();
+                    self.selected_account_idx = existing_idx;
+                    self.status_message = Some(("Google Account Updated".to_string(), 4.0));
+                } else {
+                    acc.is_default = self.accounts.is_empty();
+                    self.accounts.push(acc.clone());
+                    self.selected_account_idx = self.accounts.len() - 1;
+                    self.status_message = Some(("Google Account Added".to_string(), 4.0));
+                }
                 save_accounts(&self.accounts);
 
-                self.selected_account_idx = self.accounts.len() - 1;
                 self.emails = load_emails_for_account(&acc.email);
                 
                 sync_imap(acc, self.sender.clone());
                 
                 self.account_dialog_open = false;
-                self.status_message = Some(("Google Account Added".to_string(), 4.0));
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -1644,8 +1663,19 @@ impl Application for ClearEmailApp {
                 // Detail View for selected account
                 if self.selected_account_idx < self.accounts.len() {
                     self.btn_make_default.set_rect(391.0, 8.0, 120.0, 26.0);
+                    let acc = &self.accounts[self.selected_account_idx];
+                    if acc.is_oauth {
+                        self.btn_login_oauth.set_rect(391.0, 200.0, 180.0, 28.0);
+                    } else {
+                        self.btn_login_oauth.set_rect(-9999.0, -9999.0, 0.0, 0.0);
+                    }
+                } else {
+                    self.btn_make_default.set_rect(-9999.0, -9999.0, 0.0, 0.0);
+                    self.btn_login_oauth.set_rect(-9999.0, -9999.0, 0.0, 0.0);
                 }
             } else {
+                self.btn_make_default.set_rect(-9999.0, -9999.0, 0.0, 0.0);
+                self.btn_login_oauth.set_rect(-9999.0, -9999.0, 0.0, 0.0);
                 for (idx, &(_email_id, is_selected)) in filtered_email_ids.iter().enumerate() {
                     self.email_buttons[idx].selected = is_selected;
                     if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
@@ -1695,7 +1725,7 @@ impl Application for ClearEmailApp {
 
                 self.btn_add_acc_save.set_rect(modal_x + 320.0, modal_y + 310.0, 75.0, 28.0);
                 self.btn_add_acc_cancel.set_rect(modal_x + 410.0, modal_y + 310.0, 75.0, 28.0);
-                self.btn_add_acc_oauth.set_rect(modal_x + 15.0, modal_y + 310.0, 160.0, 28.0);
+                self.btn_add_acc_oauth.set_rect(modal_x + 15.0, modal_y + 310.0, 180.0, 28.0);
             }
 
             self.rebuild_text_items();
@@ -1779,6 +1809,9 @@ impl Application for ClearEmailApp {
                 quads.push((377.0, 42.0, w_f32 - 377.0, 1.0, [0.18, 0.18, 0.22, 1.0]));
 
                 quads.extend(self.btn_make_default.extra_quads());
+                if self.accounts[self.selected_account_idx].is_oauth {
+                    quads.extend(self.btn_login_oauth.extra_quads());
+                }
             }
         } else if let Some(selected_id) = self.selected_email_id {
             if self.emails.iter().any(|e| e.id == selected_id) {
@@ -1890,6 +1923,9 @@ impl Application for ClearEmailApp {
             if self.current_folder == Folder::Accounts {
                 if self.selected_account_idx < self.accounts.len() {
                     if self.btn_make_default.on_cursor_moved(px, py) { changed = true; }
+                    if self.accounts[self.selected_account_idx].is_oauth {
+                        if self.btn_login_oauth.on_cursor_moved(px, py) { changed = true; }
+                    }
                 }
             } else if self.selected_email_id.is_some() {
                 if self.btn_reply.on_cursor_moved(px, py) { changed = true; }
@@ -2090,6 +2126,14 @@ impl Application for ClearEmailApp {
                         changed = true;
                         if state == ElementState::Released && self.btn_make_default.take_click() {
                             msg_out = Some(AppMessage::MakeDefaultAccount);
+                        }
+                    }
+                    if self.accounts[self.selected_account_idx].is_oauth {
+                        if self.btn_login_oauth.mouse_input(button, state, px, py) {
+                            changed = true;
+                            if state == ElementState::Released && self.btn_login_oauth.take_click() {
+                                msg_out = Some(AppMessage::AddAccountOAuth);
+                            }
                         }
                     }
                 }
