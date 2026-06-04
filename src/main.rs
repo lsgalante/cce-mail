@@ -262,12 +262,47 @@ fn clean_body(body: &str) -> String {
 const GOOGLE_CLIENT_ID: &str = "946029775684-m4u4mme60a6a0qj3p5m5jvea8d2987o9.apps.googleusercontent.com";
 const GOOGLE_CLIENT_SECRET: &str = "GOCSPX-dummysecret";
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GoogleClientConfig {
+    client_id: String,
+    client_secret: String,
+}
+
+fn load_google_client_config() -> GoogleClientConfig {
+    let p = std::path::PathBuf::from("/home/lsgalante/.config/ccec/google_client.json");
+    if p.exists() {
+        if let Ok(content) = std::fs::read_to_string(&p) {
+            if let Ok(config) = serde_json::from_str::<GoogleClientConfig>(&content) {
+                return config;
+            }
+        }
+    }
+    let default_config = GoogleClientConfig {
+        client_id: GOOGLE_CLIENT_ID.to_string(),
+        client_secret: GOOGLE_CLIENT_SECRET.to_string(),
+    };
+    if let Ok(content) = serde_json::to_string_pretty(&default_config) {
+        let _ = std::fs::write(&p, content);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(&p) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&p, perms);
+            }
+        }
+    }
+    default_config
+}
+
 async fn exchange_code_for_tokens(code: String, sender: calloop::channel::Sender<AppMessage>) {
+    let client_config = load_google_client_config();
     let client = reqwest::Client::new();
     let params = [
         ("code", code.as_str()),
-        ("client_id", GOOGLE_CLIENT_ID),
-        ("client_secret", GOOGLE_CLIENT_SECRET),
+        ("client_id", client_config.client_id.as_str()),
+        ("client_secret", client_config.client_secret.as_str()),
         ("redirect_uri", "http://127.0.0.1:8080"),
         ("grant_type", "authorization_code"),
     ];
@@ -289,7 +324,7 @@ async fn exchange_code_for_tokens(code: String, sender: calloop::channel::Sender
                         .unwrap_or_default()
                         .as_secs();
                     let expiry = now + expires_in;
-
+ 
                     // Request user profile info to get the email address
                     if let Ok(email_resp) = client.get("https://www.googleapis.com/oauth2/v2/userinfo")
                         .bearer_auth(&access_token)
@@ -308,8 +343,8 @@ async fn exchange_code_for_tokens(code: String, sender: calloop::channel::Sender
                                     access_token: Some(access_token),
                                     refresh_token: Some(refresh_token),
                                     token_expiry: Some(expiry),
-                                    client_id: Some(GOOGLE_CLIENT_ID.to_string()),
-                                    client_secret: Some(GOOGLE_CLIENT_SECRET.to_string()),
+                                    client_id: Some(client_config.client_id),
+                                    client_secret: Some(client_config.client_secret),
                                 };
                                 let _ = sender.send(AppMessage::AddAccountSaveOAuth(new_acc));
                                 return;
@@ -351,8 +386,9 @@ async fn refresh_access_token(account: &mut AccountInfo) -> Result<String, Strin
         None => return Err("No refresh token".to_string()),
     };
 
-    let client_id = account.client_id.as_deref().unwrap_or(GOOGLE_CLIENT_ID);
-    let client_secret = account.client_secret.as_deref().unwrap_or(GOOGLE_CLIENT_SECRET);
+    let client_config = load_google_client_config();
+    let client_id = account.client_id.as_deref().unwrap_or(&client_config.client_id);
+    let client_secret = account.client_secret.as_deref().unwrap_or(&client_config.client_secret);
 
     let client = reqwest::Client::new();
     let params = [
@@ -1483,6 +1519,7 @@ impl Application for ClearEmailApp {
             }
             AppMessage::AddAccountOAuth => {
                 let sender = self.sender.clone();
+                let client_config = load_google_client_config();
                 tokio::spawn(async move {
                     let listener = match tokio::net::TcpListener::bind("127.0.0.1:8080").await {
                         Ok(l) => l,
@@ -1496,7 +1533,7 @@ impl Application for ClearEmailApp {
                     
                     let auth_url = format!(
                         "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080&response_type=code&scope=https%3A%2F%2Fmail.google.com%2F&access_type=offline&prompt=consent",
-                        GOOGLE_CLIENT_ID
+                        client_config.client_id
                     );
                     let _ = std::process::Command::new("xdg-open").arg(&auth_url).spawn();
 
