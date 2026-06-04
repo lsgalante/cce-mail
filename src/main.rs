@@ -5,6 +5,9 @@ use clear_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, TextItem, Widget,
     TextBox, Button, TextLabel, Key, ScrollingList, Paginator
 };
+use native_tls::TlsConnector;
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::{Message, SmtpTransport, Transport};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Folder {
@@ -14,12 +17,13 @@ enum Folder {
     Accounts,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct AccountInfo {
     email: String,
     imap: String,
     smtp: String,
     is_default: bool,
+    password: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -48,6 +52,10 @@ enum AppMessage {
     SelectAccount(usize),
     AddAccount,
     MakeDefaultAccount,
+    Status(String),
+    EmailsSynced(String, Vec<Email>),
+    AddAccountSave,
+    AddAccountCancel,
 }
 
 struct ClearEmailApp {
@@ -79,12 +87,22 @@ struct ClearEmailApp {
     btn_add_account: Button,
     btn_make_default: Button,
 
+    // Add Account Dialog
+    account_dialog_open: bool,
+    add_acc_email: TextBox,
+    add_acc_password: TextBox,
+    add_acc_imap: TextBox,
+    add_acc_smtp: TextBox,
+    btn_add_acc_save: Button,
+    btn_add_acc_cancel: Button,
+
     // Application state
     emails: Vec<Email>,
     current_folder: Folder,
     selected_email_id: Option<usize>,
     compose_open: bool,
     status_message: Option<(String, f32)>, // (message, timer)
+    sender: calloop::channel::Sender<AppMessage>,
 
     // UI state
     width: u32,
@@ -95,16 +113,52 @@ struct ClearEmailApp {
     needs_rebuild: bool,
 }
 
-fn get_config_path() -> std::path::PathBuf {
+fn get_accounts_path() -> std::path::PathBuf {
     let p = std::path::PathBuf::from("/home/lsgalante/.config/ccec");
     if !p.exists() {
         let _ = std::fs::create_dir_all(&p);
     }
-    p.join("emails.json")
+    p.join("accounts.json")
 }
 
-fn load_emails() -> Vec<Email> {
-    let path = get_config_path();
+fn load_accounts() -> Vec<AccountInfo> {
+    let path = get_accounts_path();
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(accounts) = serde_json::from_str(&content) {
+                return accounts;
+            }
+        }
+    }
+    vec![
+        AccountInfo {
+            email: "lsgalante@clear-ui.org".to_string(),
+            imap: "imap.clear-ui.org:993".to_string(),
+            smtp: "smtp.clear-ui.org:465".to_string(),
+            is_default: true,
+            password: "mock_password".to_string(),
+        },
+    ]
+}
+
+fn save_accounts(accounts: &[AccountInfo]) {
+    let path = get_accounts_path();
+    if let Ok(content) = serde_json::to_string_pretty(accounts) {
+        let _ = std::fs::write(&path, content);
+    }
+}
+
+fn get_account_emails_path(email: &str) -> std::path::PathBuf {
+    let p = std::path::PathBuf::from("/home/lsgalante/.config/ccec");
+    if !p.exists() {
+        let _ = std::fs::create_dir_all(&p);
+    }
+    let safe_email = email.replace('@', "_").replace('.', "_");
+    p.join(format!("emails_{}.json", safe_email))
+}
+
+fn load_emails_for_account(email: &str) -> Vec<Email> {
+    let path = get_account_emails_path(email);
     if path.exists() {
         if let Ok(content) = std::fs::read_to_string(&path) {
             if let Ok(emails) = serde_json::from_str(&content) {
@@ -112,14 +166,253 @@ fn load_emails() -> Vec<Email> {
             }
         }
     }
-    get_default_mock_emails()
+    if email == "lsgalante@clear-ui.org" {
+        return get_default_mock_emails();
+    }
+    Vec::new()
 }
 
-fn save_emails(emails: &[Email]) {
-    let path = get_config_path();
+fn save_emails_for_account(email: &str, emails: &[Email]) {
+    let path = get_account_emails_path(email);
     if let Ok(content) = serde_json::to_string_pretty(emails) {
         let _ = std::fs::write(&path, content);
     }
+}
+
+fn process_header(line: &str, from: &mut String, subject: &mut String, date: &mut String) {
+    if let Some(colon) = line.find(':') {
+        let key = line[..colon].trim().to_lowercase();
+        let val = line[colon+1..].trim().to_string();
+        match key.as_str() {
+            "from" => *from = val,
+            "subject" => *subject = val,
+            "date" => *date = val,
+            _ => {}
+        }
+    }
+}
+
+fn clean_body(body: &str) -> String {
+    let mut cleaned = String::new();
+    let mut in_headers = false;
+    for line in body.lines() {
+        let line_trimmed = line.trim();
+        if line_trimmed.starts_with("--") || line_trimmed.contains("Content-Type:") || line_trimmed.contains("Content-Transfer-Encoding:") {
+            in_headers = true;
+            continue;
+        }
+        if in_headers && line_trimmed.is_empty() {
+            in_headers = false;
+            continue;
+        }
+        if !in_headers {
+            cleaned.push_str(line);
+            cleaned.push('\n');
+        }
+    }
+    if cleaned.len() > 1200 {
+        cleaned = format!("{}...", &cleaned[..1200]);
+    }
+    cleaned
+}
+
+fn sync_imap(account: AccountInfo, sender: calloop::channel::Sender<AppMessage>) {
+    std::thread::spawn(move || {
+        // Skip connecting for mock credentials
+        if account.password == "mock_password" || account.email == "lsgalante@clear-ui.org" {
+            return;
+        }
+
+        let domain = match account.imap.split(':').next() {
+            Some(d) => d,
+            None => return,
+        };
+        let port = match account.imap.split(':').nth(1).and_then(|p| p.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => 993,
+        };
+
+        let _ = sender.send(AppMessage::Status(format!("Connecting to {}...", account.imap)));
+        
+        let tls = match TlsConnector::new() {
+            Ok(t) => t,
+            Err(_) => {
+                let _ = sender.send(AppMessage::Status("Failed to create TLS connector".to_string()));
+                return;
+            }
+        };
+
+        let client = match imap::connect((domain, port), domain, &tls) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = sender.send(AppMessage::Status(format!("IMAP Connection failed: {}", e)));
+                return;
+            }
+        };
+
+        let mut session = match client.login(&account.email, &account.password) {
+            Ok(s) => s,
+            Err((e, _)) => {
+                let _ = sender.send(AppMessage::Status(format!("IMAP Login failed: {}", e)));
+                return;
+            }
+        };
+
+        let _ = sender.send(AppMessage::Status("Syncing Inbox...".to_string()));
+
+        if let Err(e) = session.select("INBOX") {
+            let _ = sender.send(AppMessage::Status(format!("Failed to select INBOX: {}", e)));
+            let _ = session.logout();
+            return;
+        }
+
+        let mut search_results: Vec<u32> = match session.search("ALL") {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(e) => {
+                let _ = sender.send(AppMessage::Status(format!("IMAP Search failed: {}", e)));
+                let _ = session.logout();
+                return;
+            }
+        };
+        search_results.sort();
+
+        let total = search_results.len();
+        if total == 0 {
+            let _ = sender.send(AppMessage::Status("Inbox is empty".to_string()));
+            let _ = session.logout();
+            return;
+        }
+
+        // Fetch last 15 emails
+        let start_idx = if total > 15 { total - 15 } else { 0 };
+        let range = &search_results[start_idx..total];
+        let query_seq = range.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+
+        let mut fetched_emails = Vec::new();
+        match session.fetch(&query_seq, "(RFC822.HEADER BODY[TEXT])") {
+            Ok(fetches) => {
+                for fetch in fetches.iter() {
+                    let id = fetch.message;
+                    let mut from = "Unknown".to_string();
+                    let mut subject = "(No Subject)".to_string();
+                    let mut date = "Unknown".to_string();
+                    let mut body = String::new();
+
+                    if let Some(header) = fetch.header() {
+                        let header_str = String::from_utf8_lossy(header);
+                        let mut current_header = String::new();
+                        for line in header_str.lines() {
+                            if line.starts_with(' ') || line.starts_with('\t') {
+                                current_header.push_str(line.trim());
+                            } else {
+                                process_header(&current_header, &mut from, &mut subject, &mut date);
+                                current_header = line.trim().to_string();
+                            }
+                        }
+                        process_header(&current_header, &mut from, &mut subject, &mut date);
+                    }
+
+                    if let Some(text) = fetch.body() {
+                        body = clean_body(&String::from_utf8_lossy(text));
+                    }
+
+                    fetched_emails.push(Email {
+                        id: id as usize,
+                        from,
+                        to: account.email.clone(),
+                        subject,
+                        body,
+                        date,
+                        read: true,
+                        folder: "inbox".to_string(),
+                    });
+                }
+            }
+            Err(e) => {
+                let _ = sender.send(AppMessage::Status(format!("IMAP Fetch failed: {}", e)));
+                let _ = session.logout();
+                return;
+            }
+        }
+
+        fetched_emails.reverse(); // Newest first
+
+        let _ = sender.send(AppMessage::EmailsSynced(account.email.clone(), fetched_emails));
+        let _ = sender.send(AppMessage::Status("Sync Complete".to_string()));
+        let _ = session.logout();
+    });
+}
+
+fn send_smtp(account: AccountInfo, to: String, subject: String, body: String, sender: calloop::channel::Sender<AppMessage>) {
+    std::thread::spawn(move || {
+        if account.password == "mock_password" {
+            let _ = sender.send(AppMessage::Status("Mock Email Sent Successfully".to_string()));
+            return;
+        }
+
+        let domain = match account.smtp.split(':').next() {
+            Some(d) => d,
+            None => {
+                let _ = sender.send(AppMessage::Status("Invalid SMTP hostname".to_string()));
+                return;
+            }
+        };
+        let port = match account.smtp.split(':').nth(1).and_then(|p| p.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => 465,
+        };
+
+        let _ = sender.send(AppMessage::Status("Sending SMTP mail...".to_string()));
+
+        let email = match Message::builder()
+            .from(match account.email.parse() {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = sender.send(AppMessage::Status(format!("Invalid From Address: {}", e)));
+                    return;
+                }
+            })
+            .to(match to.parse() {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = sender.send(AppMessage::Status(format!("Invalid Recipient: {}", e)));
+                    return;
+                }
+            })
+            .subject(subject)
+            .body(body) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = sender.send(AppMessage::Status(format!("Failed to build message: {}", e)));
+                    return;
+                }
+            };
+
+        let creds = Credentials::new(account.email.clone(), account.password.clone());
+
+        let mailer = if port == 465 {
+            SmtpTransport::relay(domain)
+                .unwrap()
+                .port(port)
+                .credentials(creds)
+                .build()
+        } else {
+            SmtpTransport::starttls_relay(domain)
+                .unwrap()
+                .port(port)
+                .credentials(creds)
+                .build()
+        };
+
+        match mailer.send(&email) {
+            Ok(_) => {
+                let _ = sender.send(AppMessage::Status("Email Sent Successfully".to_string()));
+            }
+            Err(e) => {
+                let _ = sender.send(AppMessage::Status(format!("SMTP send failed: {}", e)));
+            }
+        }
+    });
 }
 
 fn get_default_mock_emails() -> Vec<Email> {
@@ -168,6 +461,12 @@ fn get_default_mock_emails() -> Vec<Email> {
 }
 
 impl ClearEmailApp {
+    fn save_emails(&self) {
+        if let Some(acc) = self.accounts.get(self.selected_account_idx) {
+            save_emails_for_account(&acc.email, &self.emails);
+        }
+    }
+
     fn rebuild_text_items(&mut self) {
         self.text_items.clear();
         let mut labels = Vec::new();
@@ -453,6 +752,104 @@ impl ClearEmailApp {
             }
         }
 
+        // 7. Add Account Dialog Content
+        if self.account_dialog_open {
+            let modal_x = ((w_f32 - 500.0) / 2.0).max(0.0);
+            let modal_y = ((h_f32 - 360.0) / 2.0).max(0.0);
+
+            labels.push(TextLabel {
+                text: "Add Email Account".to_string(),
+                x: modal_x + 15.0,
+                y: modal_y + 16.0,
+                font_size: 13.0,
+                color: [0xff, 0xff, 0xff],
+            });
+
+            labels.push(TextLabel { text: "Email Address:".to_string(), x: modal_x + 15.0, y: modal_y + 54.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+            labels.push(TextLabel { text: "Password / App PW:".to_string(), x: modal_x + 15.0, y: modal_y + 94.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+            labels.push(TextLabel { text: "IMAP Host:port:".to_string(), x: modal_x + 15.0, y: modal_y + 134.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+            labels.push(TextLabel { text: "SMTP Host:port:".to_string(), x: modal_x + 15.0, y: modal_y + 174.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+
+            labels.push(TextLabel {
+                text: "Note: For Gmail & iCloud, you must use an App Password.".to_string(),
+                x: modal_x + 15.0,
+                y: modal_y + 215.0,
+                font_size: 9.5,
+                color: [0x70, 0x70, 0x75],
+            });
+            labels.push(TextLabel {
+                text: "Servers are automatically configured for popular domains.".to_string(),
+                x: modal_x + 15.0,
+                y: modal_y + 233.0,
+                font_size: 9.5,
+                color: [0x70, 0x70, 0x75],
+            });
+
+            labels.extend(self.btn_add_acc_save.text_labels());
+            labels.extend(self.btn_add_acc_cancel.text_labels());
+
+            // 7a. Add Account Inputs text labels
+            self.add_acc_email.prepare_text(font_system);
+            for (label, bounds) in self.add_acc_email.text_labels_with_bounds() {
+                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
+                let mut buf = Buffer::new(font_system, metrics);
+                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
+                buf.shape_until_scroll(font_system, true);
+                self.text_items.push(TextItem {
+                    buffer: buf,
+                    x: label.x,
+                    y: label.y,
+                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
+                    bounds,
+                });
+            }
+
+            self.add_acc_password.prepare_text(font_system);
+            for (label, bounds) in self.add_acc_password.text_labels_with_bounds() {
+                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
+                let mut buf = Buffer::new(font_system, metrics);
+                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
+                buf.shape_until_scroll(font_system, true);
+                self.text_items.push(TextItem {
+                    buffer: buf,
+                    x: label.x,
+                    y: label.y,
+                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
+                    bounds,
+                });
+            }
+
+            self.add_acc_imap.prepare_text(font_system);
+            for (label, bounds) in self.add_acc_imap.text_labels_with_bounds() {
+                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
+                let mut buf = Buffer::new(font_system, metrics);
+                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
+                buf.shape_until_scroll(font_system, true);
+                self.text_items.push(TextItem {
+                    buffer: buf,
+                    x: label.x,
+                    y: label.y,
+                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
+                    bounds,
+                });
+            }
+
+            self.add_acc_smtp.prepare_text(font_system);
+            for (label, bounds) in self.add_acc_smtp.text_labels_with_bounds() {
+                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
+                let mut buf = Buffer::new(font_system, metrics);
+                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
+                buf.shape_until_scroll(font_system, true);
+                self.text_items.push(TextItem {
+                    buffer: buf,
+                    x: label.x,
+                    y: label.y,
+                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
+                    bounds,
+                });
+            }
+        }
+
         // Shape and append static text items
         for label in labels {
             let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
@@ -494,20 +891,9 @@ impl Application for ClearEmailApp {
         let btn_delete = Button::new_reset(471.0, 8.0, 80.0, 26.0).with_label("Delete");
         let btn_unread = Button::new(561.0, 8.0, 110.0, 26.0).with_label("Mark Unread");
 
-        let accounts = vec![
-            AccountInfo {
-                email: "lsgalante@clear-ui.org".to_string(),
-                imap: "imap.clear-ui.org:993".to_string(),
-                smtp: "smtp.clear-ui.org:465".to_string(),
-                is_default: true,
-            },
-            AccountInfo {
-                email: "lucas.galante@codeberg.org".to_string(),
-                imap: "mail.codeberg.org:993".to_string(),
-                smtp: "mail.codeberg.org:465".to_string(),
-                is_default: false,
-            },
-        ];
+        let accounts = load_accounts();
+        let selected_account_idx = accounts.iter().position(|a| a.is_default).unwrap_or(0);
+
         let btn_add_account = Button::new(66.0, 15.0, 300.0, 26.0).with_label("+ Add Account");
         let btn_make_default = Button::new(391.0, 8.0, 120.0, 26.0).with_label("Make Default");
 
@@ -526,7 +912,28 @@ impl Application for ClearEmailApp {
         let btn_compose_send = Button::new(0.0, 0.0, 75.0, 28.0).with_label("Send");
         let btn_compose_cancel = Button::new_reset(0.0, 0.0, 75.0, 28.0).with_label("Cancel");
 
-        let emails = load_emails();
+        let mut add_acc_email = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
+        add_acc_email.font_size = 11.0;
+        let mut add_acc_password = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
+        add_acc_password.font_size = 11.0;
+        add_acc_password.is_password = true;
+        let mut add_acc_imap = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
+        add_acc_imap.font_size = 11.0;
+        let mut add_acc_smtp = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
+        add_acc_smtp.font_size = 11.0;
+
+        let btn_add_acc_save = Button::new(0.0, 0.0, 75.0, 28.0).with_label("Save");
+        let btn_add_acc_cancel = Button::new_reset(0.0, 0.0, 75.0, 28.0).with_label("Cancel");
+
+        let emails = if let Some(acc) = accounts.get(selected_account_idx) {
+            load_emails_for_account(&acc.email)
+        } else {
+            Vec::new()
+        };
+
+        if let Some(acc) = accounts.get(selected_account_idx) {
+            sync_imap(acc.clone(), _sender.clone());
+        }
 
         Self {
             btn_compose,
@@ -544,14 +951,22 @@ impl Application for ClearEmailApp {
             btn_compose_send,
             btn_compose_cancel,
             accounts,
-            selected_account_idx: 0,
+            selected_account_idx,
             btn_add_account,
             btn_make_default,
+            account_dialog_open: false,
+            add_acc_email,
+            add_acc_password,
+            add_acc_imap,
+            add_acc_smtp,
+            btn_add_acc_save,
+            btn_add_acc_cancel,
             emails,
             current_folder: Folder::Inbox,
             selected_email_id: None,
             compose_open: false,
             status_message: None,
+            sender: _sender.clone(),
             width: 1000,
             height: 600,
             scale_factor: 1.0,
@@ -586,7 +1001,7 @@ impl Application for ClearEmailApp {
                 if let Some(email) = self.emails.iter_mut().find(|e| e.id == id) {
                     if !email.read {
                         email.read = true;
-                        save_emails(&self.emails);
+                        self.save_emails();
                     }
                 }
                 *needs_rebuild = true;
@@ -615,26 +1030,32 @@ impl Application for ClearEmailApp {
                 self.needs_rebuild = true;
             }
             AppMessage::ComposeSend => {
-                let to = if self.compose_to.editing { &self.compose_to.edit_buffer } else { &self.compose_to.text };
-                let subject = if self.compose_subject.editing { &self.compose_subject.edit_buffer } else { &self.compose_subject.text };
-                let body = if self.compose_body.editing { &self.compose_body.edit_buffer } else { &self.compose_body.text };
+                let to = if self.compose_to.editing { &self.compose_to.edit_buffer } else { &self.compose_to.text }.trim().to_string();
+                let subject = if self.compose_subject.editing { &self.compose_subject.edit_buffer } else { &self.compose_subject.text }.trim().to_string();
+                let body = if self.compose_body.editing { &self.compose_body.edit_buffer } else { &self.compose_body.text }.to_string();
 
-                if !to.trim().is_empty() {
+                if !to.is_empty() {
+                    let active_acc = self.accounts[self.selected_account_idx].clone();
+                    let sender_email = active_acc.email.clone();
+                    
+                    // Trigger asynchronous SMTP send in background
+                    send_smtp(active_acc, to.clone(), subject.clone(), body.clone(), self.sender.clone());
+
+                    // Save email in sent folder locally
                     let new_id = self.emails.iter().map(|e| e.id).max().unwrap_or(0) + 1;
                     let new_email = Email {
                         id: new_id,
-                        from: "lsgalante@clear-ui.org".to_string(),
+                        from: sender_email,
                         to: to.clone(),
-                        subject: if subject.trim().is_empty() { "(No Subject)".to_string() } else { subject.clone() },
-                        body: body.clone(),
+                        subject: if subject.is_empty() { "(No Subject)".to_string() } else { subject },
+                        body,
                         date: "Just now".to_string(),
                         read: true,
                         folder: "sent".to_string(),
                     };
                     self.emails.push(new_email);
-                    save_emails(&self.emails);
+                    self.save_emails();
                     self.compose_open = false;
-                    self.status_message = Some(("Email Sent Successfully".to_string(), 4.0));
                 } else {
                     self.status_message = Some(("Recipient is required".to_string(), 4.0));
                 }
@@ -676,7 +1097,7 @@ impl Application for ClearEmailApp {
                     if permanently_deleted {
                         self.emails.retain(|e| e.id != id);
                     }
-                    save_emails(&self.emails);
+                    self.save_emails();
                     self.selected_email_id = None;
                     self.status_message = Some((
                         if permanently_deleted { "Email Deleted Permanently" } else { "Moved to Trash" }.to_string(),
@@ -691,25 +1112,36 @@ impl Application for ClearEmailApp {
                     if let Some(email) = self.emails.iter_mut().find(|e| e.id == id) {
                         email.read = !email.read;
                     }
-                    save_emails(&self.emails);
+                    self.save_emails();
                 }
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
             AppMessage::SelectAccount(idx) => {
                 self.selected_account_idx = idx;
+                if let Some(acc) = self.accounts.get(idx) {
+                    self.emails = load_emails_for_account(&acc.email);
+                    sync_imap(acc.clone(), self.sender.clone());
+                } else {
+                    self.emails = Vec::new();
+                }
+                self.selected_email_id = None;
+                self.email_list.set_scroll_y(0.0);
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
             AppMessage::AddAccount => {
-                let next_idx = self.accounts.len() + 1;
-                self.accounts.push(AccountInfo {
-                    email: format!("user{}@clear-ui.org", next_idx),
-                    imap: format!("imap{}.clear-ui.org:993", next_idx),
-                    smtp: format!("smtp{}.clear-ui.org:465", next_idx),
-                    is_default: false,
-                });
-                self.status_message = Some(("New Mock Account Added".to_string(), 4.0));
+                // Clear all Add Account inputs
+                self.add_acc_email.text = String::new();
+                self.add_acc_email.edit_buffer = String::new();
+                self.add_acc_password.text = String::new();
+                self.add_acc_password.edit_buffer = String::new();
+                self.add_acc_imap.text = String::new();
+                self.add_acc_imap.edit_buffer = String::new();
+                self.add_acc_smtp.text = String::new();
+                self.add_acc_smtp.edit_buffer = String::new();
+                
+                self.account_dialog_open = true;
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -717,7 +1149,72 @@ impl Application for ClearEmailApp {
                 for (i, acc) in self.accounts.iter_mut().enumerate() {
                     acc.is_default = i == self.selected_account_idx;
                 }
+                save_accounts(&self.accounts);
                 self.status_message = Some(("Default Account Changed".to_string(), 4.0));
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::Status(msg) => {
+                self.status_message = Some((msg, 4.0));
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::EmailsSynced(email, list) => {
+                // Determine if we should update memory state (only if active account is still this one)
+                if let Some(acc) = self.accounts.get(self.selected_account_idx) {
+                    if acc.email == email {
+                        let mut local_other = self.emails.clone();
+                        local_other.retain(|e| e.folder != "inbox");
+                        let mut merged = list.clone();
+                        merged.extend(local_other);
+                        self.emails = merged;
+                        save_emails_for_account(&email, &self.emails);
+                    } else {
+                        // Just write cache to disk
+                        let mut acc_emails = load_emails_for_account(&email);
+                        acc_emails.retain(|e| e.folder != "inbox");
+                        let mut merged = list.clone();
+                        merged.extend(acc_emails);
+                        save_emails_for_account(&email, &merged);
+                    }
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::AddAccountSave => {
+                let email = if self.add_acc_email.editing { &self.add_acc_email.edit_buffer } else { &self.add_acc_email.text }.trim().to_string();
+                let password = if self.add_acc_password.editing { &self.add_acc_password.edit_buffer } else { &self.add_acc_password.text }.trim().to_string();
+                let imap = if self.add_acc_imap.editing { &self.add_acc_imap.edit_buffer } else { &self.add_acc_imap.text }.trim().to_string();
+                let smtp = if self.add_acc_smtp.editing { &self.add_acc_smtp.edit_buffer } else { &self.add_acc_smtp.text }.trim().to_string();
+
+                if email.is_empty() || password.is_empty() || imap.is_empty() || smtp.is_empty() {
+                    self.status_message = Some(("All fields are required".to_string(), 4.0));
+                } else {
+                    let is_default = self.accounts.is_empty();
+                    let new_acc = AccountInfo {
+                        email: email.clone(),
+                        imap,
+                        smtp,
+                        is_default,
+                        password,
+                    };
+                    self.accounts.push(new_acc.clone());
+                    save_accounts(&self.accounts);
+
+                    self.selected_account_idx = self.accounts.len() - 1;
+                    self.emails = load_emails_for_account(&email);
+                    
+                    // Trigger sync
+                    sync_imap(new_acc, self.sender.clone());
+                    
+                    self.account_dialog_open = false;
+                    self.status_message = Some(("Account Added Successfully".to_string(), 4.0));
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::AddAccountCancel => {
+                self.account_dialog_open = false;
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -885,6 +1382,20 @@ impl Application for ClearEmailApp {
                 self.btn_compose_cancel.set_rect(modal_x + 410.0, modal_y + 375.0, 75.0, 28.0);
             }
 
+            // Add Account inputs layout
+            if self.account_dialog_open {
+                let modal_x = ((w_f32 - 500.0) / 2.0).max(0.0);
+                let modal_y = ((h_f32 - 360.0) / 2.0).max(0.0);
+
+                self.add_acc_email.set_rect(modal_x + 140.0, modal_y + 50.0, 340.0, 26.0);
+                self.add_acc_password.set_rect(modal_x + 140.0, modal_y + 90.0, 340.0, 26.0);
+                self.add_acc_imap.set_rect(modal_x + 140.0, modal_y + 130.0, 340.0, 26.0);
+                self.add_acc_smtp.set_rect(modal_x + 140.0, modal_y + 170.0, 340.0, 26.0);
+
+                self.btn_add_acc_save.set_rect(modal_x + 320.0, modal_y + 310.0, 75.0, 28.0);
+                self.btn_add_acc_cancel.set_rect(modal_x + 410.0, modal_y + 310.0, 75.0, 28.0);
+            }
+
             self.rebuild_text_items();
             self.needs_rebuild = false;
         }
@@ -1003,6 +1514,29 @@ impl Application for ClearEmailApp {
             quads.extend(self.btn_compose_send.extra_quads());
             quads.extend(self.btn_compose_cancel.extra_quads());
         }
+
+        // 6. Add Account Dialog Overlay
+        if self.account_dialog_open {
+            let modal_x = ((w_f32 - 500.0) / 2.0).max(0.0);
+            let modal_y = ((h_f32 - 360.0) / 2.0).max(0.0);
+
+            // Semitransparent modal backdrop
+            quads.push((0.0, 0.0, w_f32, h_f32, [0.0, 0.0, 0.0, 0.6]));
+
+            // Modal dialog container
+            quads.push((modal_x, modal_y, 500.0, 360.0, [0.08, 0.08, 0.12, 1.0]));
+            quads.push((modal_x, modal_y, 500.0, 1.0, [0.25, 0.35, 0.50, 0.40]));
+            quads.push((modal_x, modal_y + 359.0, 500.0, 1.0, [0.25, 0.35, 0.50, 0.40]));
+            quads.push((modal_x, modal_y, 1.0, 360.0, [0.25, 0.35, 0.50, 0.40]));
+            quads.push((modal_x + 499.0, modal_y, 1.0, 360.0, [0.25, 0.35, 0.50, 0.40]));
+
+            quads.extend(self.add_acc_email.extra_quads());
+            quads.extend(self.add_acc_password.extra_quads());
+            quads.extend(self.add_acc_imap.extra_quads());
+            quads.extend(self.add_acc_smtp.extra_quads());
+            quads.extend(self.btn_add_acc_save.extra_quads());
+            quads.extend(self.btn_add_acc_cancel.extra_quads());
+        }
     }
 
     fn text_items(&self) -> &[TextItem] {
@@ -1014,7 +1548,14 @@ impl Application for ClearEmailApp {
         let px = pos.x as f32;
         let py = pos.y as f32;
 
-        if self.compose_open {
+        if self.account_dialog_open {
+            if self.add_acc_email.on_cursor_moved(px, py) { changed = true; }
+            if self.add_acc_password.on_cursor_moved(px, py) { changed = true; }
+            if self.add_acc_imap.on_cursor_moved(px, py) { changed = true; }
+            if self.add_acc_smtp.on_cursor_moved(px, py) { changed = true; }
+            if self.btn_add_acc_save.on_cursor_moved(px, py) { changed = true; }
+            if self.btn_add_acc_cancel.on_cursor_moved(px, py) { changed = true; }
+        } else if self.compose_open {
             if self.compose_to.on_cursor_moved(px, py) { changed = true; }
             if self.compose_subject.on_cursor_moved(px, py) { changed = true; }
             if self.compose_body.on_cursor_moved(px, py) { changed = true; }
@@ -1066,7 +1607,41 @@ impl Application for ClearEmailApp {
         let px = pos.x as f32;
         let py = pos.y as f32;
 
-        if self.compose_open {
+        if self.account_dialog_open {
+            if self.add_acc_email.mouse_input(button, state, px, py) { changed = true; }
+            if self.add_acc_password.mouse_input(button, state, px, py) { changed = true; }
+            if self.add_acc_imap.mouse_input(button, state, px, py) { changed = true; }
+            if self.add_acc_smtp.mouse_input(button, state, px, py) { changed = true; }
+
+            if self.btn_add_acc_save.mouse_input(button, state, px, py) {
+                changed = true;
+                if state == ElementState::Released && self.btn_add_acc_save.take_click() {
+                    msg_out = Some(AppMessage::AddAccountSave);
+                }
+            }
+            if self.btn_add_acc_cancel.mouse_input(button, state, px, py) {
+                changed = true;
+                if state == ElementState::Released && self.btn_add_acc_cancel.take_click() {
+                    msg_out = Some(AppMessage::AddAccountCancel);
+                }
+            }
+
+            // Click outside the modal clears focus
+            if !changed && state == ElementState::Pressed && button == MouseButton::Left {
+                let w_f32 = self.width as f32;
+                let h_f32 = self.height as f32;
+                let modal_x = ((w_f32 - 500.0) / 2.0).max(0.0);
+                let modal_y = ((h_f32 - 360.0) / 2.0).max(0.0);
+
+                if px < modal_x || px > modal_x + 500.0 || py < modal_y || py > modal_y + 360.0 {
+                    self.add_acc_email.unfocus();
+                    self.add_acc_password.unfocus();
+                    self.add_acc_imap.unfocus();
+                    self.add_acc_smtp.unfocus();
+                    changed = true;
+                }
+            }
+        } else if self.compose_open {
             if self.compose_to.mouse_input(button, state, px, py) { changed = true; }
             if self.compose_subject.mouse_input(button, state, px, py) { changed = true; }
             if self.compose_body.mouse_input(button, state, px, py) { changed = true; }
@@ -1264,7 +1839,43 @@ impl Application for ClearEmailApp {
         let mut handled = false;
         let mut msg_out = None;
 
-        if self.compose_open {
+        if self.account_dialog_open {
+            if self.add_acc_email.editing {
+                if self.add_acc_email.keyboard_input(event) {
+                    handled = true;
+                    // Auto-fill configuration based on email domain
+                    let email_val = self.add_acc_email.edit_buffer.trim().to_lowercase();
+                    if email_val.ends_with("@gmail.com") {
+                        self.add_acc_imap.text = "imap.gmail.com:993".to_string();
+                        self.add_acc_imap.edit_buffer = "imap.gmail.com:993".to_string();
+                        self.add_acc_smtp.text = "smtp.gmail.com:465".to_string();
+                        self.add_acc_smtp.edit_buffer = "smtp.gmail.com:465".to_string();
+                    } else if email_val.ends_with("@icloud.com") {
+                        self.add_acc_imap.text = "imap.mail.me.com:993".to_string();
+                        self.add_acc_imap.edit_buffer = "imap.mail.me.com:993".to_string();
+                        self.add_acc_smtp.text = "smtp.mail.me.com:587".to_string();
+                        self.add_acc_smtp.edit_buffer = "smtp.mail.me.com:587".to_string();
+                    } else if email_val.ends_with("@outlook.com") || email_val.ends_with("@hotmail.com") {
+                        self.add_acc_imap.text = "outlook.office365.com:993".to_string();
+                        self.add_acc_imap.edit_buffer = "outlook.office365.com:993".to_string();
+                        self.add_acc_smtp.text = "smtp.office365.com:587".to_string();
+                        self.add_acc_smtp.edit_buffer = "smtp.office365.com:587".to_string();
+                    }
+                }
+            } else if self.add_acc_password.editing {
+                if self.add_acc_password.keyboard_input(event) { handled = true; }
+            } else if self.add_acc_imap.editing {
+                if self.add_acc_imap.keyboard_input(event) { handled = true; }
+            } else if self.add_acc_smtp.editing {
+                if self.add_acc_smtp.keyboard_input(event) { handled = true; }
+            }
+
+            // Escape closes dialog
+            if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(clear_ui::widget::NamedKey::Escape) {
+                msg_out = Some(AppMessage::AddAccountCancel);
+                handled = true;
+            }
+        } else if self.compose_open {
             if self.compose_to.editing {
                 if self.compose_to.keyboard_input(event) { handled = true; }
             } else if self.compose_subject.editing {
