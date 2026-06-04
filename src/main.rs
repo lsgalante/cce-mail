@@ -150,6 +150,7 @@ fn get_accounts_path() -> std::path::PathBuf {
 }
 
 fn load_accounts() -> Vec<AccountInfo> {
+    let _ = load_google_client_config();
     let path = get_accounts_path();
     if path.exists() {
         if let Ok(content) = std::fs::read_to_string(&path) {
