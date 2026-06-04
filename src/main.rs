@@ -134,6 +134,15 @@ fn get_accounts_path() -> std::path::PathBuf {
     let p = std::path::PathBuf::from("/home/lsgalante/.config/ccec");
     if !p.exists() {
         let _ = std::fs::create_dir_all(&p);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(&p) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o700);
+                let _ = std::fs::set_permissions(&p, perms);
+            }
+        }
     }
     p.join("accounts.json")
 }
@@ -168,6 +177,15 @@ fn save_accounts(accounts: &[AccountInfo]) {
     let path = get_accounts_path();
     if let Ok(content) = serde_json::to_string_pretty(accounts) {
         let _ = std::fs::write(&path, content);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&path, perms);
+            }
+        }
     }
 }
 
