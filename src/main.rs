@@ -71,6 +71,7 @@ enum AppMessage {
     AddAccountOAuth,
     AddAccountSaveOAuth(AccountInfo),
     UpdateAccountTokens(String, Option<String>, Option<u64>),
+    AddAccountICloudHelp,
 }
 
 struct ClearEmailApp {
@@ -112,6 +113,7 @@ struct ClearEmailApp {
     btn_add_acc_save: Button,
     btn_add_acc_cancel: Button,
     btn_add_acc_oauth: Button,
+    btn_add_acc_icloud: Button,
 
     // Application state
     emails: Vec<Email>,
@@ -1035,6 +1037,7 @@ impl ClearEmailApp {
             labels.extend(self.btn_add_acc_save.text_labels());
             labels.extend(self.btn_add_acc_cancel.text_labels());
             labels.extend(self.btn_add_acc_oauth.text_labels());
+            labels.extend(self.btn_add_acc_icloud.text_labels());
 
             // 7a. Add Account Inputs text labels
             self.add_acc_email.prepare_text(font_system);
@@ -1172,7 +1175,8 @@ impl Application for ClearEmailApp {
 
         let btn_add_acc_save = Button::new(0.0, 0.0, 75.0, 28.0).with_label("Save");
         let btn_add_acc_cancel = Button::new_reset(0.0, 0.0, 75.0, 28.0).with_label("Cancel");
-        let btn_add_acc_oauth = Button::new(0.0, 0.0, 180.0, 28.0).with_label("Click to Login (Google)");
+        let btn_add_acc_oauth = Button::new(0.0, 0.0, 140.0, 28.0).with_label("Login (Google)");
+        let btn_add_acc_icloud = Button::new(0.0, 0.0, 140.0, 28.0).with_label("Login (iCloud)");
         let btn_login_oauth = Button::new(0.0, 0.0, 180.0, 28.0).with_label("Click to Login (Browser)");
 
         let emails = if let Some(acc) = accounts.get(selected_account_idx) {
@@ -1213,6 +1217,7 @@ impl Application for ClearEmailApp {
             btn_add_acc_save,
             btn_add_acc_cancel,
             btn_add_acc_oauth,
+            btn_add_acc_icloud,
             emails,
             current_folder: Folder::Inbox,
             selected_email_id: None,
@@ -1525,6 +1530,12 @@ impl Application for ClearEmailApp {
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
+            AppMessage::AddAccountICloudHelp => {
+                let _ = std::process::Command::new("xdg-open").arg("https://appleid.apple.com/").spawn();
+                self.status_message = Some(("Log in & generate an App-Specific Password on appleid.apple.com".to_string(), 6.0));
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
             AppMessage::AddAccountSaveOAuth(new_acc) => {
                 let mut acc = new_acc;
                 if let Some(existing_idx) = self.accounts.iter().position(|a| a.email == acc.email) {
@@ -1743,7 +1754,10 @@ impl Application for ClearEmailApp {
 
                 self.btn_add_acc_save.set_rect(modal_x + 320.0, modal_y + 310.0, 75.0, 28.0);
                 self.btn_add_acc_cancel.set_rect(modal_x + 410.0, modal_y + 310.0, 75.0, 28.0);
-                self.btn_add_acc_oauth.set_rect(modal_x + 15.0, modal_y + 310.0, 180.0, 28.0);
+                self.btn_add_acc_oauth.set_rect(modal_x + 15.0, modal_y + 310.0, 140.0, 28.0);
+                self.btn_add_acc_icloud.set_rect(modal_x + 165.0, modal_y + 310.0, 140.0, 28.0);
+            } else {
+                self.btn_add_acc_icloud.set_rect(-9999.0, -9999.0, 0.0, 0.0);
             }
 
             self.rebuild_text_items();
@@ -1890,6 +1904,7 @@ impl Application for ClearEmailApp {
             quads.extend(self.btn_add_acc_save.extra_quads());
             quads.extend(self.btn_add_acc_cancel.extra_quads());
             quads.extend(self.btn_add_acc_oauth.extra_quads());
+            quads.extend(self.btn_add_acc_icloud.extra_quads());
         }
     }
 
@@ -1910,6 +1925,7 @@ impl Application for ClearEmailApp {
             if self.btn_add_acc_save.on_cursor_moved(px, py) { changed = true; }
             if self.btn_add_acc_cancel.on_cursor_moved(px, py) { changed = true; }
             if self.btn_add_acc_oauth.on_cursor_moved(px, py) { changed = true; }
+            if self.btn_add_acc_icloud.on_cursor_moved(px, py) { changed = true; }
         } else if self.compose_open {
             if self.compose_to.on_cursor_moved(px, py) { changed = true; }
             if self.compose_subject.on_cursor_moved(px, py) { changed = true; }
@@ -1987,6 +2003,12 @@ impl Application for ClearEmailApp {
                 changed = true;
                 if state == ElementState::Released && self.btn_add_acc_oauth.take_click() {
                     msg_out = Some(AppMessage::AddAccountOAuth);
+                }
+            }
+            if self.btn_add_acc_icloud.mouse_input(button, state, px, py) {
+                changed = true;
+                if state == ElementState::Released && self.btn_add_acc_icloud.take_click() {
+                    msg_out = Some(AppMessage::AddAccountICloudHelp);
                 }
             }
 
