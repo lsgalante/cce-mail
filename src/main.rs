@@ -753,6 +753,13 @@ impl ClearEmailApp {
         let w_f32 = self.width as f32;
         let h_f32 = self.height as f32;
 
+        let sidebar_w = self.paginator.sidebar_w();
+        let list_x = sidebar_w + 10.0;
+        let detail_x = list_x + 325.0;
+        let separator_x = list_x + 310.0;
+        let (tab_w, _tab_h) = self.paginator.vertical_tab_size();
+        let margin_x = (sidebar_w - tab_w) / 2.0;
+
         // 1. Sidebar Buttons text labels
         labels.extend(self.btn_compose.text_labels());
         labels.extend(self.paginator.text_labels());
@@ -764,7 +771,7 @@ impl ClearEmailApp {
             let est_w = TextLabel::estimate_width(&badge_text, 10.0);
             labels.push(TextLabel {
                 text: badge_text,
-                x: 8.0 + (40.0 - est_w) / 2.0,
+                x: margin_x + (tab_w - est_w) / 2.0,
                 y: 84.0,
                 font_size: 10.0,
                 color: [0xff, 0xff, 0xff],
@@ -797,7 +804,7 @@ impl ClearEmailApp {
                 if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
                     labels.push(TextLabel {
                         text: acc.email.clone(),
-                        x: 86.0,
+                        x: list_x + 20.0,
                         y: draw_y + 12.0,
                         font_size: 11.0,
                         color: [0xff, 0xff, 0xff],
@@ -805,7 +812,7 @@ impl ClearEmailApp {
 
                     labels.push(TextLabel {
                         text: if acc.is_default { "Default Account".to_string() } else { "Secondary Account".to_string() },
-                        x: 86.0,
+                        x: list_x + 20.0,
                         y: draw_y + 28.0,
                         font_size: 9.0,
                         color: if acc.is_default { [0x3a, 0xff, 0x80] } else { [0x70, 0x70, 0x75] },
@@ -839,7 +846,7 @@ impl ClearEmailApp {
                     // Sender name
                     labels.push(TextLabel {
                         text: if email.from.len() > 24 { format!("{}...", &email.from[..21]) } else { email.from.clone() },
-                        x: 86.0,
+                        x: list_x + 20.0,
                         y: draw_y + 6.0,
                         font_size: 11.0,
                         color: if !email.read { [0xff, 0xff, 0xff] } else { [0xb0, 0xb0, 0xb8] },
@@ -848,7 +855,7 @@ impl ClearEmailApp {
                     // Date
                     labels.push(TextLabel {
                         text: email.date.clone(),
-                        x: 316.0,
+                        x: list_x + 250.0,
                         y: draw_y + 7.0,
                         font_size: 9.0,
                         color: [0x70, 0x70, 0x75],
@@ -857,7 +864,7 @@ impl ClearEmailApp {
                     // Subject
                     labels.push(TextLabel {
                         text: if email.subject.len() > 32 { format!("{}...", &email.subject[..29]) } else { email.subject.clone() },
-                        x: 86.0,
+                        x: list_x + 20.0,
                         y: draw_y + 20.0,
                         font_size: 10.0,
                         color: if !email.read { [0x3a, 0x9a, 0xff] } else { [0x83, 0x83, 0x8a] },
@@ -868,7 +875,7 @@ impl ClearEmailApp {
                     let snippet = if snippet_raw.len() > 40 { format!("{}...", &snippet_raw[..37]) } else { snippet_raw };
                     labels.push(TextLabel {
                         text: snippet,
-                        x: 86.0,
+                        x: list_x + 20.0,
                         y: draw_y + 34.0,
                         font_size: 9.0,
                         color: [0x60, 0x60, 0x65],
@@ -886,24 +893,24 @@ impl ClearEmailApp {
                 // Subject Header (Account email)
                 labels.push(TextLabel {
                     text: acc.email.clone(),
-                    x: 391.0,
+                    x: detail_x,
                     y: 60.0,
                     font_size: 15.0,
                     color: [0xff, 0xff, 0xff],
                 });
 
                 // Settings details
-                labels.push(TextLabel { text: format!("Incoming Server (IMAP): {}", acc.imap), x: 391.0, y: 95.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
-                labels.push(TextLabel { text: format!("Outgoing Server (SMTP): {}", acc.smtp), x: 391.0, y: 120.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
+                labels.push(TextLabel { text: format!("Incoming Server (IMAP): {}", acc.imap), x: detail_x, y: 95.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
+                labels.push(TextLabel { text: format!("Outgoing Server (SMTP): {}", acc.smtp), x: detail_x, y: 120.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
                 let auth_text = if acc.is_oauth {
                     "Authentication:          OAuth2 (Google)"
                 } else {
                     "Authentication:          SSL/TLS, Normal Password"
                 };
-                labels.push(TextLabel { text: auth_text.to_string(), x: 391.0, y: 145.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                labels.push(TextLabel { text: auth_text.to_string(), x: detail_x, y: 145.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
                 labels.push(TextLabel {
                     text: format!("Default Account:         {}", if acc.is_default { "Yes" } else { "No" }),
-                    x: 391.0,
+                    x: detail_x,
                     y: 170.0,
                     font_size: 11.0,
                     color: if acc.is_default { [0x3a, 0xff, 0x80] } else { [0x83, 0x83, 0x8a] },
@@ -921,16 +928,16 @@ impl ClearEmailApp {
                 // Subject Header
                 labels.push(TextLabel {
                     text: email.subject.clone(),
-                    x: 391.0,
+                    x: detail_x,
                     y: 60.0,
                     font_size: 15.0,
                     color: [0xff, 0xff, 0xff],
                 });
 
                 // Metadata
-                labels.push(TextLabel { text: format!("From: {}", email.from), x: 391.0, y: 85.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
-                labels.push(TextLabel { text: format!("To:   {}", email.to), x: 391.0, y: 105.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-                labels.push(TextLabel { text: format!("Date: {}", email.date), x: 391.0, y: 125.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                labels.push(TextLabel { text: format!("From: {}", email.from), x: detail_x, y: 85.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
+                labels.push(TextLabel { text: format!("To:   {}", email.to), x: detail_x, y: 105.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                labels.push(TextLabel { text: format!("Date: {}", email.date), x: detail_x, y: 125.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
 
                 // Body rendering
                 self.detail_body.prepare_text(font_system);
@@ -951,10 +958,10 @@ impl ClearEmailApp {
         } else {
             let placeholder = "Select an email to view its content".to_string();
             let est_w = TextLabel::estimate_width(&placeholder, 13.0);
-            let px = 376.0 + ((w_f32 - 376.0) - est_w) / 2.0;
+            let px = separator_x + ((w_f32 - separator_x) - est_w) / 2.0;
             labels.push(TextLabel {
                 text: placeholder,
-                x: px.max(380.0),
+                x: px.max(separator_x + 4.0),
                 y: h_f32 / 2.0 - 10.0,
                 font_size: 13.0,
                 color: [0x60, 0x60, 0x65],
@@ -1159,6 +1166,7 @@ impl Application for ClearEmailApp {
     type Message = AppMessage;
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
+        clear_ui::scale::set_scale_factor(1.0);
         let btn_compose = Button::new(10.0, 15.0, 36.0, 36.0).with_label("+");
         let mut paginator = Paginator::new(56.0, vec![
             "Inbox".to_string(),
@@ -1641,13 +1649,21 @@ impl Application for ClearEmailApp {
             Folder::Accounts => "accounts",
         };
 
+        let sidebar_w = self.paginator.sidebar_w();
+        let list_x = sidebar_w + 10.0;
+        let detail_x = list_x + 325.0;
+        let separator_x = list_x + 310.0;
+        let detail_panel_x = separator_x + 1.0;
+        let (tab_w, _tab_h) = self.paginator.vertical_tab_size();
+        let margin_x = (sidebar_w - tab_w) / 2.0;
+
         if self.needs_rebuild || size_changed {
             // Sidebar buttons layout
-            self.btn_compose.set_rect(10.0, 15.0, 36.0, 36.0);
+            self.btn_compose.set_rect((sidebar_w - 36.0) / 2.0, 15.0, 36.0, 36.0);
 
             // Set paginator layout
-            self.paginator.set_scale_factor(scale as f32);
-            self.paginator.set_rect(0.0, 0.0, 56.0, h_f32);
+            clear_ui::scale::set_scale_factor(scale as f32);
+            self.paginator.set_rect(0.0, 0.0, sidebar_w, h_f32);
             let folder_idx = match self.current_folder {
                 Folder::Inbox => 0,
                 Folder::Sent => 1,
@@ -1658,10 +1674,10 @@ impl Application for ClearEmailApp {
 
             // Search box / Add Account and Scrolling list
             let list_count = if self.current_folder == Folder::Accounts {
-                self.btn_add_account.set_rect(66.0, 15.0, 300.0, 26.0);
+                self.btn_add_account.set_rect(list_x, 15.0, 300.0, 26.0);
                 self.accounts.len()
             } else {
-                self.search_box.set_rect(66.0, 15.0, 300.0, 26.0);
+                self.search_box.set_rect(list_x, 15.0, 300.0, 26.0);
                 
                 // Get filtered emails count for bounds setup
                 self.emails.iter()
@@ -1680,7 +1696,7 @@ impl Application for ClearEmailApp {
                     .count()
             };
 
-            self.email_list.set_rect(66.0, 55.0, 300.0, h_f32 - 70.0);
+            self.email_list.set_rect(list_x, 55.0, 300.0, h_f32 - 70.0);
             self.email_list.update_bounds(list_count, 55.0, h_f32 - 70.0);
 
             if self.email_buttons.len() != list_count {
@@ -1721,7 +1737,7 @@ impl Application for ClearEmailApp {
                 for idx in 0..self.accounts.len() {
                     self.email_buttons[idx].selected = idx == self.selected_account_idx;
                     if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                        self.email_buttons[idx].set_rect(66.0, draw_y, 300.0, 54.0);
+                        self.email_buttons[idx].set_rect(list_x, draw_y, 300.0, 54.0);
                     } else {
                         self.email_buttons[idx].set_rect(-9999.0, -9999.0, 0.0, 0.0);
                     }
@@ -1729,10 +1745,10 @@ impl Application for ClearEmailApp {
 
                 // Detail View for selected account
                 if self.selected_account_idx < self.accounts.len() {
-                    self.btn_make_default.set_rect(391.0, 8.0, 120.0, 26.0);
+                    self.btn_make_default.set_rect(detail_x, 8.0, 120.0, 26.0);
                     let acc = &self.accounts[self.selected_account_idx];
                     if acc.is_oauth {
-                        self.btn_login_oauth.set_rect(391.0, 200.0, 180.0, 28.0);
+                        self.btn_login_oauth.set_rect(detail_x, 200.0, 180.0, 28.0);
                     } else {
                         self.btn_login_oauth.set_rect(-9999.0, -9999.0, 0.0, 0.0);
                     }
@@ -1746,7 +1762,7 @@ impl Application for ClearEmailApp {
                 for (idx, &(_email_id, is_selected)) in filtered_email_ids.iter().enumerate() {
                     self.email_buttons[idx].selected = is_selected;
                     if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                        self.email_buttons[idx].set_rect(66.0, draw_y, 300.0, 54.0);
+                        self.email_buttons[idx].set_rect(list_x, draw_y, 300.0, 54.0);
                     } else {
                         self.email_buttons[idx].set_rect(-9999.0, -9999.0, 0.0, 0.0);
                     }
@@ -1754,15 +1770,15 @@ impl Application for ClearEmailApp {
 
                 // Detail View
                 if let Some((read, body)) = selected_email_state {
-                    self.btn_reply.set_rect(391.0, 8.0, 70.0, 26.0);
-                    self.btn_delete.set_rect(471.0, 8.0, 80.0, 26.0);
-                    self.btn_unread.set_rect(561.0, 8.0, 110.0, 26.0);
+                    self.btn_reply.set_rect(detail_x, 8.0, 70.0, 26.0);
+                    self.btn_delete.set_rect(detail_x + 80.0, 8.0, 80.0, 26.0);
+                    self.btn_unread.set_rect(detail_x + 170.0, 8.0, 110.0, 26.0);
                     if let Some(base) = self.btn_unread.base_mut() {
                         base.label = Some((if read { "Mark Unread" } else { "Mark Read" }).to_string());
                     }
 
-                    let detail_w = (w_f32 - 406.0).max(100.0);
-                    self.detail_body.set_rect(391.0, 170.0, detail_w, (h_f32 - 190.0).max(100.0));
+                    let detail_w = (w_f32 - (detail_x + 15.0)).max(100.0);
+                    self.detail_body.set_rect(detail_x, 170.0, detail_w, (h_f32 - 190.0).max(100.0));
                     self.detail_body.text = body;
                 }
             }
@@ -1826,8 +1842,8 @@ impl Application for ClearEmailApp {
         quads.push((0.0, 0.0, w_f32, h_f32, [0.05, 0.05, 0.07, 1.0]));
 
         // 2. Sidebar background panel
-        quads.push((0.0, 0.0, 56.0, h_f32, [0.08, 0.08, 0.12, 1.0]));
-        quads.push((56.0, 0.0, 1.0, h_f32, [0.18, 0.18, 0.22, 1.0])); // sidebar separator
+        quads.push((0.0, 0.0, sidebar_w, h_f32, [0.08, 0.08, 0.12, 1.0]));
+        quads.push((sidebar_w, 0.0, 1.0, h_f32, [0.18, 0.18, 0.22, 1.0])); // sidebar separator
 
         // Compose Button and Folders Graphics
         quads.extend(self.btn_compose.extra_quads());
@@ -1836,13 +1852,13 @@ impl Application for ClearEmailApp {
         // Draw badge pill for inbox unread (centered on vertical rotated tab)
         let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
         if inbox_unread > 0 {
-            let bx = 8.0;
+            let bx = margin_x;
             let by = 70.0;
-            quads.push((bx + (40.0 - 22.0) / 2.0, by + 12.0, 22.0, 16.0, [0.20, 0.45, 0.85, 0.8]));
+            quads.push((bx + (tab_w - 22.0) / 2.0, by + 12.0, 22.0, 16.0, [0.20, 0.45, 0.85, 0.8]));
         }
 
         // 3. Email List Panel Separator
-        quads.push((376.0, 0.0, 1.0, h_f32, [0.18, 0.18, 0.22, 1.0]));
+        quads.push((separator_x, 0.0, 1.0, h_f32, [0.18, 0.18, 0.22, 1.0]));
 
         // Search box / Add Account and List
         if self.current_folder == Folder::Accounts {
@@ -1865,7 +1881,7 @@ impl Application for ClearEmailApp {
                 // Blue dot/unread indicator for this row (emails only)
                 if self.current_folder != Folder::Accounts && !filtered[idx].read {
                     if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                        quads.push((74.0, draw_y + 12.0, 6.0, 6.0, [0.20, 0.45, 0.85, 1.0]));
+                        quads.push((list_x + 8.0, draw_y + 12.0, 6.0, 6.0, [0.20, 0.45, 0.85, 1.0]));
                     }
                 }
             }
@@ -1875,8 +1891,8 @@ impl Application for ClearEmailApp {
         if self.current_folder == Folder::Accounts {
             if self.selected_account_idx < self.accounts.len() {
                 // Top action toolbar background
-                quads.push((377.0, 0.0, w_f32 - 377.0, 42.0, [0.08, 0.08, 0.12, 1.0]));
-                quads.push((377.0, 42.0, w_f32 - 377.0, 1.0, [0.18, 0.18, 0.22, 1.0]));
+                quads.push((detail_panel_x, 0.0, w_f32 - detail_panel_x, 42.0, [0.08, 0.08, 0.12, 1.0]));
+                quads.push((detail_panel_x, 42.0, w_f32 - detail_panel_x, 1.0, [0.18, 0.18, 0.22, 1.0]));
 
                 quads.extend(self.btn_make_default.extra_quads());
                 if self.accounts[self.selected_account_idx].is_oauth {
@@ -1886,8 +1902,8 @@ impl Application for ClearEmailApp {
         } else if let Some(selected_id) = self.selected_email_id {
             if self.emails.iter().any(|e| e.id == selected_id) {
                 // Top action toolbar background
-                quads.push((377.0, 0.0, w_f32 - 377.0, 42.0, [0.08, 0.08, 0.12, 1.0]));
-                quads.push((377.0, 42.0, w_f32 - 377.0, 1.0, [0.18, 0.18, 0.22, 1.0]));
+                quads.push((detail_panel_x, 0.0, w_f32 - detail_panel_x, 42.0, [0.08, 0.08, 0.12, 1.0]));
+                quads.push((detail_panel_x, 42.0, w_f32 - detail_panel_x, 1.0, [0.18, 0.18, 0.22, 1.0]));
 
                 quads.extend(self.btn_reply.extra_quads());
                 quads.extend(self.btn_delete.extra_quads());
@@ -1973,7 +1989,8 @@ impl Application for ClearEmailApp {
         } else {
             // Sidebar buttons
             if self.btn_compose.on_cursor_moved(px, py) { changed = true; }
-            if px < 56.0 {
+            let sidebar_w = self.paginator.sidebar_w();
+            if px < sidebar_w {
                 if self.paginator.on_cursor_moved(px, py) { changed = true; }
             }
 
@@ -2105,7 +2122,8 @@ impl Application for ClearEmailApp {
                     msg_out = Some(AppMessage::ComposeNew);
                 }
             }
-            if px < 56.0 {
+            let sidebar_w = self.paginator.sidebar_w();
+            if px < sidebar_w {
                 if self.paginator.mouse_input(button, state, px, py) {
                     changed = true;
                     if self.paginator.take_click() {
