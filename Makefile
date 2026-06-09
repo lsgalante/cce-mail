@@ -5,7 +5,7 @@ build:
 
 install: build
 	mkdir -p ~/.local/bin
-	install -m 755 target/release/clear-email-interface ~/.local/bin/clear-email-interface
+	install -m 755 target/release/cce-email ~/.local/bin/cce-email
 
 run:
 	cargo run
