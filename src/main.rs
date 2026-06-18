@@ -1,11 +1,11 @@
 use wayland_client::QueueHandle;
 use glyphon::{FontSystem, Buffer, Metrics, Attrs};
-use clear_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
-use clear_ui::widget::{
+use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
+use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, TextItem, Element,
     TextBox, Button, TextLabel, Key, ScrollingList, Paginator
 };
-use clear_ui::context::UiContext;
+use cce_ui::context::UiContext;
 use native_tls::TlsConnector;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
@@ -163,9 +163,9 @@ fn load_accounts() -> Vec<AccountInfo> {
     }
     vec![
         AccountInfo {
-            email: "lsgalante@clear-ui.org".to_string(),
-            imap: "imap.clear-ui.org:993".to_string(),
-            smtp: "smtp.clear-ui.org:465".to_string(),
+            email: "lsgalante@cce-ui.org".to_string(),
+            imap: "imap.cce-ui.org:993".to_string(),
+            smtp: "smtp.cce-ui.org:465".to_string(),
             is_default: true,
             password: "mock_password".to_string(),
             is_oauth: false,
@@ -212,7 +212,7 @@ fn load_emails_for_account(email: &str) -> Vec<Email> {
             }
         }
     }
-    if email == "lsgalante@clear-ui.org" {
+    if email == "lsgalante@cce-ui.org" {
         return get_default_mock_emails();
     }
     Vec::new()
@@ -444,7 +444,7 @@ impl imap::Authenticator for ImapOAuth2 {
 fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessage>) {
     std::thread::spawn(move || {
         // Skip connecting for mock credentials
-        if account.password == "mock_password" || account.email == "lsgalante@clear-ui.org" {
+        if account.password == "mock_password" || account.email == "lsgalante@cce-ui.org" {
             return;
         }
 
@@ -699,18 +699,18 @@ fn get_default_mock_emails() -> Vec<Email> {
     vec![
         Email {
             id: 1,
-            from: "System Daemon <daemon@clear-ui.org>".to_string(),
-            to: "lsgalante@clear-ui.org".to_string(),
+            from: "System Daemon <daemon@cce-ui.org>".to_string(),
+            to: "lsgalante@cce-ui.org".to_string(),
             subject: "Welcome to Clear Mail".to_string(),
-            body: "Welcome to the Clear Computing Environment (CCE) email client!\n\nThis application is built entirely using the clear-ui Rust framework, running on top of Wayland and wgpu. It provides a premium, responsive dark slate interface.\n\nEnjoy the clean lines and micro-animations!\n\nBest,\nSystem Daemon".to_string(),
+            body: "Welcome to the Clear Computing Environment (CCE) email client!\n\nThis application is built entirely using the cce-ui Rust framework, running on top of Wayland and wgpu. It provides a premium, responsive dark slate interface.\n\nEnjoy the clean lines and micro-animations!\n\nBest,\nSystem Daemon".to_string(),
             date: "12:15 PM".to_string(),
             read: false,
             folder: "inbox".to_string(),
         },
         Email {
             id: 2,
-            from: "Design Team <design@clear-ui.org>".to_string(),
-            to: "lsgalante@clear-ui.org".to_string(),
+            from: "Design Team <design@cce-ui.org>".to_string(),
+            to: "lsgalante@cce-ui.org".to_string(),
             subject: "Slate Dark Theme Palette Guidelines".to_string(),
             body: "Hi Lucas,\n\nWe have finalized the core Slate Dark styling color values for CCE application builders:\n- Window Background: [0.05, 0.05, 0.07, 1.0] (deep slate blue)\n- Sidebar Background: [0.08, 0.08, 0.12, 1.0]\n- Selection Highlight: [0.20, 0.45, 0.85, 0.50] (high contrast premium blue)\n- Text Bright: [0.88, 0.88, 0.92, 1.0]\n- Text Muted: [0.51, 0.51, 0.54, 1.0]\n\nPlease align all interface panels and layouts to use these values.\n\nThanks,\nDesign Team".to_string(),
             date: "Yesterday".to_string(),
@@ -720,7 +720,7 @@ fn get_default_mock_emails() -> Vec<Email> {
         Email {
             id: 3,
             from: "Codeberg CI <ci@codeberg.org>".to_string(),
-            to: "lsgalante@clear-ui.org".to_string(),
+            to: "lsgalante@cce-ui.org".to_string(),
             subject: "Build Success: cce-email (main)".to_string(),
             body: "Repository: lsgalante/cce-email\nBranch: main\nCommit: da8cf20fcb2c993c1c048ced4020\nStatus: SUCCESS\n\nAll unit tests passed. Binary compiled in 48.2s.\n\n---\nCodeberg Actions".to_string(),
             date: "June 3".to_string(),
@@ -729,8 +729,8 @@ fn get_default_mock_emails() -> Vec<Email> {
         },
         Email {
             id: 4,
-            from: "lsgalante@clear-ui.org".to_string(),
-            to: "Design Team <design@clear-ui.org>".to_string(),
+            from: "lsgalante@cce-ui.org".to_string(),
+            to: "Design Team <design@cce-ui.org>".to_string(),
             subject: "Re: Slate Dark Theme Palette Guidelines".to_string(),
             body: "Thanks for sending the palette! I am implementing the email client right now using these specifications. The three-pane layout feels very premium.\n\n- Lucas".to_string(),
             date: "Yesterday".to_string(),
@@ -1169,7 +1169,7 @@ impl Application for ClearEmailApp {
     type Message = AppMessage;
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
-        clear_ui::scale::set_scale_factor(1.0);
+        cce_ui::scale::set_scale_factor(1.0);
         let btn_compose = Button::new(10.0, 15.0, 36.0, 36.0).with_label("+");
         let mut paginator = Paginator::new(56.0, vec![
             "Inbox".to_string(),
@@ -1666,7 +1666,7 @@ impl Application for ClearEmailApp {
             self.btn_compose.set_rect((sidebar_w - 36.0) / 2.0, 15.0, 36.0, 36.0);
 
             // Set paginator layout
-            clear_ui::scale::set_scale_factor(scale as f32);
+            cce_ui::scale::set_scale_factor(scale as f32);
             self.paginator.set_rect(0.0, 0.0, sidebar_w, h_f32);
             let folder_idx = match self.current_folder {
                 Folder::Inbox => 0,
@@ -2355,7 +2355,7 @@ impl Application for ClearEmailApp {
             }
 
             // Escape closes dialog
-            if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(clear_ui::widget::NamedKey::Escape) {
+            if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(cce_ui::widget::NamedKey::Escape) {
                 msg_out = Some(AppMessage::AddAccountCancel);
                 handled = true;
             }
@@ -2369,7 +2369,7 @@ impl Application for ClearEmailApp {
             }
 
             // Escape closes compose dialog
-            if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(clear_ui::widget::NamedKey::Escape) {
+            if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(cce_ui::widget::NamedKey::Escape) {
                 msg_out = Some(AppMessage::ComposeCancel);
                 handled = true;
             }
@@ -2404,7 +2404,7 @@ impl Application for ClearEmailApp {
             }
 
             // Escape unfocuses search
-            if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(clear_ui::widget::NamedKey::Escape) {
+            if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(cce_ui::widget::NamedKey::Escape) {
                 if self.current_folder != Folder::Accounts && self.search_box.editing {
                     ctx.clear_focus();
                     self.search_box.unfocus();
@@ -2426,5 +2426,5 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let _guard = rt.enter();
 
-    clear_ui::engine::run::<ClearEmailApp>();
+    cce_ui::engine::run::<ClearEmailApp>();
 }
