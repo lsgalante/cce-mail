@@ -3,7 +3,7 @@ use glyphon::{FontSystem, Buffer, Metrics, Attrs};
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, TextItem, Element,
-    TextBox, Button, TextLabel, Key, ScrollingList, MenuBar, PageSelector, MenuController
+    TextBox, Button, TextLabel, Key, ScrollingList, Paginator, PageSelector, MenuController
 };
 use cce_ui::context::UiContext;
 use native_tls::TlsConnector;
@@ -78,7 +78,7 @@ enum AppMessage {
 struct ClearEmailApp {
     // Navigation / Sidebar
     btn_compose: Button,
-    paginator: MenuBar,
+    paginator: Paginator,
 
     // Search and List View
     search_box: TextBox,
@@ -1171,9 +1171,7 @@ impl Application for ClearEmailApp {
     fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
         cce_ui::scale::set_scale_factor(1.0);
         let btn_compose = Button::new(10.0, 15.0, 36.0, 36.0).with_label("+");
-        let mut paginator = MenuBar::new(0.0, 0.0, 56.0, 0.0)
-            .with_vertical(true);
-        paginator.set_pages(vec![
+        let paginator = Paginator::new(56.0, vec![
             "Inbox".to_string(),
             "Sent".to_string(),
             "Trash".to_string(),
