@@ -3,7 +3,7 @@ use glyphon::{FontSystem, Buffer, Metrics, Attrs};
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, TextItem, Element,
-    TextBox, Button, TextLabel, Key, ScrollingList, Paginator
+    TextBox, Button, TextLabel, Key, ScrollingList, MenuBar, PageSelector, MenuController
 };
 use cce_ui::context::UiContext;
 use native_tls::TlsConnector;
@@ -78,7 +78,7 @@ enum AppMessage {
 struct ClearEmailApp {
     // Navigation / Sidebar
     btn_compose: Button,
-    paginator: Paginator,
+    paginator: MenuBar,
 
     // Search and List View
     search_box: TextBox,
@@ -760,7 +760,7 @@ impl ClearEmailApp {
         let list_x = sidebar_w + 10.0;
         let detail_x = list_x + 325.0;
         let separator_x = list_x + 310.0;
-        let (tab_w, _tab_h) = self.paginator.vertical_tab_size();
+        let tab_w = 46.0;
         let margin_x = (sidebar_w - tab_w) / 2.0;
 
         // 1. Sidebar Buttons text labels
@@ -1171,15 +1171,14 @@ impl Application for ClearEmailApp {
     fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
         cce_ui::scale::set_scale_factor(1.0);
         let btn_compose = Button::new(10.0, 15.0, 36.0, 36.0).with_label("+");
-        let mut paginator = Paginator::new(56.0, vec![
+        let mut paginator = MenuBar::new(0.0, 0.0, 56.0, 0.0)
+            .with_vertical(true);
+        paginator.set_pages(vec![
             "Inbox".to_string(),
             "Sent".to_string(),
             "Trash".to_string(),
             "Accounts".to_string(),
         ]);
-        paginator.tabs_rotated = true;
-        paginator.tabs_at_top = false;
-        paginator.tab_y_offset = 70.0;
 
         let mut search_box = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
         search_box.font_size = 11.0;
@@ -1658,7 +1657,7 @@ impl Application for ClearEmailApp {
         let detail_x = list_x + 325.0;
         let separator_x = list_x + 310.0;
         let detail_panel_x = separator_x + 1.0;
-        let (tab_w, _tab_h) = self.paginator.vertical_tab_size();
+        let tab_w = 46.0;
         let margin_x = (sidebar_w - tab_w) / 2.0;
 
         if self.needs_rebuild || size_changed {
@@ -2155,8 +2154,7 @@ impl Application for ClearEmailApp {
             if px < sidebar_w {
                 if self.paginator.mouse_input(button, state, px, py, ctx) {
                     changed = true;
-                    if self.paginator.take_click() {
-                        let page = self.paginator.selected_page();
+                    if let Some((page, _)) = self.paginator.menu_click() {
                         let folder = match page {
                             0 => Folder::Inbox,
                             1 => Folder::Sent,
