@@ -1168,10 +1168,14 @@ impl ClearEmailApp {
 impl Application for ClearEmailApp {
     type Message = AppMessage;
 
+    fn ui_context(&self) -> Option<&cce_ui::context::UiContext> {
+        Some(&self.ui_context)
+    }
+
     fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
         cce_ui::scale::set_scale_factor(1.0);
         let btn_compose = Button::new(10.0, 15.0, 36.0, 36.0).with_label("+");
-        let paginator = Paginator::new(56.0, vec![
+        let paginator = Paginator::new(vec![
             "Inbox".to_string(),
             "Sent".to_string(),
             "Trash".to_string(),
