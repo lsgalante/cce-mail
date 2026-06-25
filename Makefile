@@ -5,7 +5,7 @@ build:
 
 install: build
 	mkdir -p ~/.local/bin
-	install -m 755 target/release/cce-email ~/.local/bin/cce-email
+	install -m 755 ../target/release/cce-email ~/.local/bin/cce-email
 
 run:
 	cargo run
