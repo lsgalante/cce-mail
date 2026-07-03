@@ -299,16 +299,34 @@ fn load_google_client_config() -> GoogleClientConfig {
     default_config
 }
 
-async fn exchange_code_for_tokens(code: String, sender: calloop::channel::Sender<AppMessage>) {
+fn generate_pkce() -> (String, String) {
+    use ring::rand::SecureRandom;
+    use base64::Engine;
+    let rand = ring::rand::SystemRandom::new();
+    let mut bytes = [0u8; 32];
+    rand.fill(&mut bytes).unwrap();
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    
+    let hash = ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.as_ref());
+    
+    (verifier, challenge)
+}
+
+async fn exchange_code_for_tokens(code: String, verifier: String, sender: calloop::channel::Sender<AppMessage>) {
     let client_config = load_google_client_config();
     let client = reqwest::Client::new();
-    let params = [
+    let mut params = vec![
         ("code", code.as_str()),
         ("client_id", client_config.client_id.as_str()),
-        ("client_secret", client_config.client_secret.as_str()),
         ("redirect_uri", "http://127.0.0.1:8080"),
         ("grant_type", "authorization_code"),
+        ("code_verifier", verifier.as_str()),
     ];
+    if !client_config.client_secret.is_empty() && client_config.client_secret != "GOCSPX-dummysecret" {
+        params.push(("client_secret", client_config.client_secret.as_str()));
+    }
+
     
     match client.post("https://oauth2.googleapis.com/token")
         .form(&params)
@@ -1545,9 +1563,12 @@ impl Application for ClearEmailApp {
                     
                     let _ = sender.send(AppMessage::Status("Waiting for browser login...".to_string()));
                     
+                    let (verifier, challenge) = generate_pkce();
+                    
                     let auth_url = format!(
-                        "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080&response_type=code&scope=https%3A%2F%2Fmail.google.com%2F&access_type=offline&prompt=consent",
-                        client_config.client_id
+                        "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080&response_type=code&scope=https%3A%2F%2Fmail.google.com%2F&access_type=offline&prompt=consent&code_challenge={}&code_challenge_method=S256",
+                        client_config.client_id,
+                        challenge
                     );
                     let _ = std::process::Command::new("xdg-open").arg(&auth_url).spawn();
 
@@ -1562,7 +1583,8 @@ impl Application for ClearEmailApp {
                                 let code = rest[..end_idx].to_string();
                                 
                                 let _ = sender.send(AppMessage::Status("Exchanging code for token...".to_string()));
-                                exchange_code_for_tokens(code, sender.clone()).await;
+                                exchange_code_for_tokens(code, verifier, sender.clone()).await;
+
                                 
                                 let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
                                                 <html><head><style>body { font-family: sans-serif; background-color: #08080c; color: #fff; text-align: center; padding-top: 50px; }</style></head><body><h2>Clear Mail Authentication Successful!</h2><p>You can close this tab and return to the application.</p></body></html>";
