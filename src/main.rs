@@ -3,7 +3,7 @@ use glyphon::{FontSystem, Buffer, Metrics, Attrs};
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, TextItem, Element,
-    TextBox, Button, TextLabel, Key, ScrollingList, Paginator, PageSelector, MenuController
+    TextBox, Button, TextLabel, Key, List, Paginator, PageSelector, MenuController
 };
 use cce_ui::context::UiContext;
 use native_tls::TlsConnector;
@@ -82,7 +82,7 @@ struct ClearEmailApp {
 
     // Search and List View
     search_box: TextBox,
-    email_list: ScrollingList,
+    email_list: List,
     email_buttons: Vec<Button>,
 
     // Details View
@@ -1203,7 +1203,7 @@ impl Application for ClearEmailApp {
         let mut search_box = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
         search_box.font_size = 11.0;
 
-        let email_list = ScrollingList::new(54.0, 4.0);
+        let email_list = List::new(54.0, 4.0);
 
         let btn_reply = Button::new(391.0, 8.0, 70.0, 26.0).with_label("Reply");
         let btn_delete = Button::new_reset(471.0, 8.0, 80.0, 26.0).with_label("Delete");
