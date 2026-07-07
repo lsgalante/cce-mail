@@ -135,7 +135,7 @@ struct ClearEmailApp {
 }
 
 fn get_accounts_path() -> std::path::PathBuf {
-    let p = std::path::PathBuf::from("/home/lsgalante/.config/cce");
+    let p = cce_ui::config::cce_config_dir();
     if !p.exists() {
         let _ = std::fs::create_dir_all(&p);
         #[cfg(unix)]
@@ -195,7 +195,7 @@ fn save_accounts(accounts: &[AccountInfo]) {
 }
 
 fn get_account_emails_path(email: &str) -> std::path::PathBuf {
-    let p = std::path::PathBuf::from("/home/lsgalante/.config/cce");
+    let p = cce_ui::config::cce_config_dir();
     if !p.exists() {
         let _ = std::fs::create_dir_all(&p);
     }
@@ -272,7 +272,7 @@ struct GoogleClientConfig {
 }
 
 fn load_google_client_config() -> GoogleClientConfig {
-    let p = std::path::PathBuf::from("/home/lsgalante/.config/cce/google_client.json");
+    let p = cce_ui::config::cce_config_dir().join("google_client.json");
     if p.exists() {
         if let Ok(content) = std::fs::read_to_string(&p) {
             if let Ok(config) = serde_json::from_str::<GoogleClientConfig>(&content) {
