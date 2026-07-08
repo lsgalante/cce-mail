@@ -77,33 +77,33 @@ enum AppMessage {
 
 struct ClearEmailApp {
     // Navigation / Sidebar
-    btn_compose: Button,
+    btn_compose: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     paginator: Paginator,
 
     // Search and List View
     search_box: TextBox,
     email_list: List,
-    email_buttons: Vec<Button>,
+    email_buttons: Vec<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
 
     // Details View
-    btn_reply: Button,
-    btn_delete: Button,
-    btn_unread: Button,
+    btn_reply: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_delete: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_unread: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     detail_body: TextBox,
 
     // Compose Dialog
     compose_to: TextBox,
     compose_subject: TextBox,
     compose_body: TextBox,
-    btn_compose_send: Button,
-    btn_compose_cancel: Button,
+    btn_compose_send: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_compose_cancel: cce_ui::widget::Adapted<cce_ui::widget::Button>,
 
     // Accounts Management
     accounts: Vec<AccountInfo>,
     selected_account_idx: usize,
-    btn_add_account: Button,
-    btn_make_default: Button,
-    btn_login_oauth: Button,
+    btn_add_account: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_make_default: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_login_oauth: cce_ui::widget::Adapted<cce_ui::widget::Button>,
 
     // Add Account Dialog
     account_dialog_open: bool,
@@ -111,10 +111,10 @@ struct ClearEmailApp {
     add_acc_password: TextBox,
     add_acc_imap: TextBox,
     add_acc_smtp: TextBox,
-    btn_add_acc_save: Button,
-    btn_add_acc_cancel: Button,
-    btn_add_acc_oauth: Button,
-    btn_add_acc_icloud: Button,
+    btn_add_acc_save: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_add_acc_cancel: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_add_acc_oauth: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_add_acc_icloud: cce_ui::widget::Adapted<cce_ui::widget::Button>,
 
     // Application state
     emails: Vec<Email>,
