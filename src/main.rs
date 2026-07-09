@@ -81,7 +81,7 @@ struct ClearEmailApp {
     paginator: Paginator,
 
     // Search and List View
-    search_box: TextBox,
+    search_box: cce_ui::widget::Adapted<TextBox>,
     email_list: List,
     email_buttons: Vec<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
 
@@ -89,12 +89,12 @@ struct ClearEmailApp {
     btn_reply: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     btn_delete: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     btn_unread: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    detail_body: TextBox,
+    detail_body: cce_ui::widget::Adapted<TextBox>,
 
     // Compose Dialog
-    compose_to: TextBox,
-    compose_subject: TextBox,
-    compose_body: TextBox,
+    compose_to: cce_ui::widget::Adapted<TextBox>,
+    compose_subject: cce_ui::widget::Adapted<TextBox>,
+    compose_body: cce_ui::widget::Adapted<TextBox>,
     btn_compose_send: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     btn_compose_cancel: cce_ui::widget::Adapted<cce_ui::widget::Button>,
 
@@ -107,10 +107,10 @@ struct ClearEmailApp {
 
     // Add Account Dialog
     account_dialog_open: bool,
-    add_acc_email: TextBox,
-    add_acc_password: TextBox,
-    add_acc_imap: TextBox,
-    add_acc_smtp: TextBox,
+    add_acc_email: cce_ui::widget::Adapted<TextBox>,
+    add_acc_password: cce_ui::widget::Adapted<TextBox>,
+    add_acc_imap: cce_ui::widget::Adapted<TextBox>,
+    add_acc_smtp: cce_ui::widget::Adapted<TextBox>,
     btn_add_acc_save: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     btn_add_acc_cancel: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     btn_add_acc_oauth: cce_ui::widget::Adapted<cce_ui::widget::Button>,
