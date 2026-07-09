@@ -78,7 +78,7 @@ enum AppMessage {
 struct ClearEmailApp {
     // Navigation / Sidebar
     btn_compose: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    paginator: Paginator,
+    paginator: cce_ui::widget::Adapted<Paginator>,
 
     // Search and List View
     search_box: cce_ui::widget::Adapted<TextBox>,
