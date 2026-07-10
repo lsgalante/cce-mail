@@ -1,8 +1,8 @@
 use wayland_client::QueueHandle;
-use glyphon::{FontSystem, Buffer, Metrics, Attrs};
+use glyphon::FontSystem;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
-    MouseButton, ElementState, MouseScrollDelta, KeyEvent, TextItem, Element,
+    MouseButton, ElementState, MouseScrollDelta, KeyEvent, Element,
     TextBox, Button, TextLabel, Key, List, Paginator, PageSelector, MenuController
 };
 use cce_ui::context::UiContext;
@@ -128,7 +128,6 @@ struct ClearEmailApp {
     width: u32,
     height: u32,
     scale_factor: f64,
-    text_items: Vec<TextItem>,
     font_system: FontSystem,
     needs_rebuild: bool,
     ui_context: UiContext,
@@ -765,8 +764,7 @@ impl ClearEmailApp {
         }
     }
 
-    fn rebuild_text_items(&mut self) {
-        self.text_items.clear();
+    fn emit_text_prims(&mut self, pc: &mut cce_ui::scene::paint::PaintCtx) {
         let mut labels = Vec::new();
         let font_system = &mut self.font_system;
         let ctx = &self.ui_context;
@@ -805,17 +803,7 @@ impl ClearEmailApp {
         } else {
             self.search_box.prepare_text(font_system);
             for (label, bounds) in self.search_box.text_labels_with_bounds(ctx) {
-                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
-                let mut buf = Buffer::new(font_system, metrics);
-                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
-                buf.shape_until_scroll(font_system, true);
-                self.text_items.push(TextItem {
-                    buffer: buf,
-                    x: label.x,
-                    y: label.y,
-                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
-                    bounds,
-                });
+                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
             }
         }
 
@@ -963,17 +951,7 @@ impl ClearEmailApp {
                 // Body rendering
                 self.detail_body.prepare_text(font_system);
                 for (label, bounds) in self.detail_body.text_labels_with_bounds(ctx) {
-                    let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
-                    let mut buf = Buffer::new(font_system, metrics);
-                    buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
-                    buf.shape_until_scroll(font_system, true);
-                    self.text_items.push(TextItem {
-                        buffer: buf,
-                        x: label.x,
-                        y: label.y,
-                        color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
-                        bounds,
-                    });
+                    pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
                 }
             }
         } else {
@@ -1022,47 +1000,17 @@ impl ClearEmailApp {
             // Compose inputs text labels
             self.compose_to.prepare_text(font_system);
             for (label, bounds) in self.compose_to.text_labels_with_bounds(ctx) {
-                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
-                let mut buf = Buffer::new(font_system, metrics);
-                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
-                buf.shape_until_scroll(font_system, true);
-                self.text_items.push(TextItem {
-                    buffer: buf,
-                    x: label.x,
-                    y: label.y,
-                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
-                    bounds,
-                });
+                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
             }
 
             self.compose_subject.prepare_text(font_system);
             for (label, bounds) in self.compose_subject.text_labels_with_bounds(ctx) {
-                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
-                let mut buf = Buffer::new(font_system, metrics);
-                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
-                buf.shape_until_scroll(font_system, true);
-                self.text_items.push(TextItem {
-                    buffer: buf,
-                    x: label.x,
-                    y: label.y,
-                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
-                    bounds,
-                });
+                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
             }
 
             self.compose_body.prepare_text(font_system);
             for (label, bounds) in self.compose_body.text_labels_with_bounds(ctx) {
-                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
-                let mut buf = Buffer::new(font_system, metrics);
-                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
-                buf.shape_until_scroll(font_system, true);
-                self.text_items.push(TextItem {
-                    buffer: buf,
-                    x: label.x,
-                    y: label.y,
-                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
-                    bounds,
-                });
+                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
             }
         }
 
@@ -1107,78 +1055,45 @@ impl ClearEmailApp {
             // 7a. Add Account Inputs text labels
             self.add_acc_email.prepare_text(font_system);
             for (label, bounds) in self.add_acc_email.text_labels_with_bounds(ctx) {
-                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
-                let mut buf = Buffer::new(font_system, metrics);
-                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
-                buf.shape_until_scroll(font_system, true);
-                self.text_items.push(TextItem {
-                    buffer: buf,
-                    x: label.x,
-                    y: label.y,
-                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
-                    bounds,
-                });
+                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
             }
 
             self.add_acc_password.prepare_text(font_system);
             for (label, bounds) in self.add_acc_password.text_labels_with_bounds(ctx) {
-                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
-                let mut buf = Buffer::new(font_system, metrics);
-                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
-                buf.shape_until_scroll(font_system, true);
-                self.text_items.push(TextItem {
-                    buffer: buf,
-                    x: label.x,
-                    y: label.y,
-                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
-                    bounds,
-                });
+                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
             }
 
             self.add_acc_imap.prepare_text(font_system);
             for (label, bounds) in self.add_acc_imap.text_labels_with_bounds(ctx) {
-                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
-                let mut buf = Buffer::new(font_system, metrics);
-                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
-                buf.shape_until_scroll(font_system, true);
-                self.text_items.push(TextItem {
-                    buffer: buf,
-                    x: label.x,
-                    y: label.y,
-                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
-                    bounds,
-                });
+                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
             }
 
             self.add_acc_smtp.prepare_text(font_system);
             for (label, bounds) in self.add_acc_smtp.text_labels_with_bounds(ctx) {
-                let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
-                let mut buf = Buffer::new(font_system, metrics);
-                buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
-                buf.shape_until_scroll(font_system, true);
-                self.text_items.push(TextItem {
-                    buffer: buf,
-                    x: label.x,
-                    y: label.y,
-                    color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
-                    bounds,
-                });
+                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
             }
         }
 
-        // Shape and append static text items
+        // Emit accumulated static labels as text prims.
+        let _ = font_system;
         for label in labels {
-            let metrics = Metrics::new(label.font_size, label.font_size * 1.4);
-            let mut buf = Buffer::new(font_system, metrics);
-            buf.set_text(font_system, &label.text, Attrs::new(), glyphon::Shaping::Advanced);
-            buf.shape_until_scroll(font_system, true);
-            self.text_items.push(TextItem {
-                buffer: buf,
-                x: label.x,
-                y: label.y,
-                color: glyphon::Color::rgb(label.color[0], label.color[1], label.color[2]),
-                bounds: None,
-            });
+            pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, None);
+        }
+    }
+}
+
+/// Adapts the legacy `quads.push((x,y,w,h,color))` / `quads.extend(extra_quads())` calls in
+/// the ported view() body to the single paint path: each tuple becomes a `PaintCtx::quad`.
+struct __EmailQuadSink<'a> {
+    pc: &'a mut cce_ui::scene::paint::PaintCtx,
+}
+impl<'a> __EmailQuadSink<'a> {
+    fn push(&mut self, q: (f32, f32, f32, f32, [f32; 4])) {
+        self.pc.quad(cce_ui::scene::layout::Rect { x: q.0, y: q.1, width: q.2, height: q.3 }, q.4);
+    }
+    fn extend<I: IntoIterator<Item = (f32, f32, f32, f32, [f32; 4])>>(&mut self, it: I) {
+        for q in it {
+            self.push(q);
         }
     }
 }
@@ -1294,8 +1209,7 @@ impl Application for ClearEmailApp {
             width: 1000,
             height: 600,
             scale_factor: 1.0,
-            text_items: Vec::new(),
-            font_system: cce_ui::create_font_system_with_system_fonts(),
+            font_system: cce_ui::create_font_system(),
             needs_rebuild: true,
             ui_context: UiContext::new(),
         }
@@ -1658,7 +1572,14 @@ impl Application for ClearEmailApp {
         }
     }
 
-    fn view(&mut self, quads: &mut Vec<(f32, f32, f32, f32, [f32; 4])>, size: LogicalSize, scale: f64) {
+    fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<cce_ui::scene::paint::DisplayList> {
+        // Phase 6ai single paint path: the view() geometry (all plain quads) and the text
+        // (the old rebuild_text_items assembly, now prims via emit_text_prims) are this one
+        // list. The app FontSystem stays for the TextBoxes' prepare_text measurement, but is
+        // now bundled create_font_system() (was _with_system_fonts) — the render path is the
+        // engine's bundled cache, so measurement matches and no face-ID mismatch remains.
+        let mut __pc = cce_ui::scene::paint::PaintCtx::new();
+        let quads = &mut __EmailQuadSink { pc: &mut __pc };
         let size_changed = self.width != size.width as u32 || self.height != size.height as u32 || self.scale_factor != scale;
         if self.needs_rebuild || size_changed {
             self.width = size.width as u32;
@@ -1841,7 +1762,6 @@ impl Application for ClearEmailApp {
                 self.btn_add_acc_icloud.set_rect(-9999.0, -9999.0, 0.0, 0.0);
             }
 
-            self.rebuild_text_items();
             self.needs_rebuild = false;
         }
 
@@ -1987,10 +1907,13 @@ impl Application for ClearEmailApp {
             quads.extend(self.btn_add_acc_oauth.extra_quads());
             quads.extend(self.btn_add_acc_icloud.extra_quads());
         }
+
+        self.emit_text_prims(&mut __pc);
+        Some(__pc.finish())
     }
 
-    fn text_items(&self) -> &[TextItem] {
-        &self.text_items
+    fn display_list_text(&self) -> bool {
+        true
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
