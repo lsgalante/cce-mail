@@ -780,8 +780,8 @@ impl ClearEmailApp {
         let margin_x = (sidebar_w - tab_w) / 2.0;
 
         // 1. Sidebar Buttons text labels
-        labels.extend(self.btn_compose.text_labels());
-        labels.extend(self.paginator.text_labels());
+        cce_ui::scene::painter::append_widget_text(ctx, &self.btn_compose, pc);
+        cce_ui::scene::painter::append_widget_text(ctx, &self.paginator, pc);
 
         // Sidebar Folder Badges
         let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
@@ -799,12 +799,10 @@ impl ClearEmailApp {
 
         // 2. Search box labels / Accounts add button
         if self.current_folder == Folder::Accounts {
-            labels.extend(self.btn_add_account.text_labels());
+            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_add_account, pc);
         } else {
             self.search_box.prepare_text(font_system);
-            for (label, bounds) in self.search_box.text_labels_with_bounds(ctx) {
-                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
-            }
+            cce_ui::scene::painter::append_widget_text(ctx, &self.search_box, pc);
         }
 
         // 3. Email List Labels / Accounts list labels
@@ -897,7 +895,7 @@ impl ClearEmailApp {
         if self.current_folder == Folder::Accounts {
             if self.selected_account_idx < self.accounts.len() {
                 let acc = &self.accounts[self.selected_account_idx];
-                labels.extend(self.btn_make_default.text_labels());
+                cce_ui::scene::painter::append_widget_text(ctx, &self.btn_make_default, pc);
 
                 // Subject Header (Account email)
                 labels.push(TextLabel {
@@ -925,14 +923,14 @@ impl ClearEmailApp {
                     color: if acc.is_default { [0x3a, 0xff, 0x80] } else { [0x83, 0x83, 0x8a] },
                 });
                 if acc.is_oauth {
-                    labels.extend(self.btn_login_oauth.text_labels());
+                    cce_ui::scene::painter::append_widget_text(ctx, &self.btn_login_oauth, pc);
                 }
             }
         } else if let Some(selected_id) = self.selected_email_id {
             if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
-                labels.extend(self.btn_reply.text_labels());
-                labels.extend(self.btn_delete.text_labels());
-                labels.extend(self.btn_unread.text_labels());
+                cce_ui::scene::painter::append_widget_text(ctx, &self.btn_reply, pc);
+                cce_ui::scene::painter::append_widget_text(ctx, &self.btn_delete, pc);
+                cce_ui::scene::painter::append_widget_text(ctx, &self.btn_unread, pc);
 
                 // Subject Header
                 labels.push(TextLabel {
@@ -950,9 +948,7 @@ impl ClearEmailApp {
 
                 // Body rendering
                 self.detail_body.prepare_text(font_system);
-                for (label, bounds) in self.detail_body.text_labels_with_bounds(ctx) {
-                    pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
-                }
+                cce_ui::scene::painter::append_widget_text(ctx, &self.detail_body, pc);
             }
         } else {
             let placeholder = "Select an email to view its content".to_string();
@@ -994,24 +990,18 @@ impl ClearEmailApp {
             labels.push(TextLabel { text: "To:".to_string(), x: modal_x + 15.0, y: modal_y + 54.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
             labels.push(TextLabel { text: "Subject:".to_string(), x: modal_x + 15.0, y: modal_y + 94.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
 
-            labels.extend(self.btn_compose_send.text_labels());
-            labels.extend(self.btn_compose_cancel.text_labels());
+            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_compose_send, pc);
+            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_compose_cancel, pc);
 
             // Compose inputs text labels
             self.compose_to.prepare_text(font_system);
-            for (label, bounds) in self.compose_to.text_labels_with_bounds(ctx) {
-                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
-            }
+            cce_ui::scene::painter::append_widget_text(ctx, &self.compose_to, pc);
 
             self.compose_subject.prepare_text(font_system);
-            for (label, bounds) in self.compose_subject.text_labels_with_bounds(ctx) {
-                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
-            }
+            cce_ui::scene::painter::append_widget_text(ctx, &self.compose_subject, pc);
 
             self.compose_body.prepare_text(font_system);
-            for (label, bounds) in self.compose_body.text_labels_with_bounds(ctx) {
-                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
-            }
+            cce_ui::scene::painter::append_widget_text(ctx, &self.compose_body, pc);
         }
 
         // 7. Add Account Dialog Content
@@ -1047,31 +1037,23 @@ impl ClearEmailApp {
                 color: [0x70, 0x70, 0x75],
             });
 
-            labels.extend(self.btn_add_acc_save.text_labels());
-            labels.extend(self.btn_add_acc_cancel.text_labels());
-            labels.extend(self.btn_add_acc_oauth.text_labels());
-            labels.extend(self.btn_add_acc_icloud.text_labels());
+            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_add_acc_save, pc);
+            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_add_acc_cancel, pc);
+            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_add_acc_oauth, pc);
+            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_add_acc_icloud, pc);
 
             // 7a. Add Account Inputs text labels
             self.add_acc_email.prepare_text(font_system);
-            for (label, bounds) in self.add_acc_email.text_labels_with_bounds(ctx) {
-                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
-            }
+            cce_ui::scene::painter::append_widget_text(ctx, &self.add_acc_email, pc);
 
             self.add_acc_password.prepare_text(font_system);
-            for (label, bounds) in self.add_acc_password.text_labels_with_bounds(ctx) {
-                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
-            }
+            cce_ui::scene::painter::append_widget_text(ctx, &self.add_acc_password, pc);
 
             self.add_acc_imap.prepare_text(font_system);
-            for (label, bounds) in self.add_acc_imap.text_labels_with_bounds(ctx) {
-                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
-            }
+            cce_ui::scene::painter::append_widget_text(ctx, &self.add_acc_imap, pc);
 
             self.add_acc_smtp.prepare_text(font_system);
-            for (label, bounds) in self.add_acc_smtp.text_labels_with_bounds(ctx) {
-                pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, bounds);
-            }
+            cce_ui::scene::painter::append_widget_text(ctx, &self.add_acc_smtp, pc);
         }
 
         // Emit accumulated static labels as text prims.
