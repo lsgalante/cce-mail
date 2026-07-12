@@ -4,7 +4,7 @@ use wayland_client::QueueHandle;
 use glyphon::FontSystem;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
-    MouseButton, ElementState, MouseScrollDelta, KeyEvent, Element,
+    MouseButton, ElementState, MouseScrollDelta, KeyEvent, WidgetHost,
     TextBox, Button, TextLabel, Key, Paginator, PageSelector, MenuController
 };
 use cce_ui::context::UiContext;
