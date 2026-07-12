@@ -1,9 +1,11 @@
+mod scroll_region;
+use scroll_region::ScrollRegion;
 use wayland_client::QueueHandle;
 use glyphon::FontSystem;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, Element,
-    TextBox, Button, TextLabel, Key, List, Paginator, PageSelector, MenuController
+    TextBox, Button, TextLabel, Key, Paginator, PageSelector, MenuController
 };
 use cce_ui::context::UiContext;
 use native_tls::TlsConnector;
@@ -82,7 +84,7 @@ struct ClearEmailApp {
 
     // Search and List View
     search_box: cce_ui::widget::Adapted<TextBox>,
-    email_list: List,
+    email_list: ScrollRegion,
     email_buttons: Vec<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
 
     // Details View
@@ -1100,7 +1102,7 @@ impl Application for ClearEmailApp {
         let mut search_box = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
         search_box.font_size = 11.0;
 
-        let email_list = List::new(54.0, 4.0);
+        let email_list = ScrollRegion::new(54.0, 4.0);
 
         let btn_reply = Button::new(391.0, 8.0, 70.0, 26.0).with_label("Reply");
         let btn_delete = Button::new_reset(471.0, 8.0, 80.0, 26.0).with_label("Delete");
@@ -1795,7 +1797,11 @@ impl Application for ClearEmailApp {
         } else {
             quads.extend(self.search_box.extra_quads());
         }
-        quads.extend(self.email_list.extra_quads());
+        {
+            let mut list_quads = Vec::new();
+            self.email_list.push_quads(&mut list_quads);
+            quads.extend(list_quads);
+        }
 
         // Visible List Item Buttons
         let list_len = if self.current_folder == Folder::Accounts {
@@ -1933,7 +1939,7 @@ impl Application for ClearEmailApp {
             } else {
                 if self.search_box.on_cursor_moved(px, py, ctx) { changed = true; }
             }
-            if self.email_list.on_cursor_moved(px, py, ctx) { changed = true; }
+            if self.email_list.cursor_moved(px, py) { changed = true; }
 
             for btn in &mut self.email_buttons {
                 if btn.rect().0 > -9000.0 {
@@ -2118,8 +2124,14 @@ impl Application for ClearEmailApp {
                 }
             }
 
-            if self.email_list.mouse_input(button, state, px, py, ctx) {
-                changed = true;
+            if button == MouseButton::Left {
+                let handled = match state {
+                    ElementState::Pressed => self.email_list.press(px, py),
+                    ElementState::Released => self.email_list.release(),
+                };
+                if handled {
+                    changed = true;
+                }
             }
 
             if self.current_folder == Folder::Accounts {
@@ -2229,11 +2241,10 @@ impl Application for ClearEmailApp {
         let mut changed = false;
         let px = pos.x as f32;
         let py = pos.y as f32;
-        let ctx = &mut self.ui_context;
 
         if !self.compose_open {
             if px >= 66.0 && px <= 366.0 {
-                if self.email_list.mouse_wheel(delta, px, py, ctx) {
+                if self.email_list.wheel(delta, px, py) {
                     changed = true;
                 }
             }
