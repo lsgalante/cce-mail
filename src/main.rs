@@ -1705,9 +1705,7 @@ impl Application for ClearEmailApp {
                     self.btn_reply.set_rect(detail_x, 8.0, 70.0, 26.0);
                     self.btn_delete.set_rect(detail_x + 80.0, 8.0, 80.0, 26.0);
                     self.btn_unread.set_rect(detail_x + 170.0, 8.0, 110.0, 26.0);
-                    if let Some(base) = self.btn_unread.base_mut() {
-                        base.label = Some((if read { "Mark Unread" } else { "Mark Read" }).to_string());
-                    }
+                    self.btn_unread.base_mut().label = Some((if read { "Mark Unread" } else { "Mark Read" }).to_string());
 
                     let detail_w = (w_f32 - (detail_x + 15.0)).max(100.0);
                     self.detail_body.set_rect(detail_x, 170.0, detail_w, (h_f32 - 190.0).max(100.0));
