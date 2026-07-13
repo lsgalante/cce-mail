@@ -760,6 +760,63 @@ fn get_default_mock_emails() -> Vec<Email> {
 }
 
 impl ClearEmailApp {
+    /// Register every dispatch root in the ui_context (idempotent, runs each frame).
+    /// The id-rooted router (`propagate_event(event, WidgetId)`) resolves roots through
+    /// the registry; email assembles its frame by hand and never goes through
+    /// `render_widget`'s registration side effect. `email_buttons` is rebuilt on list
+    /// refresh — per-frame registration follows the fresh allocations.
+    fn register_dispatch_roots(&mut self) {
+        let (id, ptr) = (self.search_box.id(), self.search_box.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.detail_body.id(), self.detail_body.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.compose_to.id(), self.compose_to.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.compose_subject.id(), self.compose_subject.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.compose_body.id(), self.compose_body.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_compose.id(), self.btn_compose.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_compose_send.id(), self.btn_compose_send.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_compose_cancel.id(), self.btn_compose_cancel.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_reply.id(), self.btn_reply.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_delete.id(), self.btn_delete.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_unread.id(), self.btn_unread.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_make_default.id(), self.btn_make_default.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_add_account.id(), self.btn_add_account.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_login_oauth.id(), self.btn_login_oauth.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_add_acc_oauth.id(), self.btn_add_acc_oauth.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_add_acc_icloud.id(), self.btn_add_acc_icloud.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_add_acc_save.id(), self.btn_add_acc_save.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_add_acc_cancel.id(), self.btn_add_acc_cancel.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.add_acc_email.id(), self.add_acc_email.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.add_acc_password.id(), self.add_acc_password.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.add_acc_imap.id(), self.add_acc_imap.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.add_acc_smtp.id(), self.add_acc_smtp.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        for btn in self.email_buttons.iter_mut() {
+            let (id, ptr) = (btn.id(), btn.as_ptr_mut());
+            self.ui_context.register_widget(id, ptr);
+        }
+    }
+
+
     fn save_emails(&self) {
         if let Some(acc) = self.accounts.get(self.selected_account_idx) {
             save_emails_for_account(&acc.email, &self.emails);
@@ -1557,6 +1614,7 @@ impl Application for ClearEmailApp {
     }
 
     fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<cce_ui::scene::paint::DisplayList> {
+        self.register_dispatch_roots();
         // Phase 6ai single paint path: the view() geometry (all plain quads) and the text
         // (the old rebuild_text_items assembly, now prims via emit_text_prims) are this one
         // list. The app FontSystem stays for the TextBoxes' prepare_text measurement, but is
@@ -1911,23 +1969,23 @@ impl Application for ClearEmailApp {
         let ctx = &mut self.ui_context;
 
         if self.account_dialog_open {
-            if ctx.propagate_event(&mv, self.add_acc_email.as_ptr_mut()) { changed = true; }
-            if ctx.propagate_event(&mv, self.add_acc_password.as_ptr_mut()) { changed = true; }
-            if ctx.propagate_event(&mv, self.add_acc_imap.as_ptr_mut()) { changed = true; }
-            if ctx.propagate_event(&mv, self.add_acc_smtp.as_ptr_mut()) { changed = true; }
-            if ctx.propagate_event(&mv, self.btn_add_acc_save.as_ptr_mut()) { changed = true; }
-            if ctx.propagate_event(&mv, self.btn_add_acc_cancel.as_ptr_mut()) { changed = true; }
-            if ctx.propagate_event(&mv, self.btn_add_acc_oauth.as_ptr_mut()) { changed = true; }
-            if ctx.propagate_event(&mv, self.btn_add_acc_icloud.as_ptr_mut()) { changed = true; }
+            if ctx.propagate_event(&mv, self.add_acc_email.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.add_acc_password.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.add_acc_imap.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.add_acc_smtp.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.btn_add_acc_save.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.btn_add_acc_cancel.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.btn_add_acc_oauth.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.btn_add_acc_icloud.id()) { changed = true; }
         } else if self.compose_open {
-            if ctx.propagate_event(&mv, self.compose_to.as_ptr_mut()) { changed = true; }
-            if ctx.propagate_event(&mv, self.compose_subject.as_ptr_mut()) { changed = true; }
-            if ctx.propagate_event(&mv, self.compose_body.as_ptr_mut()) { changed = true; }
-            if ctx.propagate_event(&mv, self.btn_compose_send.as_ptr_mut()) { changed = true; }
-            if ctx.propagate_event(&mv, self.btn_compose_cancel.as_ptr_mut()) { changed = true; }
+            if ctx.propagate_event(&mv, self.compose_to.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.compose_subject.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.compose_body.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.btn_compose_send.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.btn_compose_cancel.id()) { changed = true; }
         } else {
             // Sidebar buttons
-            if ctx.propagate_event(&mv, self.btn_compose.as_ptr_mut()) { changed = true; }
+            if ctx.propagate_event(&mv, self.btn_compose.id()) { changed = true; }
             let sidebar_w = self.paginator.sidebar_w();
             if px < sidebar_w {
                 // Self-routing composite: handle_event, not propagate — the router's
@@ -1937,31 +1995,31 @@ impl Application for ClearEmailApp {
 
             // Search / Add account and lists
             if self.current_folder == Folder::Accounts {
-                if ctx.propagate_event(&mv, self.btn_add_account.as_ptr_mut()) { changed = true; }
+                if ctx.propagate_event(&mv, self.btn_add_account.id()) { changed = true; }
             } else {
-                if ctx.propagate_event(&mv, self.search_box.as_ptr_mut()) { changed = true; }
+                if ctx.propagate_event(&mv, self.search_box.id()) { changed = true; }
             }
             if self.email_list.cursor_moved(px, py) { changed = true; }
 
             for btn in &mut self.email_buttons {
                 if btn.rect().0 > -9000.0 {
-                    if ctx.propagate_event(&mv, btn.as_ptr_mut()) { changed = true; }
+                    if ctx.propagate_event(&mv, btn.id()) { changed = true; }
                 }
             }
 
             // Detail view buttons
             if self.current_folder == Folder::Accounts {
                 if self.selected_account_idx < self.accounts.len() {
-                    if ctx.propagate_event(&mv, self.btn_make_default.as_ptr_mut()) { changed = true; }
+                    if ctx.propagate_event(&mv, self.btn_make_default.id()) { changed = true; }
                     if self.accounts[self.selected_account_idx].is_oauth {
-                        if ctx.propagate_event(&mv, self.btn_login_oauth.as_ptr_mut()) { changed = true; }
+                        if ctx.propagate_event(&mv, self.btn_login_oauth.id()) { changed = true; }
                     }
                 }
             } else if self.selected_email_id.is_some() {
-                if ctx.propagate_event(&mv, self.btn_reply.as_ptr_mut()) { changed = true; }
-                if ctx.propagate_event(&mv, self.btn_delete.as_ptr_mut()) { changed = true; }
-                if ctx.propagate_event(&mv, self.btn_unread.as_ptr_mut()) { changed = true; }
-                if ctx.propagate_event(&mv, self.detail_body.as_ptr_mut()) { changed = true; }
+                if ctx.propagate_event(&mv, self.btn_reply.id()) { changed = true; }
+                if ctx.propagate_event(&mv, self.btn_delete.id()) { changed = true; }
+                if ctx.propagate_event(&mv, self.btn_unread.id()) { changed = true; }
+                if ctx.propagate_event(&mv, self.detail_body.id()) { changed = true; }
             }
         }
 
@@ -1980,42 +2038,42 @@ impl Application for ClearEmailApp {
         let ctx = &mut self.ui_context;
 
         if self.account_dialog_open {
-            if ctx.propagate_event(&ev, self.add_acc_email.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.add_acc_email.id()) {
                 changed = true;
                 if state == ElementState::Pressed { ctx.set_focused(&mut self.add_acc_email); }
             }
-            if ctx.propagate_event(&ev, self.add_acc_password.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.add_acc_password.id()) {
                 changed = true;
                 if state == ElementState::Pressed { ctx.set_focused(&mut self.add_acc_password); }
             }
-            if ctx.propagate_event(&ev, self.add_acc_imap.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.add_acc_imap.id()) {
                 changed = true;
                 if state == ElementState::Pressed { ctx.set_focused(&mut self.add_acc_imap); }
             }
-            if ctx.propagate_event(&ev, self.add_acc_smtp.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.add_acc_smtp.id()) {
                 changed = true;
                 if state == ElementState::Pressed { ctx.set_focused(&mut self.add_acc_smtp); }
             }
 
-            if ctx.propagate_event(&ev, self.btn_add_acc_save.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.btn_add_acc_save.id()) {
                 changed = true;
                 if state == ElementState::Released && self.btn_add_acc_save.take_click() {
                     msg_out = Some(AppMessage::AddAccountSave);
                 }
             }
-            if ctx.propagate_event(&ev, self.btn_add_acc_cancel.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.btn_add_acc_cancel.id()) {
                 changed = true;
                 if state == ElementState::Released && self.btn_add_acc_cancel.take_click() {
                     msg_out = Some(AppMessage::AddAccountCancel);
                 }
             }
-            if ctx.propagate_event(&ev, self.btn_add_acc_oauth.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.btn_add_acc_oauth.id()) {
                 changed = true;
                 if state == ElementState::Released && self.btn_add_acc_oauth.take_click() {
                     msg_out = Some(AppMessage::AddAccountOAuth);
                 }
             }
-            if ctx.propagate_event(&ev, self.btn_add_acc_icloud.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.btn_add_acc_icloud.id()) {
                 changed = true;
                 if state == ElementState::Released && self.btn_add_acc_icloud.take_click() {
                     msg_out = Some(AppMessage::AddAccountICloudHelp);
@@ -2039,26 +2097,26 @@ impl Application for ClearEmailApp {
                 }
             }
         } else if self.compose_open {
-            if ctx.propagate_event(&ev, self.compose_to.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.compose_to.id()) {
                 changed = true;
                 if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_to); }
             }
-            if ctx.propagate_event(&ev, self.compose_subject.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.compose_subject.id()) {
                 changed = true;
                 if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_subject); }
             }
-            if ctx.propagate_event(&ev, self.compose_body.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.compose_body.id()) {
                 changed = true;
                 if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_body); }
             }
 
-            if ctx.propagate_event(&ev, self.btn_compose_send.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.btn_compose_send.id()) {
                 changed = true;
                 if state == ElementState::Released && self.btn_compose_send.take_click() {
                     msg_out = Some(AppMessage::ComposeSend);
                 }
             }
-            if ctx.propagate_event(&ev, self.btn_compose_cancel.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.btn_compose_cancel.id()) {
                 changed = true;
                 if state == ElementState::Released && self.btn_compose_cancel.take_click() {
                     msg_out = Some(AppMessage::ComposeCancel);
@@ -2082,7 +2140,7 @@ impl Application for ClearEmailApp {
             }
         } else {
             // Sidebar buttons
-            if ctx.propagate_event(&ev, self.btn_compose.as_ptr_mut()) {
+            if ctx.propagate_event(&ev, self.btn_compose.id()) {
                 changed = true;
                 if state == ElementState::Released && self.btn_compose.take_click() {
                     msg_out = Some(AppMessage::ComposeNew);
@@ -2106,7 +2164,7 @@ impl Application for ClearEmailApp {
             }
 
             if self.current_folder == Folder::Accounts {
-                if ctx.propagate_event(&ev, self.btn_add_account.as_ptr_mut()) {
+                if ctx.propagate_event(&ev, self.btn_add_account.id()) {
                     changed = true;
                     if state == ElementState::Released && self.btn_add_account.take_click() {
                         msg_out = Some(AppMessage::AddAccount);
@@ -2114,7 +2172,7 @@ impl Application for ClearEmailApp {
                 }
             } else {
                 // Search input
-                if ctx.propagate_event(&ev, self.search_box.as_ptr_mut()) {
+                if ctx.propagate_event(&ev, self.search_box.id()) {
                     changed = true;
                     if state == ElementState::Pressed { ctx.set_focused(&mut self.search_box); }
                     if self.search_box.take_change() {
@@ -2142,7 +2200,7 @@ impl Application for ClearEmailApp {
                     if idx < self.email_buttons.len() {
                         let btn = &mut self.email_buttons[idx];
                         if btn.rect().0 > -9000.0 {
-                            if ctx.propagate_event(&ev, btn.as_ptr_mut()) {
+                            if ctx.propagate_event(&ev, btn.id()) {
                                 changed = true;
                                 if state == ElementState::Released && btn.take_click() {
                                     msg_out = Some(AppMessage::SelectAccount(idx));
@@ -2177,7 +2235,7 @@ impl Application for ClearEmailApp {
                     if idx < self.email_buttons.len() {
                         let btn = &mut self.email_buttons[idx];
                         if btn.rect().0 > -9000.0 {
-                            if ctx.propagate_event(&ev, btn.as_ptr_mut()) {
+                            if ctx.propagate_event(&ev, btn.id()) {
                                 changed = true;
                                 if state == ElementState::Released && btn.take_click() {
                                     msg_out = Some(AppMessage::SelectEmail(email.id));
@@ -2191,14 +2249,14 @@ impl Application for ClearEmailApp {
             // Detail View action buttons
             if self.current_folder == Folder::Accounts {
                 if self.selected_account_idx < self.accounts.len() {
-                    if ctx.propagate_event(&ev, self.btn_make_default.as_ptr_mut()) {
+                    if ctx.propagate_event(&ev, self.btn_make_default.id()) {
                         changed = true;
                         if state == ElementState::Released && self.btn_make_default.take_click() {
                             msg_out = Some(AppMessage::MakeDefaultAccount);
                         }
                     }
                     if self.accounts[self.selected_account_idx].is_oauth {
-                        if ctx.propagate_event(&ev, self.btn_login_oauth.as_ptr_mut()) {
+                        if ctx.propagate_event(&ev, self.btn_login_oauth.id()) {
                             changed = true;
                             if state == ElementState::Released && self.btn_login_oauth.take_click() {
                                 msg_out = Some(AppMessage::AddAccountOAuth);
@@ -2207,25 +2265,25 @@ impl Application for ClearEmailApp {
                     }
                 }
             } else if self.selected_email_id.is_some() {
-                if ctx.propagate_event(&ev, self.btn_reply.as_ptr_mut()) {
+                if ctx.propagate_event(&ev, self.btn_reply.id()) {
                     changed = true;
                     if state == ElementState::Released && self.btn_reply.take_click() {
                         msg_out = Some(AppMessage::Reply);
                     }
                 }
-                if ctx.propagate_event(&ev, self.btn_delete.as_ptr_mut()) {
+                if ctx.propagate_event(&ev, self.btn_delete.id()) {
                     changed = true;
                     if state == ElementState::Released && self.btn_delete.take_click() {
                         msg_out = Some(AppMessage::DeleteSelected);
                     }
                 }
-                if ctx.propagate_event(&ev, self.btn_unread.as_ptr_mut()) {
+                if ctx.propagate_event(&ev, self.btn_unread.id()) {
                     changed = true;
                     if state == ElementState::Released && self.btn_unread.take_click() {
                         msg_out = Some(AppMessage::ToggleUnread);
                     }
                 }
-                if ctx.propagate_event(&ev, self.detail_body.as_ptr_mut()) {
+                if ctx.propagate_event(&ev, self.detail_body.id()) {
                     changed = true;
                     if state == ElementState::Pressed { ctx.set_focused(&mut self.detail_body); }
                 }
@@ -2267,7 +2325,7 @@ impl Application for ClearEmailApp {
 
         if self.account_dialog_open {
             if self.add_acc_email.editing {
-                if ctx.propagate_event(&kev, self.add_acc_email.as_ptr_mut()) {
+                if ctx.propagate_event(&kev, self.add_acc_email.id()) {
                     handled = true;
                     // Auto-fill configuration based on email domain
                     let email_val = self.add_acc_email.edit_buffer.trim().to_lowercase();
@@ -2289,11 +2347,11 @@ impl Application for ClearEmailApp {
                     }
                 }
             } else if self.add_acc_password.editing {
-                if ctx.propagate_event(&kev, self.add_acc_password.as_ptr_mut()) { handled = true; }
+                if ctx.propagate_event(&kev, self.add_acc_password.id()) { handled = true; }
             } else if self.add_acc_imap.editing {
-                if ctx.propagate_event(&kev, self.add_acc_imap.as_ptr_mut()) { handled = true; }
+                if ctx.propagate_event(&kev, self.add_acc_imap.id()) { handled = true; }
             } else if self.add_acc_smtp.editing {
-                if ctx.propagate_event(&kev, self.add_acc_smtp.as_ptr_mut()) { handled = true; }
+                if ctx.propagate_event(&kev, self.add_acc_smtp.id()) { handled = true; }
             }
 
             // Escape closes dialog
@@ -2303,11 +2361,11 @@ impl Application for ClearEmailApp {
             }
         } else if self.compose_open {
             if self.compose_to.editing {
-                if ctx.propagate_event(&kev, self.compose_to.as_ptr_mut()) { handled = true; }
+                if ctx.propagate_event(&kev, self.compose_to.id()) { handled = true; }
             } else if self.compose_subject.editing {
-                if ctx.propagate_event(&kev, self.compose_subject.as_ptr_mut()) { handled = true; }
+                if ctx.propagate_event(&kev, self.compose_subject.id()) { handled = true; }
             } else if self.compose_body.editing {
-                if ctx.propagate_event(&kev, self.compose_body.as_ptr_mut()) { handled = true; }
+                if ctx.propagate_event(&kev, self.compose_body.id()) { handled = true; }
             }
 
             // Escape closes compose dialog
@@ -2337,7 +2395,7 @@ impl Application for ClearEmailApp {
             }
 
             if !handled && self.current_folder != Folder::Accounts && self.search_box.editing {
-                if ctx.propagate_event(&kev, self.search_box.as_ptr_mut()) {
+                if ctx.propagate_event(&kev, self.search_box.id()) {
                     handled = true;
                     if self.search_box.take_change() {
                         msg_out = Some(AppMessage::SearchChanged);
