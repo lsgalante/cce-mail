@@ -77,7 +77,25 @@ enum AppMessage {
     AddAccountICloudHelp,
 }
 
+/// App shortcuts, resolved once at startup from input.kdl
+/// (`cce-email` domain → `cce-ui` domain), defaulting to the historical keys.
+struct EmailKeys {
+    compose: String,
+    open_search: String,
+}
+
+impl EmailKeys {
+    fn load() -> Self {
+        Self {
+            compose: cce_ui::input::app_chord("compose", "ctrl+n"),
+            open_search: cce_ui::input::app_chord("open_search", "ctrl+f"),
+        }
+    }
+}
+
 struct ClearEmailApp {
+    keys: EmailKeys,
+
     // Navigation / Sidebar
     btn_compose: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     paginator: cce_ui::widget::Adapted<Paginator>,
@@ -1213,6 +1231,7 @@ impl Application for ClearEmailApp {
         }
 
         Self {
+            keys: EmailKeys::load(),
             btn_compose,
             paginator,
             search_box,
@@ -2374,22 +2393,16 @@ impl Application for ClearEmailApp {
                 handled = true;
             }
         } else {
-            // General keyboard shortcuts
-            if event.ctrl && event.state == ElementState::Pressed {
-                if let Key::Character(ref ch) = event.logical_key {
-                    match ch.to_lowercase().as_str() {
-                        "n" => {
-                            msg_out = Some(AppMessage::ComposeNew);
-                            handled = true;
-                        }
-                        "f" => {
-                            if self.current_folder != Folder::Accounts {
-                                ctx.set_focused(&mut self.search_box);
-                                self.search_box.focus();
-                                handled = true;
-                            }
-                        }
-                        _ => {}
+            // General keyboard shortcuts (input.kdl `cce-email` domain)
+            if event.state == ElementState::Pressed {
+                if cce_ui::widget::match_key_shortcut(event, &self.keys.compose) {
+                    msg_out = Some(AppMessage::ComposeNew);
+                    handled = true;
+                } else if cce_ui::widget::match_key_shortcut(event, &self.keys.open_search) {
+                    if self.current_folder != Folder::Accounts {
+                        ctx.set_focused(&mut self.search_box);
+                        self.search_box.focus();
+                        handled = true;
                     }
                 }
             }
