@@ -140,6 +140,12 @@ struct ClearEmailApp {
     emails: Vec<Email>,
     current_folder: Folder,
     selected_email_id: Option<usize>,
+    /// Detail-pane body scroll offset (logical px) and the measured height of
+    /// the wrapped body text, refreshed each display_list; hover scopes the
+    /// wheel/keyboard scrolling to the pane.
+    body_scroll: f32,
+    body_content_h: f32,
+    detail_hovered: bool,
     compose_open: bool,
     status_message: Option<(String, f32)>, // (message, timer)
     sender: calloop::channel::Sender<AppMessage>,
@@ -1291,6 +1297,9 @@ impl Application for ClearEmailApp {
             emails,
             current_folder: Folder::Inbox,
             selected_email_id: None,
+            body_scroll: 0.0,
+            body_content_h: 0.0,
+            detail_hovered: false,
             compose_open: false,
             status_message: None,
             sender: _sender.clone(),
@@ -1320,11 +1329,13 @@ impl Application for ClearEmailApp {
                 self.current_folder = f;
                 self.selected_email_id = None;
                 self.email_list.set_scroll_y(0.0);
+                self.body_scroll = 0.0;
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
             AppMessage::SelectEmail(id) => {
                 self.selected_email_id = Some(id);
+                self.body_scroll = 0.0;
                 if let Some(email) = self.emails.iter_mut().find(|e| e.id == id) {
                     if !email.read {
                         email.read = true;
@@ -1337,6 +1348,7 @@ impl Application for ClearEmailApp {
             AppMessage::SearchChanged => {
                 self.selected_email_id = None;
                 self.email_list.set_scroll_y(0.0);
+                self.body_scroll = 0.0;
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -1454,6 +1466,7 @@ impl Application for ClearEmailApp {
                 }
                 self.selected_email_id = None;
                 self.email_list.set_scroll_y(0.0);
+                self.body_scroll = 0.0;
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -1981,10 +1994,42 @@ impl Application for ClearEmailApp {
                     if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
                         let body_w = (w_f32 - (detail_x + 15.0)).max(100.0);
                         let body_h = (h_f32 - 190.0).max(100.0);
+                        let line_h = 12.0 * 1.4; // get_text_buffer_laid_out's placed-text metric
+
+                        // Measure with the exact shaping the renderer will use, so the
+                        // scroll clamp and the thumb track the real wrapped height.
+                        let (buffer, _) = cce_ui::engine::get_text_buffer_laid_out(
+                            &mut self.font_system,
+                            &email.body,
+                            12.0,
+                            Some("sans-serif"),
+                            cce_ui::scene::paint::TextAttrs::default(),
+                            cce_ui::scene::paint::TextLayout {
+                                wrap_width: Some(body_w),
+                                box_height: 1.0e6,
+                                align_h: cce_ui::scene::paint::AlignH::Left,
+                                align_v: cce_ui::scene::paint::AlignV::Top,
+                            },
+                        );
+                        let content_h = buffer.layout_runs().count() as f32 * line_h;
+                        self.body_content_h = content_h;
+                        let max_scroll = (content_h - body_h).max(0.0);
+                        self.body_scroll = self.body_scroll.clamp(0.0, max_scroll);
+
+                        // Scrollbar (ScrollRegion's colors) when the body overflows.
+                        if max_scroll > 0.0 {
+                            let sb_w = cce_ui::layout::scrollbar_width();
+                            let sb_x = w_f32 - sb_w - 4.0;
+                            let thumb_h = (body_h * body_h / content_h).clamp(20.0, body_h);
+                            let thumb_y = 170.0 + (self.body_scroll / max_scroll) * (body_h - thumb_h);
+                            quads.push((sb_x, 170.0, sb_w, body_h, cce_ui::color::scrollbar_track_color()));
+                            quads.push((sb_x, thumb_y, sb_w, thumb_h, cce_ui::color::scrollbar_thumb_color()));
+                        }
+
                         quads.pc.text_boxed(
                             email.body.clone(),
                             detail_x,
-                            170.0,
+                            170.0 - self.body_scroll,
                             12.0,
                             [0xc8, 0xc8, 0xd0],
                             Some("sans-serif".to_string()),
@@ -1992,7 +2037,7 @@ impl Application for ClearEmailApp {
                             cce_ui::scene::paint::TextAttrs::default(),
                             cce_ui::scene::paint::TextLayout {
                                 wrap_width: Some(body_w),
-                                box_height: body_h,
+                                box_height: content_h.max(body_h),
                                 align_h: cce_ui::scene::paint::AlignH::Left,
                                 align_v: cce_ui::scene::paint::AlignV::Top,
                             },
@@ -2104,6 +2149,8 @@ impl Application for ClearEmailApp {
                 if ctx.propagate_event(&mv, self.search_box.id()) { changed = true; }
             }
             if self.email_list.cursor_moved(px, py) { changed = true; }
+            // Hover scope for the detail-pane body scroll (wheel + keys).
+            self.detail_hovered = px > self.paginator.sidebar_w() + 10.0 + 310.0;
 
             for btn in &mut self.email_buttons {
                 if btn.rect().0 > -9000.0 {
@@ -2414,6 +2461,28 @@ impl Application for ClearEmailApp {
             }
         }
 
+        // Detail-pane body scroll.
+        if !self.compose_open
+            && !self.account_dialog_open
+            && self.current_folder != Folder::Accounts
+            && self.selected_email_id.is_some()
+        {
+            let separator_x = self.paginator.sidebar_w() + 10.0 + 310.0;
+            if px > separator_x {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
+                    MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
+                };
+                let body_h = (self.height as f32 - 190.0).max(100.0);
+                let max = (self.body_content_h - body_h).max(0.0);
+                let old = self.body_scroll;
+                self.body_scroll = (self.body_scroll + dy).clamp(0.0, max);
+                if (self.body_scroll - old).abs() > 0.01 {
+                    changed = true;
+                }
+            }
+        }
+
         if changed {
             *needs_rebuild = true;
             self.needs_rebuild = true;
@@ -2488,6 +2557,31 @@ impl Application for ClearEmailApp {
                         self.search_box.focus();
                         handled = true;
                     }
+                }
+            }
+
+            // Detail-pane body scroll, hover-scoped like ScrollRegion's keyboard path.
+            if !handled
+                && self.detail_hovered
+                && self.selected_email_id.is_some()
+                && self.current_folder != Folder::Accounts
+                && !self.search_box.editing
+                && event.state == ElementState::Pressed
+            {
+                let body_h = (self.height as f32 - 190.0).max(100.0);
+                let max = (self.body_content_h - body_h).max(0.0);
+                let old = self.body_scroll;
+                match &event.logical_key {
+                    Key::Named(cce_ui::widget::NamedKey::ArrowDown) => self.body_scroll = (self.body_scroll + 24.0).min(max),
+                    Key::Named(cce_ui::widget::NamedKey::ArrowUp) => self.body_scroll = (self.body_scroll - 24.0).max(0.0),
+                    Key::Named(cce_ui::widget::NamedKey::PageDown) => self.body_scroll = (self.body_scroll + body_h).min(max),
+                    Key::Named(cce_ui::widget::NamedKey::PageUp) => self.body_scroll = (self.body_scroll - body_h).max(0.0),
+                    Key::Named(cce_ui::widget::NamedKey::Home) => self.body_scroll = 0.0,
+                    Key::Named(cce_ui::widget::NamedKey::End) => self.body_scroll = max,
+                    _ => {}
+                }
+                if (self.body_scroll - old).abs() > 0.01 {
+                    handled = true;
                 }
             }
 
