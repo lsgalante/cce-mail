@@ -142,10 +142,13 @@ struct ClearEmailApp {
     selected_email_id: Option<usize>,
     /// Detail-pane body scroll offset (logical px) and the measured height of
     /// the wrapped body text, refreshed each display_list; hover scopes the
-    /// wheel/keyboard scrolling to the pane.
+    /// wheel/keyboard scrolling to the pane. The sb_* pair is the scrollbar
+    /// thumb drag (grab offset within the thumb), mirroring ScrollRegion.
     body_scroll: f32,
     body_content_h: f32,
     detail_hovered: bool,
+    body_sb_dragging: bool,
+    body_sb_drag_offset: f32,
     compose_open: bool,
     status_message: Option<(String, f32)>, // (message, timer)
     sender: calloop::channel::Sender<AppMessage>,
@@ -922,6 +925,61 @@ impl ClearEmailApp {
         }
     }
 
+    /// Detail-pane body scrollbar geometry, mirroring `ScrollRegion::scrollbar_geom`:
+    /// (sb_x, track_y, sb_w, track_h, thumb_y, thumb_h). None when the body fits
+    /// (no scrollbar drawn). The single source for display_list and the drag path.
+    fn body_scrollbar_geom(&self) -> Option<(f32, f32, f32, f32, f32, f32)> {
+        let w = self.width as f32;
+        let h = self.height as f32;
+        let body_h = (h - 190.0).max(100.0);
+        let max_scroll = (self.body_content_h - body_h).max(0.0);
+        if max_scroll <= 0.0 {
+            return None;
+        }
+        let sb_w = cce_ui::layout::scrollbar_width();
+        let sb_x = w - sb_w - 4.0;
+        let thumb_h = (body_h * body_h / self.body_content_h).clamp(20.0, body_h);
+        let thumb_y = 170.0 + (self.body_scroll / max_scroll) * (body_h - thumb_h);
+        Some((sb_x, 170.0, sb_w, body_h, thumb_y, thumb_h))
+    }
+
+    /// Left press on the scrollbar strip (±4px slop like ScrollRegion): grab the
+    /// thumb where it was clicked, or jump the track and drag from the thumb center.
+    fn body_sb_press(&mut self, px: f32, py: f32) -> bool {
+        let Some((sb_x, track_y, sb_w, track_h, thumb_y, thumb_h)) = self.body_scrollbar_geom() else {
+            return false;
+        };
+        if px < sb_x - 4.0 || px > sb_x + sb_w + 4.0 || py < track_y || py > track_y + track_h {
+            return false;
+        }
+        self.body_sb_dragging = true;
+        let click_offset = py - thumb_y;
+        if click_offset >= 0.0 && click_offset <= thumb_h {
+            self.body_sb_drag_offset = click_offset;
+        } else {
+            self.body_sb_drag_offset = thumb_h / 2.0;
+            self.body_sb_drag_to(py);
+        }
+        true
+    }
+
+    fn body_sb_drag_to(&mut self, py: f32) -> bool {
+        let Some((_, track_y, _, track_h, _, thumb_h)) = self.body_scrollbar_geom() else {
+            return false;
+        };
+        let body_h = (self.height as f32 - 190.0).max(100.0);
+        let max_scroll = (self.body_content_h - body_h).max(0.0);
+        let target = py - self.body_sb_drag_offset;
+        let ratio = if track_h - thumb_h > 0.0 {
+            ((target - track_y) / (track_h - thumb_h)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let old = self.body_scroll;
+        self.body_scroll = ratio * max_scroll;
+        (self.body_scroll - old).abs() > 0.01
+    }
+
     fn emit_text_prims(&mut self, pc: &mut cce_ui::scene::paint::PaintCtx) {
         let mut labels = Vec::new();
 
@@ -1300,6 +1358,8 @@ impl Application for ClearEmailApp {
             body_scroll: 0.0,
             body_content_h: 0.0,
             detail_hovered: false,
+            body_sb_dragging: false,
+            body_sb_drag_offset: 0.0,
             compose_open: false,
             status_message: None,
             sender: _sender.clone(),
@@ -2017,12 +2077,8 @@ impl Application for ClearEmailApp {
                         self.body_scroll = self.body_scroll.clamp(0.0, max_scroll);
 
                         // Scrollbar (ScrollRegion's colors) when the body overflows.
-                        if max_scroll > 0.0 {
-                            let sb_w = cce_ui::layout::scrollbar_width();
-                            let sb_x = w_f32 - sb_w - 4.0;
-                            let thumb_h = (body_h * body_h / content_h).clamp(20.0, body_h);
-                            let thumb_y = 170.0 + (self.body_scroll / max_scroll) * (body_h - thumb_h);
-                            quads.push((sb_x, 170.0, sb_w, body_h, cce_ui::color::scrollbar_track_color()));
+                        if let Some((sb_x, track_y, sb_w, track_h, thumb_y, thumb_h)) = self.body_scrollbar_geom() {
+                            quads.push((sb_x, track_y, sb_w, track_h, cce_ui::color::scrollbar_track_color()));
                             quads.push((sb_x, thumb_y, sb_w, thumb_h, cce_ui::color::scrollbar_thumb_color()));
                         }
 
@@ -2113,6 +2169,14 @@ impl Application for ClearEmailApp {
         let mut changed = false;
         let px = pos.x as f32;
         let py = pos.y as f32;
+        // Active scrollbar-thumb drag tracks the pointer — before the
+        // ui_context borrow (the sb helper takes &mut self).
+        if !self.account_dialog_open && !self.compose_open && self.body_sb_dragging {
+            if self.body_sb_drag_to(py) {
+                changed = true;
+            }
+        }
+
         // Routed dispatch (6bd shrink): one Event per widget root through the router.
         let mv = cce_ui::widget::Event::PointerMove { x: px, y: py, local_x: px, local_y: py };
         let ctx = &mut self.ui_context;
@@ -2186,6 +2250,31 @@ impl Application for ClearEmailApp {
         let px = pos.x as f32;
         let py = pos.y as f32;
         let ev = cce_ui::widget::Event::MouseButton { button, state, x: px, y: py, local_x: px, local_y: py };
+
+        // Detail-pane body scrollbar drag — before the ui_context borrow (the
+        // sb helpers take &mut self).
+        if !self.account_dialog_open
+            && !self.compose_open
+            && button == MouseButton::Left
+            && self.current_folder != Folder::Accounts
+        {
+            match state {
+                ElementState::Pressed => {
+                    // A fresh press always supersedes a stale drag — a lost
+                    // release must not leave the thumb glued to the pointer.
+                    self.body_sb_dragging = false;
+                    if self.selected_email_id.is_some() && self.body_sb_press(px, py) {
+                        changed = true;
+                    }
+                }
+                ElementState::Released => {
+                    if std::mem::take(&mut self.body_sb_dragging) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
         let ctx = &mut self.ui_context;
 
         if self.account_dialog_open {
@@ -2345,6 +2434,7 @@ impl Application for ClearEmailApp {
                     changed = true;
                 }
             }
+
 
             if self.current_folder == Folder::Accounts {
                 for (idx, _) in self.accounts.iter().enumerate() {
