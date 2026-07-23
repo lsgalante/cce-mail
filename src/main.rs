@@ -478,6 +478,17 @@ impl imap::Authenticator for ImapOAuth2 {
     }
 }
 
+/// Block on a future from a plain worker thread. `pollster::block_on` is NOT
+/// enough for reqwest/hyper futures — they need a live tokio reactor, and the
+/// `rt.enter()` guard in main() only covers the main thread.
+fn block_on_worker<F: std::future::Future>(fut: F) -> Result<F::Output, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {}", e))
+        .map(|rt| rt.block_on(fut))
+}
+
 fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessage>) {
     std::thread::spawn(move || {
         // Skip connecting for mock credentials
@@ -488,7 +499,7 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
         let mut access_token = account.password.clone();
         if account.is_oauth {
             let mut acc = account.clone();
-            match pollster::block_on(refresh_access_token(&mut acc)) {
+            match block_on_worker(refresh_access_token(&mut acc)).and_then(|r| r) {
                 Ok(token) => {
                     access_token = token;
                     // Send refreshed tokens back to main thread to save them
@@ -651,7 +662,7 @@ fn send_smtp(mut account: AccountInfo, to: String, subject: String, body: String
         let mut access_token = account.password.clone();
         if account.is_oauth {
             let mut acc = account.clone();
-            match pollster::block_on(refresh_access_token(&mut acc)) {
+            match block_on_worker(refresh_access_token(&mut acc)).and_then(|r| r) {
                 Ok(token) => {
                     access_token = token;
                     let _ = sender.send(AppMessage::UpdateAccountTokens(
@@ -1712,6 +1723,14 @@ impl Application for ClearEmailApp {
                 self.email_buttons = (0..list_count)
                     .map(|_| Button::new_list_row(0.0, 0.0, 0.0, 0.0))
                     .collect();
+                // register_dispatch_roots() already ran this frame with the OLD
+                // buttons; the fresh ids must be registered now or every click on
+                // the list is dropped as a stale root (and nothing re-triggers a
+                // rebuild, so the list stays dead).
+                for btn in self.email_buttons.iter_mut() {
+                    let (id, ptr) = (btn.id(), btn.as_ptr_mut());
+                    self.ui_context.register_widget(id, ptr);
+                }
             }
 
             // Get selected email state to avoid borrowing self while mutating
