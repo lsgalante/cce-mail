@@ -214,12 +214,16 @@ impl ScrollRegion {
         (self.scroll_y - old).abs() > 0.01
     }
 
-    /// The legacy frame, single-drawn: 1px rounded border (focus/hover tinted, from
-    /// `List::solid_border`), inset rounded bg, then the scrollbar track and thumb ON TOP.
-    /// The legacy `ScrollBox::extra_quads` emission: flat background, then the
-    /// scrollbar track + thumb when the content overflows.
+    /// The region's flat background (the legacy `ScrollBox::extra_quads` fill).
+    /// The scrollbar is split into [`push_scrollbar_quads`](Self::push_scrollbar_quads)
+    /// so the host can emit it AFTER the rows — drawn together, the rows paint over
+    /// the thumb and it peeks through the inter-row gaps as dotted segments.
     pub fn push_quads(&self, quads: &mut Vec<(f32, f32, f32, f32, [f32; 4])>) {
         quads.push((self.x, self.y, self.w, self.h, cce_ui::color::list_bg_color()));
+    }
+
+    /// Scrollbar track + thumb when the content overflows; emit after the rows.
+    pub fn push_scrollbar_quads(&self, quads: &mut Vec<(f32, f32, f32, f32, [f32; 4])>) {
         if self.content_h > self.viewport_h {
             let (sb_x, track_y, sb_w, track_h, thumb_y, thumb_h) = self.scrollbar_geom();
             quads.push((sb_x, track_y, sb_w, track_h, cce_ui::color::scrollbar_track_color()));

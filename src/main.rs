@@ -2023,6 +2023,13 @@ impl Application for ClearEmailApp {
                 }
             }
         }
+        // Scrollbar after the rows so the thumb rides on top of them instead of
+        // peeking through the inter-row gaps.
+        {
+            let mut sb_quads = Vec::new();
+            self.email_list.push_scrollbar_quads(&mut sb_quads);
+            quads.extend(sb_quads);
+        }
 
         // 4. Detail View Area
         if self.current_folder == Folder::Accounts {
@@ -2673,6 +2680,14 @@ impl Application for ClearEmailApp {
                 if (self.body_scroll - old).abs() > 0.01 {
                     handled = true;
                 }
+            }
+
+            // Email/accounts list keyboard scrolling. ScrollRegion scopes itself to
+            // hover-or-focus (a row click focuses the region, a press elsewhere
+            // unfocuses); the search box owns the keys while editing, and a
+            // body-scroll above wins when the detail pane is hovered.
+            if !handled && !self.search_box.editing && self.email_list.keyboard(event) {
+                handled = true;
             }
 
             if !handled && self.current_folder != Folder::Accounts && self.search_box.editing {
