@@ -253,9 +253,105 @@ fn save_emails_for_account(email: &str, emails: &[Email]) {
     }
 }
 
-/// Newest-N window fetched per sync. Full messages (attachments included) come
-/// down the wire, so this trades sync time against history depth.
+/// Newest-N window fetched per sync. Only headers, structure, and the chosen
+/// text part come down the wire, so attachments never inflate a sync.
 const FETCH_COUNT: usize = 50;
+
+/// Byte cap on a fetched text part (pre-decode); the display model caps at
+/// 1200 chars, so 64 KiB of qp/base64 is plenty.
+const PART_FETCH_CAP: u32 = 65536;
+
+/// The text part chosen from a BODYSTRUCTURE walk: its IMAP section path plus
+/// the metadata needed to rebuild a decodable single-part MIME message.
+struct TextPartSpec {
+    path: Vec<u32>,
+    subtype: String,
+    charset: Option<String>,
+    encoding: String,
+}
+
+/// IMAP dotted section string for a part path ("1.2").
+fn section_str(path: &[u32]) -> String {
+    path.iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+impl TextPartSpec {
+    /// Wrap raw (still transfer-encoded) part bytes in a minimal single-part
+    /// message so mail-parser handles the decode (CTE + charset + HTML→text).
+    fn synthesize(&self, part_bytes: &[u8]) -> Vec<u8> {
+        let charset = self.charset.as_deref().unwrap_or("utf-8");
+        let mut raw = format!(
+            "MIME-Version: 1.0\r\nContent-Type: text/{}; charset=\"{}\"\r\nContent-Transfer-Encoding: {}\r\n\r\n",
+            self.subtype, charset, self.encoding
+        )
+        .into_bytes();
+        raw.extend_from_slice(part_bytes);
+        raw
+    }
+}
+
+fn encoding_str(enc: &imap_proto::types::ContentEncoding) -> String {
+    use imap_proto::types::ContentEncoding as E;
+    match enc {
+        E::SevenBit => "7bit".to_string(),
+        E::EightBit => "8bit".to_string(),
+        E::Binary => "binary".to_string(),
+        E::Base64 => "base64".to_string(),
+        E::QuotedPrintable => "quoted-printable".to_string(),
+        E::Other(s) => s.to_string(),
+    }
+}
+
+/// DFS over a BODYSTRUCTURE for the best displayable part: the first
+/// text/plain anywhere, else the first text/html. Multipart children are
+/// numbered 1.. and nest dotted (RFC 3501); a non-multipart top level is
+/// section 1. None (e.g. embedded message/rfc822 only) → caller falls back
+/// to a capped full-message fetch.
+fn find_text_part(bs: &imap_proto::types::BodyStructure<'_>) -> Option<TextPartSpec> {
+    use imap_proto::types::BodyStructure as B;
+    fn walk(bs: &B<'_>, path: &mut Vec<u32>, best: &mut Option<(u8, TextPartSpec)>) {
+        match bs {
+            B::Text { common, other, .. } => {
+                let sub = common.ty.subtype.to_ascii_lowercase();
+                let rank = match sub.as_str() {
+                    "plain" => 0u8,
+                    "html" => 1u8,
+                    _ => return,
+                };
+                if best.as_ref().is_none_or(|(r, _)| rank < *r) {
+                    let charset = common.ty.params.as_ref().and_then(|ps| {
+                        ps.iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("charset"))
+                            .map(|(_, v)| v.to_string())
+                    });
+                    *best = Some((
+                        rank,
+                        TextPartSpec {
+                            path: if path.is_empty() { vec![1] } else { path.clone() },
+                            subtype: sub,
+                            charset,
+                            encoding: encoding_str(&other.transfer_encoding),
+                        },
+                    ));
+                }
+            }
+            B::Multipart { bodies, .. } => {
+                for (i, b) in bodies.iter().enumerate() {
+                    path.push(i as u32 + 1);
+                    walk(b, path, best);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut best = None;
+    walk(bs, &mut Vec::new(), &mut best);
+    best.map(|(_, spec)| spec)
+}
 
 /// Char-boundary-safe ellipsized truncation. Byte slicing (`&s[..n]`) panics
 /// mid-UTF-8, and real-world mail headers/bodies are full of multi-byte chars.
@@ -664,49 +760,52 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
             return;
         }
 
-        // Fetch the newest FETCH_COUNT messages in full. PEEK keeps the server's
-        // \Seen flags untouched; FLAGS rides along so read-state comes from the
-        // server instead of being hardcoded.
+        // Pass 1: flags + headers + BODYSTRUCTURE — no body bytes yet, so
+        // attachments never ride along. PEEK semantics don't matter here
+        // (headers/structure don't set \Seen), but flags come from the server.
         let start_idx = total.saturating_sub(FETCH_COUNT);
         let range = &search_results[start_idx..total];
         let query_seq = range.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
         let _ = sender.send(AppMessage::Status(format!("Fetching {} messages...", range.len())));
 
-        let mut fetched_emails = Vec::new();
-        match session.fetch(&query_seq, "(FLAGS BODY.PEEK[])") {
+        struct Pending {
+            seq: u32,
+            read: bool,
+            from: String,
+            subject: String,
+            date: String,
+            part: Option<TextPartSpec>,
+            body: String,
+        }
+        let parser = mail_parser::MessageParser::default();
+        let mut pending: Vec<Pending> = Vec::new();
+        match session.fetch(&query_seq, "(FLAGS RFC822.HEADER BODYSTRUCTURE)") {
             Ok(fetches) => {
-                let parser = mail_parser::MessageParser::default();
                 for fetch in fetches.iter() {
-                    let id = fetch.message;
                     let read = fetch
                         .flags()
                         .iter()
                         .any(|f| matches!(f, imap::types::Flag::Seen));
-
-                    let (from, subject, date, body) = match fetch.body().and_then(|raw| parser.parse(raw)) {
+                    let (from, subject, date) = match fetch.header().and_then(|h| parser.parse(h)) {
                         Some(msg) => (
                             format_from(&msg),
                             msg.subject().unwrap_or("(No Subject)").to_string(),
                             format_date(msg.date()),
-                            extract_body(&msg),
                         ),
                         None => (
                             "Unknown".to_string(),
                             "(No Subject)".to_string(),
                             "Unknown".to_string(),
-                            String::new(),
                         ),
                     };
-
-                    fetched_emails.push(Email {
-                        id: id as usize,
-                        from,
-                        to: account.email.clone(),
-                        subject,
-                        body,
-                        date,
+                    pending.push(Pending {
+                        seq: fetch.message,
                         read,
-                        folder: "inbox".to_string(),
+                        from,
+                        subject,
+                        date,
+                        part: fetch.bodystructure().and_then(find_text_part),
+                        body: String::new(),
                     });
                 }
             }
@@ -716,6 +815,75 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
                 return;
             }
         }
+
+        // Pass 2: fetch just the chosen text part, grouped by section path so a
+        // typical mailbox needs only 1-2 more round trips; capped so a giant
+        // text part can't stall the sync either.
+        let mut groups: std::collections::HashMap<Vec<u32>, Vec<u32>> = std::collections::HashMap::new();
+        for p in &pending {
+            if let Some(spec) = &p.part {
+                groups.entry(spec.path.clone()).or_default().push(p.seq);
+            }
+        }
+        for (path, seqs) in groups {
+            let seq_set = seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
+            let section = section_str(&path);
+            let query = format!("BODY.PEEK[{}]<0.{}>", section, PART_FETCH_CAP);
+            let section_path = imap_proto::types::SectionPath::Part(path, None);
+            match session.fetch(&seq_set, &query) {
+                Ok(fetches) => {
+                    for fetch in fetches.iter() {
+                        let Some(bytes) = fetch.section(&section_path) else { continue };
+                        if let Some(p) = pending.iter_mut().find(|p| p.seq == fetch.message) {
+                            if let Some(spec) = &p.part {
+                                p.body = parser
+                                    .parse(&spec.synthesize(bytes))
+                                    .map(|m| extract_body(&m))
+                                    .unwrap_or_default();
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = sender.send(AppMessage::Status(format!("IMAP part fetch failed: {}", e)));
+                }
+            }
+        }
+
+        // Fallback: no usable text part in the structure (or the walk failed) —
+        // one capped full-message fetch for those stragglers.
+        let no_part: Vec<u32> = pending.iter().filter(|p| p.part.is_none()).map(|p| p.seq).collect();
+        if !no_part.is_empty() {
+            let seq_set = no_part.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
+            let query = format!("BODY.PEEK[]<0.{}>", PART_FETCH_CAP * 4);
+            match session.fetch(&seq_set, &query) {
+                Ok(fetches) => {
+                    for fetch in fetches.iter() {
+                        let Some(raw) = fetch.body() else { continue };
+                        if let Some(p) = pending.iter_mut().find(|p| p.seq == fetch.message) {
+                            p.body = parser.parse(raw).map(|m| extract_body(&m)).unwrap_or_default();
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = sender.send(AppMessage::Status(format!("IMAP fallback fetch failed: {}", e)));
+                }
+            }
+        }
+
+        let mut fetched_emails: Vec<Email> = pending
+            .into_iter()
+            .map(|p| Email {
+                id: p.seq as usize,
+                from: p.from,
+                to: account.email.clone(),
+                subject: p.subject,
+                body: p.body,
+                date: p.date,
+                read: p.read,
+                folder: "inbox".to_string(),
+            })
+            .collect();
 
         fetched_emails.reverse(); // Newest first
 
@@ -2808,5 +2976,128 @@ mod tests {
         let msg = parse("X-Nothing: here\r\n\r\nbody\r\n");
         assert_eq!(format_from(&msg), "Unknown");
         assert_eq!(format_date(msg.date()), "Unknown");
+    }
+
+    use imap_proto::types::{
+        BodyContentCommon, BodyContentSinglePart, BodyStructure, ContentEncoding, ContentType,
+    };
+
+    fn text_part<'a>(
+        subtype: &'a str,
+        enc: ContentEncoding<'a>,
+        charset: Option<(&'a str, &'a str)>,
+    ) -> BodyStructure<'a> {
+        BodyStructure::Text {
+            common: BodyContentCommon {
+                ty: ContentType {
+                    ty: "TEXT",
+                    subtype,
+                    params: charset.map(|kv| vec![kv]),
+                },
+                disposition: None,
+                language: None,
+                location: None,
+            },
+            other: BodyContentSinglePart {
+                id: None,
+                md5: None,
+                description: None,
+                transfer_encoding: enc,
+                octets: 0,
+            },
+            lines: 0,
+            extension: None,
+        }
+    }
+
+    fn multipart<'a>(subtype: &'a str, bodies: Vec<BodyStructure<'a>>) -> BodyStructure<'a> {
+        BodyStructure::Multipart {
+            common: BodyContentCommon {
+                ty: ContentType {
+                    ty: "MULTIPART",
+                    subtype,
+                    params: None,
+                },
+                disposition: None,
+                language: None,
+                location: None,
+            },
+            bodies,
+            extension: None,
+        }
+    }
+
+    fn basic_part<'a>(ty: &'a str, subtype: &'a str) -> BodyStructure<'a> {
+        BodyStructure::Basic {
+            common: BodyContentCommon {
+                ty: ContentType {
+                    ty,
+                    subtype,
+                    params: None,
+                },
+                disposition: None,
+                language: None,
+                location: None,
+            },
+            other: BodyContentSinglePart {
+                id: None,
+                md5: None,
+                description: None,
+                transfer_encoding: ContentEncoding::Base64,
+                octets: 0,
+            },
+            extension: None,
+        }
+    }
+
+    #[test]
+    fn text_part_found_through_nested_multipart() {
+        // multipart/mixed( multipart/alternative( text/plain qp, text/HTML ), application/pdf )
+        let bs = multipart(
+            "MIXED",
+            vec![
+                multipart(
+                    "ALTERNATIVE",
+                    vec![
+                        text_part("PLAIN", ContentEncoding::QuotedPrintable, Some(("CHARSET", "UTF-8"))),
+                        text_part("HTML", ContentEncoding::Base64, None),
+                    ],
+                ),
+                basic_part("APPLICATION", "PDF"),
+            ],
+        );
+        let spec = find_text_part(&bs).expect("finds the plain part");
+        assert_eq!(spec.path, vec![1, 1]);
+        assert_eq!(section_str(&spec.path), "1.1");
+        assert_eq!(spec.subtype, "plain");
+        assert_eq!(spec.encoding, "quoted-printable");
+        assert_eq!(spec.charset.as_deref(), Some("UTF-8"));
+    }
+
+    #[test]
+    fn html_only_and_toplevel_paths() {
+        // top-level (non-multipart) text/html → section 1, html rank
+        let spec = find_text_part(&text_part("HTML", ContentEncoding::Base64, None)).unwrap();
+        assert_eq!(spec.path, vec![1]);
+        assert_eq!(spec.subtype, "html");
+        // attachments only → None (caller falls back to a capped full fetch)
+        let bs = multipart("MIXED", vec![basic_part("APPLICATION", "OCTET-STREAM")]);
+        assert!(find_text_part(&bs).is_none());
+    }
+
+    #[test]
+    fn synthesized_part_decodes_via_mail_parser() {
+        let spec = TextPartSpec {
+            path: vec![1, 1],
+            subtype: "plain".to_string(),
+            charset: Some("utf-8".to_string()),
+            encoding: "quoted-printable".to_string(),
+        };
+        // "Grüße aus München!" as quoted-printable part bytes
+        let raw = spec.synthesize(b"Gr=C3=BC=C3=9Fe aus M=C3=BCnchen!");
+        let msg = mail_parser::MessageParser::default()
+            .parse(&raw[..])
+            .expect("synthetic message parses");
+        assert_eq!(extract_body(&msg), "Grüße aus München!");
     }
 }
