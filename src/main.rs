@@ -257,6 +257,15 @@ fn process_header(line: &str, from: &mut String, subject: &mut String, date: &mu
     }
 }
 
+/// Char-boundary-safe ellipsized truncation. Byte slicing (`&s[..n]`) panics
+/// mid-UTF-8, and real-world mail headers/bodies are full of multi-byte chars.
+fn ellipsize(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}...", &s[..idx]),
+        None => s.to_string(),
+    }
+}
+
 fn clean_body(body: &str) -> String {
     let mut cleaned = String::new();
     let mut in_headers = false;
@@ -276,7 +285,12 @@ fn clean_body(body: &str) -> String {
         }
     }
     if cleaned.len() > 1200 {
-        cleaned = format!("{}...", &cleaned[..1200]);
+        let mut cut = 1200;
+        while !cleaned.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        cleaned.truncate(cut);
+        cleaned.push_str("...");
     }
     cleaned
 }
@@ -876,7 +890,7 @@ impl ClearEmailApp {
             labels.push(TextLabel {
                 text: badge_text,
                 x: margin_x + (tab_w - est_w) / 2.0,
-                y: 144.0, // tracks the paginator's y=60 tab offset
+                y: 106.0, // centers in the badge pill (by + 12 + ~2)
                 font_size: 10.0,
                 color: [0xff, 0xff, 0xff],
             });
@@ -934,7 +948,7 @@ impl ClearEmailApp {
                 if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
                     // Sender name
                     labels.push(TextLabel {
-                        text: if email.from.len() > 24 { format!("{}...", &email.from[..21]) } else { email.from.clone() },
+                        text: ellipsize(&email.from, 21),
                         x: list_x + 20.0,
                         y: draw_y + 6.0,
                         font_size: 11.0,
@@ -952,7 +966,7 @@ impl ClearEmailApp {
 
                     // Subject
                     labels.push(TextLabel {
-                        text: if email.subject.len() > 32 { format!("{}...", &email.subject[..29]) } else { email.subject.clone() },
+                        text: ellipsize(&email.subject, 29),
                         x: list_x + 20.0,
                         y: draw_y + 20.0,
                         font_size: 10.0,
@@ -961,7 +975,7 @@ impl ClearEmailApp {
 
                     // Snippet
                     let snippet_raw = email.body.replace('\n', " ");
-                    let snippet = if snippet_raw.len() > 40 { format!("{}...", &snippet_raw[..37]) } else { snippet_raw };
+                    let snippet = ellipsize(&snippet_raw, 37);
                     labels.push(TextLabel {
                         text: snippet,
                         x: list_x + 20.0,
@@ -1834,7 +1848,7 @@ impl Application for ClearEmailApp {
         let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
         if inbox_unread > 0 {
             let bx = margin_x;
-            let by = 130.0; // tracks the paginator's y=60 tab offset
+            let by = 92.0; // lower edge of the Inbox tab (tabs start at the y=60 paginator offset)
             quads.push((bx + (tab_w - 22.0) / 2.0, by + 12.0, 22.0, 16.0, [0.20, 0.45, 0.85, 0.8]));
         }
 
@@ -1895,9 +1909,32 @@ impl Application for ClearEmailApp {
                 cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_delete, &mut *quads.pc);
                 cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_unread, &mut *quads.pc);
 
-                // Detail body textbox: chrome-less, but the walk emits its text
-                self.detail_body.prepare_text(&mut self.font_system);
-                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.detail_body, &mut *quads.pc);
+                // Body as one boxed text prim: word-wrapped at the pane width and
+                // clipped to the pane (the TextBox walk drew each logical line as a
+                // single run, so long paragraphs truncated at the pane edge). Skipped
+                // while a modal is up — boxed text still renders above the panel.
+                if !self.compose_open && !self.account_dialog_open {
+                    if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
+                        let body_w = (w_f32 - (detail_x + 15.0)).max(100.0);
+                        let body_h = (h_f32 - 190.0).max(100.0);
+                        quads.pc.text_boxed(
+                            email.body.clone(),
+                            detail_x,
+                            170.0,
+                            12.0,
+                            [0xc8, 0xc8, 0xd0],
+                            Some("sans-serif".to_string()),
+                            Some([detail_x, 170.0, detail_x + body_w, 170.0 + body_h]),
+                            cce_ui::scene::paint::TextAttrs::default(),
+                            cce_ui::scene::paint::TextLayout {
+                                wrap_width: Some(body_w),
+                                box_height: body_h,
+                                align_h: cce_ui::scene::paint::AlignH::Left,
+                                align_v: cce_ui::scene::paint::AlignV::Top,
+                            },
+                        );
+                    }
+                }
             }
         }
 
@@ -2022,7 +2059,7 @@ impl Application for ClearEmailApp {
                 if ctx.propagate_event(&mv, self.btn_reply.id()) { changed = true; }
                 if ctx.propagate_event(&mv, self.btn_delete.id()) { changed = true; }
                 if ctx.propagate_event(&mv, self.btn_unread.id()) { changed = true; }
-                if ctx.propagate_event(&mv, self.detail_body.id()) { changed = true; }
+                // detail_body: read-only boxed-text pane, no event routing
             }
         }
 
@@ -2286,10 +2323,9 @@ impl Application for ClearEmailApp {
                         msg_out = Some(AppMessage::ToggleUnread);
                     }
                 }
-                if ctx.propagate_event(&ev, self.detail_body.id()) {
-                    changed = true;
-                    if state == ElementState::Pressed { ctx.set_focused(&mut self.detail_body); }
-                }
+                // detail_body deliberately gets no events: the pane is a read-only
+                // boxed-text render now, and focusing the TextBox only let you
+                // invisibly edit the display copy.
             }
         }
 
