@@ -854,8 +854,6 @@ impl ClearEmailApp {
 
     fn emit_text_prims(&mut self, pc: &mut cce_ui::scene::paint::PaintCtx) {
         let mut labels = Vec::new();
-        let font_system = &mut self.font_system;
-        let ctx = &self.ui_context;
 
         let w_f32 = self.width as f32;
         let h_f32 = self.height as f32;
@@ -867,9 +865,8 @@ impl ClearEmailApp {
         let tab_w = 46.0;
         let margin_x = (sidebar_w - tab_w) / 2.0;
 
-        // 1. Sidebar Buttons text labels
-        cce_ui::scene::painter::append_widget_text(ctx, &self.btn_compose, pc);
-        cce_ui::scene::painter::append_widget_text(ctx, &self.paginator, pc);
+        // Sidebar button/tab text now rides along with their chrome in display_list's
+        // paint_root_into walk — only app-composed labels are emitted here.
 
         // Sidebar Folder Badges
         let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
@@ -879,22 +876,19 @@ impl ClearEmailApp {
             labels.push(TextLabel {
                 text: badge_text,
                 x: margin_x + (tab_w - est_w) / 2.0,
-                y: 84.0,
+                y: 144.0, // tracks the paginator's y=60 tab offset
                 font_size: 10.0,
                 color: [0xff, 0xff, 0xff],
             });
         }
 
-        // 2. Search box labels / Accounts add button
-        if self.current_folder == Folder::Accounts {
-            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_add_account, pc);
-        } else {
-            self.search_box.prepare_text(font_system);
-            cce_ui::scene::painter::append_widget_text(ctx, &self.search_box, pc);
-        }
-
-        // 3. Email List Labels / Accounts list labels
-        if self.current_folder == Folder::Accounts {
+        // 3. Email List Labels / Accounts list labels.
+        // Skipped while a modal is up: text always renders above geometry, and these
+        // hand-emitted labels carry no bounds, so they'd bleed straight through the
+        // modal panel (the popover-occlusion clamp only knows registered popovers).
+        let modal_open = self.compose_open || self.account_dialog_open;
+        if modal_open {
+        } else if self.current_folder == Folder::Accounts {
             for (idx, acc) in self.accounts.iter().enumerate() {
                 if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
                     labels.push(TextLabel {
@@ -979,11 +973,11 @@ impl ClearEmailApp {
             }
         }
 
-        // 4. Detail View Content
-        if self.current_folder == Folder::Accounts {
+        // 4. Detail View Content (same modal gate as the list labels above)
+        if modal_open {
+        } else if self.current_folder == Folder::Accounts {
             if self.selected_account_idx < self.accounts.len() {
                 let acc = &self.accounts[self.selected_account_idx];
-                cce_ui::scene::painter::append_widget_text(ctx, &self.btn_make_default, pc);
 
                 // Subject Header (Account email)
                 labels.push(TextLabel {
@@ -1010,16 +1004,9 @@ impl ClearEmailApp {
                     font_size: 11.0,
                     color: if acc.is_default { [0x3a, 0xff, 0x80] } else { [0x83, 0x83, 0x8a] },
                 });
-                if acc.is_oauth {
-                    cce_ui::scene::painter::append_widget_text(ctx, &self.btn_login_oauth, pc);
-                }
             }
         } else if let Some(selected_id) = self.selected_email_id {
             if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
-                cce_ui::scene::painter::append_widget_text(ctx, &self.btn_reply, pc);
-                cce_ui::scene::painter::append_widget_text(ctx, &self.btn_delete, pc);
-                cce_ui::scene::painter::append_widget_text(ctx, &self.btn_unread, pc);
-
                 // Subject Header
                 labels.push(TextLabel {
                     text: email.subject.clone(),
@@ -1033,10 +1020,6 @@ impl ClearEmailApp {
                 labels.push(TextLabel { text: format!("From: {}", email.from), x: detail_x, y: 85.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
                 labels.push(TextLabel { text: format!("To:   {}", email.to), x: detail_x, y: 105.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
                 labels.push(TextLabel { text: format!("Date: {}", email.date), x: detail_x, y: 125.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-
-                // Body rendering
-                self.detail_body.prepare_text(font_system);
-                cce_ui::scene::painter::append_widget_text(ctx, &self.detail_body, pc);
             }
         } else {
             let placeholder = "Select an email to view its content".to_string();
@@ -1078,18 +1061,6 @@ impl ClearEmailApp {
             labels.push(TextLabel { text: "To:".to_string(), x: modal_x + 15.0, y: modal_y + 54.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
             labels.push(TextLabel { text: "Subject:".to_string(), x: modal_x + 15.0, y: modal_y + 94.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
 
-            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_compose_send, pc);
-            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_compose_cancel, pc);
-
-            // Compose inputs text labels
-            self.compose_to.prepare_text(font_system);
-            cce_ui::scene::painter::append_widget_text(ctx, &self.compose_to, pc);
-
-            self.compose_subject.prepare_text(font_system);
-            cce_ui::scene::painter::append_widget_text(ctx, &self.compose_subject, pc);
-
-            self.compose_body.prepare_text(font_system);
-            cce_ui::scene::painter::append_widget_text(ctx, &self.compose_body, pc);
         }
 
         // 7. Add Account Dialog Content
@@ -1125,27 +1096,9 @@ impl ClearEmailApp {
                 color: [0x70, 0x70, 0x75],
             });
 
-            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_add_acc_save, pc);
-            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_add_acc_cancel, pc);
-            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_add_acc_oauth, pc);
-            cce_ui::scene::painter::append_widget_text(ctx, &self.btn_add_acc_icloud, pc);
-
-            // 7a. Add Account Inputs text labels
-            self.add_acc_email.prepare_text(font_system);
-            cce_ui::scene::painter::append_widget_text(ctx, &self.add_acc_email, pc);
-
-            self.add_acc_password.prepare_text(font_system);
-            cce_ui::scene::painter::append_widget_text(ctx, &self.add_acc_password, pc);
-
-            self.add_acc_imap.prepare_text(font_system);
-            cce_ui::scene::painter::append_widget_text(ctx, &self.add_acc_imap, pc);
-
-            self.add_acc_smtp.prepare_text(font_system);
-            cce_ui::scene::painter::append_widget_text(ctx, &self.add_acc_smtp, pc);
         }
 
         // Emit accumulated static labels as text prims.
-        let _ = font_system;
         for label in labels {
             pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, None);
         }
@@ -1681,9 +1634,10 @@ impl Application for ClearEmailApp {
             // Sidebar buttons layout
             self.btn_compose.set_rect((sidebar_w - 36.0) / 2.0, 15.0, 36.0, 36.0);
 
-            // Set paginator layout
+            // Set paginator layout — tabs start below the compose button (the two used
+            // to stack at y=0 and the "+" sat buried under the Inbox tab).
             cce_ui::scale::set_scale_factor(scale as f32);
-            self.paginator.set_rect(0.0, 0.0, sidebar_w, h_f32);
+            self.paginator.set_rect(0.0, 60.0, sidebar_w, h_f32 - 60.0);
             let folder_idx = match self.current_folder {
                 Folder::Inbox => 0,
                 Folder::Sent => 1,
@@ -1870,15 +1824,17 @@ impl Application for ClearEmailApp {
         quads.push((0.0, 0.0, sidebar_w, h_f32, [0.08, 0.08, 0.12, 1.0]));
         quads.push((sidebar_w, 0.0, 1.0, h_f32, [0.18, 0.18, 0.22, 1.0])); // sidebar separator
 
-        // Compose Button and Folders Graphics
-        quads.extend(self.btn_compose.extra_quads());
-        quads.extend(self.paginator.extra_quads());
+        // Compose Button and Folders Graphics — full paint walk: chrome (rounded rects,
+        // hover/selected states) AND text in one pass. The legacy extra_quads bridge only
+        // forwarded plain Prim::Quads, so every widget's rounded chrome was dropped.
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose, &mut *quads.pc);
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.paginator, &mut *quads.pc);
 
         // Draw badge pill for inbox unread (centered on vertical rotated tab)
         let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
         if inbox_unread > 0 {
             let bx = margin_x;
-            let by = 70.0;
+            let by = 130.0; // tracks the paginator's y=60 tab offset
             quads.push((bx + (tab_w - 22.0) / 2.0, by + 12.0, 22.0, 16.0, [0.20, 0.45, 0.85, 0.8]));
         }
 
@@ -1887,9 +1843,10 @@ impl Application for ClearEmailApp {
 
         // Search box / Add Account and List
         if self.current_folder == Folder::Accounts {
-            quads.extend(self.btn_add_account.extra_quads());
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_add_account, &mut *quads.pc);
         } else {
-            quads.extend(self.search_box.extra_quads());
+            self.search_box.prepare_text(&mut self.font_system);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.search_box, &mut *quads.pc);
         }
         {
             let mut list_quads = Vec::new();
@@ -1905,7 +1862,7 @@ impl Application for ClearEmailApp {
         };
         for idx in 0..list_len {
             if self.email_list.get_item_draw_y(idx, 0.0).is_some() {
-                quads.extend(self.email_buttons[idx].extra_quads());
+                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.email_buttons[idx], &mut *quads.pc);
 
                 // Blue dot/unread indicator for this row (emails only)
                 if self.current_folder != Folder::Accounts && !filtered[idx].read {
@@ -1923,9 +1880,9 @@ impl Application for ClearEmailApp {
                 quads.push((detail_panel_x, 0.0, w_f32 - detail_panel_x, 42.0, [0.08, 0.08, 0.12, 1.0]));
                 quads.push((detail_panel_x, 42.0, w_f32 - detail_panel_x, 1.0, [0.18, 0.18, 0.22, 1.0]));
 
-                quads.extend(self.btn_make_default.extra_quads());
+                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_make_default, &mut *quads.pc);
                 if self.accounts[self.selected_account_idx].is_oauth {
-                    quads.extend(self.btn_login_oauth.extra_quads());
+                    cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_login_oauth, &mut *quads.pc);
                 }
             }
         } else if let Some(selected_id) = self.selected_email_id {
@@ -1934,12 +1891,13 @@ impl Application for ClearEmailApp {
                 quads.push((detail_panel_x, 0.0, w_f32 - detail_panel_x, 42.0, [0.08, 0.08, 0.12, 1.0]));
                 quads.push((detail_panel_x, 42.0, w_f32 - detail_panel_x, 1.0, [0.18, 0.18, 0.22, 1.0]));
 
-                quads.extend(self.btn_reply.extra_quads());
-                quads.extend(self.btn_delete.extra_quads());
-                quads.extend(self.btn_unread.extra_quads());
+                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_reply, &mut *quads.pc);
+                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_delete, &mut *quads.pc);
+                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_unread, &mut *quads.pc);
 
-                // Detail body textbox graphics
-                quads.extend(self.detail_body.extra_quads());
+                // Detail body textbox: chrome-less, but the walk emits its text
+                self.detail_body.prepare_text(&mut self.font_system);
+                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.detail_body, &mut *quads.pc);
             }
         }
 
@@ -1958,11 +1916,14 @@ impl Application for ClearEmailApp {
             quads.push((modal_x, modal_y, 1.0, 420.0, [0.25, 0.35, 0.50, 0.40]));
             quads.push((modal_x + 499.0, modal_y, 1.0, 420.0, [0.25, 0.35, 0.50, 0.40]));
 
-            quads.extend(self.compose_to.extra_quads());
-            quads.extend(self.compose_subject.extra_quads());
-            quads.extend(self.compose_body.extra_quads());
-            quads.extend(self.btn_compose_send.extra_quads());
-            quads.extend(self.btn_compose_cancel.extra_quads());
+            self.compose_to.prepare_text(&mut self.font_system);
+            self.compose_subject.prepare_text(&mut self.font_system);
+            self.compose_body.prepare_text(&mut self.font_system);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_to, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_subject, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_body, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose_send, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose_cancel, &mut *quads.pc);
         }
 
         // 6. Add Account Dialog Overlay
@@ -1980,14 +1941,18 @@ impl Application for ClearEmailApp {
             quads.push((modal_x, modal_y, 1.0, 360.0, [0.25, 0.35, 0.50, 0.40]));
             quads.push((modal_x + 499.0, modal_y, 1.0, 360.0, [0.25, 0.35, 0.50, 0.40]));
 
-            quads.extend(self.add_acc_email.extra_quads());
-            quads.extend(self.add_acc_password.extra_quads());
-            quads.extend(self.add_acc_imap.extra_quads());
-            quads.extend(self.add_acc_smtp.extra_quads());
-            quads.extend(self.btn_add_acc_save.extra_quads());
-            quads.extend(self.btn_add_acc_cancel.extra_quads());
-            quads.extend(self.btn_add_acc_oauth.extra_quads());
-            quads.extend(self.btn_add_acc_icloud.extra_quads());
+            self.add_acc_email.prepare_text(&mut self.font_system);
+            self.add_acc_password.prepare_text(&mut self.font_system);
+            self.add_acc_imap.prepare_text(&mut self.font_system);
+            self.add_acc_smtp.prepare_text(&mut self.font_system);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.add_acc_email, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.add_acc_password, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.add_acc_imap, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.add_acc_smtp, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_add_acc_save, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_add_acc_cancel, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_add_acc_oauth, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_add_acc_icloud, &mut *quads.pc);
         }
 
         self.emit_text_prims(&mut __pc);
