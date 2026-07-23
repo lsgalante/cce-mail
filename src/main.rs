@@ -65,16 +65,12 @@ enum AppMessage {
     DeleteSelected,
     ToggleUnread,
     SelectAccount(usize),
-    AddAccount,
-    MakeDefaultAccount,
+    /// Open cce-system-settings on its Accounts page — account add/remove/
+    /// default/OAuth all live there now; this app only reads accounts.json.
+    ManageAccounts,
     Status(String),
     EmailsSynced(String, Vec<Email>),
-    AddAccountSave,
-    AddAccountCancel,
-    AddAccountOAuth,
-    AddAccountSaveOAuth(AccountInfo),
     UpdateAccountTokens(String, Option<String>, Option<u64>),
-    AddAccountICloudHelp,
 }
 
 /// App shortcuts, resolved once at startup from input.kdl
@@ -118,23 +114,10 @@ struct ClearEmailApp {
     btn_compose_send: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     btn_compose_cancel: cce_ui::widget::Adapted<cce_ui::widget::Button>,
 
-    // Accounts Management
+    // Accounts (view/switch only — management lives in cce-system-settings)
     accounts: Vec<AccountInfo>,
     selected_account_idx: usize,
-    btn_add_account: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    btn_make_default: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    btn_login_oauth: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-
-    // Add Account Dialog
-    account_dialog_open: bool,
-    add_acc_email: cce_ui::widget::Adapted<TextBox>,
-    add_acc_password: cce_ui::widget::Adapted<TextBox>,
-    add_acc_imap: cce_ui::widget::Adapted<TextBox>,
-    add_acc_smtp: cce_ui::widget::Adapted<TextBox>,
-    btn_add_acc_save: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    btn_add_acc_cancel: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    btn_add_acc_oauth: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    btn_add_acc_icloud: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_manage_accounts: cce_ui::widget::Adapted<cce_ui::widget::Button>,
 
     // Application state
     emails: Vec<Email>,
@@ -180,7 +163,6 @@ fn get_accounts_path() -> std::path::PathBuf {
 }
 
 fn load_accounts() -> Vec<AccountInfo> {
-    let _ = load_google_client_config();
     let path = get_accounts_path();
     if path.exists() {
         if let Ok(content) = std::fs::read_to_string(&path) {
@@ -484,92 +466,6 @@ fn load_google_client_config() -> GoogleClientConfig {
         }
     }
     default_config
-}
-
-fn generate_pkce() -> (String, String) {
-    use ring::rand::SecureRandom;
-    use base64::Engine;
-    let rand = ring::rand::SystemRandom::new();
-    let mut bytes = [0u8; 32];
-    rand.fill(&mut bytes).unwrap();
-    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-    
-    let hash = ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes());
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.as_ref());
-    
-    (verifier, challenge)
-}
-
-async fn exchange_code_for_tokens(code: String, verifier: String, sender: calloop::channel::Sender<AppMessage>) {
-    let client_config = load_google_client_config();
-    let client = reqwest::Client::new();
-    let mut params = vec![
-        ("code", code.as_str()),
-        ("client_id", client_config.client_id.as_str()),
-        ("redirect_uri", "http://127.0.0.1:8080"),
-        ("grant_type", "authorization_code"),
-        ("code_verifier", verifier.as_str()),
-    ];
-    if !client_config.client_secret.is_empty() && client_config.client_secret != "GOCSPX-dummysecret" {
-        params.push(("client_secret", client_config.client_secret.as_str()));
-    }
-
-    
-    match client.post("https://oauth2.googleapis.com/token")
-        .form(&params)
-        .send()
-        .await 
-    {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    let access_token = json.get("access_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let refresh_token = json.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let expires_in = json.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
-                    
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let expiry = now + expires_in;
- 
-                    // Request user profile info to get the email address
-                    if let Ok(email_resp) = client.get("https://www.googleapis.com/oauth2/v2/userinfo")
-                        .bearer_auth(&access_token)
-                        .send()
-                        .await 
-                    {
-                        if let Ok(email_json) = email_resp.json::<serde_json::Value>().await {
-                            if let Some(email) = email_json.get("email").and_then(|v| v.as_str()) {
-                                let new_acc = AccountInfo {
-                                    email: email.to_string(),
-                                    imap: "imap.gmail.com:993".to_string(),
-                                    smtp: "smtp.gmail.com:465".to_string(),
-                                    is_default: false,
-                                    password: String::new(),
-                                    is_oauth: true,
-                                    access_token: Some(access_token),
-                                    refresh_token: Some(refresh_token),
-                                    token_expiry: Some(expiry),
-                                    client_id: Some(client_config.client_id),
-                                    client_secret: Some(client_config.client_secret),
-                                };
-                                let _ = sender.send(AppMessage::AddAccountSaveOAuth(new_acc));
-                                return;
-                            }
-                        }
-                    }
-                }
-                let _ = sender.send(AppMessage::Status("Failed to parse Google profile".to_string()));
-            } else {
-                let err_text = resp.text().await.unwrap_or_default();
-                let _ = sender.send(AppMessage::Status(format!("Token exchange failed: {}", err_text)));
-            }
-        }
-        Err(e) => {
-            let _ = sender.send(AppMessage::Status(format!("Token request failed: {}", e)));
-        }
-    }
 }
 
 async fn refresh_access_token(account: &mut AccountInfo) -> Result<String, String> {
@@ -1058,27 +954,7 @@ impl ClearEmailApp {
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_unread.id(), self.btn_unread.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_make_default.id(), self.btn_make_default.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_add_account.id(), self.btn_add_account.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_login_oauth.id(), self.btn_login_oauth.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_add_acc_oauth.id(), self.btn_add_acc_oauth.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_add_acc_icloud.id(), self.btn_add_acc_icloud.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_add_acc_save.id(), self.btn_add_acc_save.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_add_acc_cancel.id(), self.btn_add_acc_cancel.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.add_acc_email.id(), self.add_acc_email.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.add_acc_password.id(), self.add_acc_password.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.add_acc_imap.id(), self.add_acc_imap.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.add_acc_smtp.id(), self.add_acc_smtp.as_ptr_mut());
+        let (id, ptr) = (self.btn_manage_accounts.id(), self.btn_manage_accounts.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         for btn in self.email_buttons.iter_mut() {
             let (id, ptr) = (btn.id(), btn.as_ptr_mut());
@@ -1182,7 +1058,7 @@ impl ClearEmailApp {
         // Skipped while a modal is up: text always renders above geometry, and these
         // hand-emitted labels carry no bounds, so they'd bleed straight through the
         // modal panel (the popover-occlusion clamp only knows registered popovers).
-        let modal_open = self.compose_open || self.account_dialog_open;
+        let modal_open = self.compose_open;
         if modal_open {
         } else if self.current_folder == Folder::Accounts {
             for (idx, acc) in self.accounts.iter().enumerate() {
@@ -1359,41 +1235,6 @@ impl ClearEmailApp {
 
         }
 
-        // 7. Add Account Dialog Content
-        if self.account_dialog_open {
-            let modal_x = ((w_f32 - 500.0) / 2.0).max(0.0);
-            let modal_y = ((h_f32 - 360.0) / 2.0).max(0.0);
-
-            labels.push(TextLabel {
-                text: "Add Email Account".to_string(),
-                x: modal_x + 15.0,
-                y: modal_y + 16.0,
-                font_size: 13.0,
-                color: [0xff, 0xff, 0xff],
-            });
-
-            labels.push(TextLabel { text: "Email Address:".to_string(), x: modal_x + 15.0, y: modal_y + 54.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-            labels.push(TextLabel { text: "Password / App PW:".to_string(), x: modal_x + 15.0, y: modal_y + 94.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-            labels.push(TextLabel { text: "IMAP Host:port:".to_string(), x: modal_x + 15.0, y: modal_y + 134.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-            labels.push(TextLabel { text: "SMTP Host:port:".to_string(), x: modal_x + 15.0, y: modal_y + 174.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-
-            labels.push(TextLabel {
-                text: "Note: For Gmail, use 'Click to Login (Google)' below. iCloud requires App PW.".to_string(),
-                x: modal_x + 15.0,
-                y: modal_y + 215.0,
-                font_size: 9.5,
-                color: [0x70, 0x70, 0x75],
-            });
-            labels.push(TextLabel {
-                text: "Servers are automatically configured for popular domains.".to_string(),
-                x: modal_x + 15.0,
-                y: modal_y + 233.0,
-                font_size: 9.5,
-                color: [0x70, 0x70, 0x75],
-            });
-
-        }
-
         // Emit accumulated static labels as text prims.
         for label in labels {
             pc.text_with(label.text.clone(), label.x, label.y, label.font_size, label.color, None, None);
@@ -1446,8 +1287,7 @@ impl Application for ClearEmailApp {
         let accounts = load_accounts();
         let selected_account_idx = accounts.iter().position(|a| a.is_default).unwrap_or(0);
 
-        let btn_add_account = Button::new(66.0, 15.0, 300.0, 26.0).with_label("+ Add Account");
-        let btn_make_default = Button::new(391.0, 8.0, 120.0, 26.0).with_label("Make Default");
+        let btn_manage_accounts = Button::new(66.0, 15.0, 300.0, 26.0).with_label("Manage Accounts...");
 
         let mut detail_body = TextBox::new(String::new()).with_multiline(true).with_draw_bg_border(false);
         detail_body.font_size = 12.0;
@@ -1464,21 +1304,6 @@ impl Application for ClearEmailApp {
         let btn_compose_send = Button::new(0.0, 0.0, 75.0, 28.0).with_label("Send");
         let btn_compose_cancel = Button::new_reset(0.0, 0.0, 75.0, 28.0).with_label("Cancel");
 
-        let mut add_acc_email = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
-        add_acc_email.font_size = 11.0;
-        let mut add_acc_password = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
-        add_acc_password.font_size = 11.0;
-        add_acc_password.is_password = true;
-        let mut add_acc_imap = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
-        add_acc_imap.font_size = 11.0;
-        let mut add_acc_smtp = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
-        add_acc_smtp.font_size = 11.0;
-
-        let btn_add_acc_save = Button::new(0.0, 0.0, 75.0, 28.0).with_label("Save");
-        let btn_add_acc_cancel = Button::new_reset(0.0, 0.0, 75.0, 28.0).with_label("Cancel");
-        let btn_add_acc_oauth = Button::new(0.0, 0.0, 140.0, 28.0).with_label("Login (Google)");
-        let btn_add_acc_icloud = Button::new(0.0, 0.0, 140.0, 28.0).with_label("Login (iCloud)");
-        let btn_login_oauth = Button::new(0.0, 0.0, 180.0, 28.0).with_label("Click to Login (Browser)");
 
         let emails = if let Some(acc) = accounts.get(selected_account_idx) {
             load_emails_for_account(&acc.email)
@@ -1508,18 +1333,7 @@ impl Application for ClearEmailApp {
             btn_compose_cancel,
             accounts,
             selected_account_idx,
-            btn_add_account,
-            btn_make_default,
-            btn_login_oauth,
-            account_dialog_open: false,
-            add_acc_email,
-            add_acc_password,
-            add_acc_imap,
-            add_acc_smtp,
-            btn_add_acc_save,
-            btn_add_acc_cancel,
-            btn_add_acc_oauth,
-            btn_add_acc_icloud,
+            btn_manage_accounts,
             emails,
             current_folder: Folder::Inbox,
             selected_email_id: None,
@@ -1558,6 +1372,33 @@ impl Application for ClearEmailApp {
                 self.selected_email_id = None;
                 self.email_list.set_scroll_y(0.0);
                 self.body_scroll = 0.0;
+                if f == Folder::Accounts {
+                    // Accounts are managed by cce-system-settings — re-read the
+                    // shared accounts.json on every entry so its changes appear
+                    // without an app restart. Keep the selection by email; if
+                    // that account is gone, fall to the default.
+                    let prev_email = self
+                        .accounts
+                        .get(self.selected_account_idx)
+                        .map(|a| a.email.clone());
+                    self.accounts = load_accounts();
+                    let new_idx = prev_email
+                        .as_deref()
+                        .and_then(|e| self.accounts.iter().position(|a| a.email == e))
+                        .or_else(|| self.accounts.iter().position(|a| a.is_default))
+                        .unwrap_or(0);
+                    let changed_account =
+                        self.accounts.get(new_idx).map(|a| a.email.as_str()) != prev_email.as_deref();
+                    self.selected_account_idx = new_idx;
+                    if changed_account {
+                        if let Some(acc) = self.accounts.get(new_idx) {
+                            self.emails = load_emails_for_account(&acc.email);
+                            sync_imap(acc.clone(), self.sender.clone());
+                        } else {
+                            self.emails = Vec::new();
+                        }
+                    }
+                }
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -1698,27 +1539,11 @@ impl Application for ClearEmailApp {
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
-            AppMessage::AddAccount => {
-                // Clear all Add Account inputs
-                self.add_acc_email.text = String::new();
-                self.add_acc_email.edit_buffer = String::new();
-                self.add_acc_password.text = String::new();
-                self.add_acc_password.edit_buffer = String::new();
-                self.add_acc_imap.text = String::new();
-                self.add_acc_imap.edit_buffer = String::new();
-                self.add_acc_smtp.text = String::new();
-                self.add_acc_smtp.edit_buffer = String::new();
-                
-                self.account_dialog_open = true;
-                *needs_rebuild = true;
-                self.needs_rebuild = true;
-            }
-            AppMessage::MakeDefaultAccount => {
-                for (i, acc) in self.accounts.iter_mut().enumerate() {
-                    acc.is_default = i == self.selected_account_idx;
-                }
-                save_accounts(&self.accounts);
-                self.status_message = Some(("Default Account Changed".to_string(), 4.0));
+            AppMessage::ManageAccounts => {
+                let mut cmd = std::process::Command::new("cce-system-settings");
+                cmd.arg("accounts");
+                let _ = cce_ui::process::spawn_detached(cmd);
+                self.status_message = Some(("Opening System Settings...".to_string(), 4.0));
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -1760,133 +1585,6 @@ impl Application for ClearEmailApp {
                         save_emails_for_account(&email, &merged);
                     }
                 }
-                *needs_rebuild = true;
-                self.needs_rebuild = true;
-            }
-            AppMessage::AddAccountSave => {
-                let email = if self.add_acc_email.editing { &self.add_acc_email.edit_buffer } else { &self.add_acc_email.text }.trim().to_string();
-                let password = if self.add_acc_password.editing { &self.add_acc_password.edit_buffer } else { &self.add_acc_password.text }.trim().to_string();
-                let imap = if self.add_acc_imap.editing { &self.add_acc_imap.edit_buffer } else { &self.add_acc_imap.text }.trim().to_string();
-                let smtp = if self.add_acc_smtp.editing { &self.add_acc_smtp.edit_buffer } else { &self.add_acc_smtp.text }.trim().to_string();
-
-                if email.is_empty() || password.is_empty() || imap.is_empty() || smtp.is_empty() {
-                    self.status_message = Some(("All fields are required".to_string(), 4.0));
-                } else {
-                    let is_default = self.accounts.is_empty();
-                    let new_acc = AccountInfo {
-                        email: email.clone(),
-                        imap,
-                        smtp,
-                        is_default,
-                        password,
-                        is_oauth: false,
-                        access_token: None,
-                        refresh_token: None,
-                        token_expiry: None,
-                        client_id: None,
-                        client_secret: None,
-                    };
-                    self.accounts.push(new_acc.clone());
-                    save_accounts(&self.accounts);
-
-                    self.selected_account_idx = self.accounts.len() - 1;
-                    self.emails = load_emails_for_account(&email);
-                    
-                    // Trigger sync
-                    sync_imap(new_acc, self.sender.clone());
-                    
-                    self.account_dialog_open = false;
-                    self.status_message = Some(("Account Added Successfully".to_string(), 4.0));
-                }
-                *needs_rebuild = true;
-                self.needs_rebuild = true;
-            }
-            AppMessage::AddAccountCancel => {
-                self.account_dialog_open = false;
-                *needs_rebuild = true;
-                self.needs_rebuild = true;
-            }
-            AppMessage::AddAccountOAuth => {
-                let sender = self.sender.clone();
-                let client_config = load_google_client_config();
-                tokio::spawn(async move {
-                    let listener = match tokio::net::TcpListener::bind("127.0.0.1:8080").await {
-                        Ok(l) => l,
-                        Err(e) => {
-                            let _ = sender.send(AppMessage::Status(format!("Failed to bind port 8080: {}", e)));
-                            return;
-                        }
-                    };
-                    
-                    let _ = sender.send(AppMessage::Status("Waiting for browser login...".to_string()));
-                    
-                    let (verifier, challenge) = generate_pkce();
-                    
-                    let auth_url = format!(
-                        "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080&response_type=code&scope=https%3A%2F%2Fmail.google.com%2F&access_type=offline&prompt=consent&code_challenge={}&code_challenge_method=S256",
-                        client_config.client_id,
-                        challenge
-                    );
-                    let _ = std::process::Command::new("xdg-open").arg(&auth_url).spawn();
-
-                    if let Ok((mut stream, _)) = listener.accept().await {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut buffer = [0; 1024];
-                        if let Ok(n) = stream.read(&mut buffer).await {
-                            let req_str = String::from_utf8_lossy(&buffer[..n]);
-                            if let Some(code_idx) = req_str.find("code=") {
-                                let rest = &req_str[code_idx + 5..];
-                                let end_idx = rest.find(|c: char| c == ' ' || c == '&' || c == '\r' || c == '\n').unwrap_or(rest.len());
-                                let code = rest[..end_idx].to_string();
-                                
-                                let _ = sender.send(AppMessage::Status("Exchanging code for token...".to_string()));
-                                exchange_code_for_tokens(code, verifier, sender.clone()).await;
-
-                                
-                                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
-                                                <html><head><style>body { font-family: sans-serif; background-color: #08080c; color: #fff; text-align: center; padding-top: 50px; }</style></head><body><h2>Clear Mail Authentication Successful!</h2><p>You can close this tab and return to the application.</p></body></html>";
-                                let _ = stream.write_all(response.as_bytes()).await;
-                                let _ = stream.flush().await;
-                            } else {
-                                let _ = sender.send(AppMessage::Status("OAuth Error: No code received".to_string()));
-                                let response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
-                                                <html><head><style>body { font-family: sans-serif; background-color: #08080c; color: #ff6060; text-align: center; padding-top: 50px; }</style></head><body><h2>Clear Mail Authentication Failed</h2><p>No authorization code was found.</p></body></html>";
-                                let _ = stream.write_all(response.as_bytes()).await;
-                                let _ = stream.flush().await;
-                            }
-                        }
-                    }
-                });
-                *needs_rebuild = true;
-                self.needs_rebuild = true;
-            }
-            AppMessage::AddAccountICloudHelp => {
-                let _ = std::process::Command::new("xdg-open").arg("https://appleid.apple.com/").spawn();
-                self.status_message = Some(("Log in & generate an App-Specific Password on appleid.apple.com".to_string(), 6.0));
-                *needs_rebuild = true;
-                self.needs_rebuild = true;
-            }
-            AppMessage::AddAccountSaveOAuth(new_acc) => {
-                let mut acc = new_acc;
-                if let Some(existing_idx) = self.accounts.iter().position(|a| a.email == acc.email) {
-                    let is_default = self.accounts[existing_idx].is_default;
-                    acc.is_default = is_default;
-                    self.accounts[existing_idx] = acc.clone();
-                    self.selected_account_idx = existing_idx;
-                    self.status_message = Some(("Google Account Updated".to_string(), 4.0));
-                } else {
-                    acc.is_default = self.accounts.is_empty();
-                    self.accounts.push(acc.clone());
-                    self.selected_account_idx = self.accounts.len() - 1;
-                    self.status_message = Some(("Google Account Added".to_string(), 4.0));
-                }
-                save_accounts(&self.accounts);
-
-                self.emails = load_emails_for_account(&acc.email);
-                
-                sync_imap(acc, self.sender.clone());
-                
-                self.account_dialog_open = false;
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -1967,7 +1665,7 @@ impl Application for ClearEmailApp {
 
             // Search box / Add Account and Scrolling list
             let list_count = if self.current_folder == Folder::Accounts {
-                self.btn_add_account.set_rect(list_x, 15.0, 300.0, 26.0);
+                self.btn_manage_accounts.set_rect(list_x, 15.0, 300.0, 26.0);
                 self.accounts.len()
             } else {
                 self.search_box.set_rect(list_x, 15.0, 300.0, 26.0);
@@ -2044,22 +1742,7 @@ impl Application for ClearEmailApp {
                     }
                 }
 
-                // Detail View for selected account
-                if self.selected_account_idx < self.accounts.len() {
-                    self.btn_make_default.set_rect(detail_x, 8.0, 120.0, 26.0);
-                    let acc = &self.accounts[self.selected_account_idx];
-                    if acc.is_oauth {
-                        self.btn_login_oauth.set_rect(detail_x, 200.0, 180.0, 28.0);
-                    } else {
-                        self.btn_login_oauth.set_rect(-9999.0, -9999.0, 0.0, 0.0);
-                    }
-                } else {
-                    self.btn_make_default.set_rect(-9999.0, -9999.0, 0.0, 0.0);
-                    self.btn_login_oauth.set_rect(-9999.0, -9999.0, 0.0, 0.0);
-                }
             } else {
-                self.btn_make_default.set_rect(-9999.0, -9999.0, 0.0, 0.0);
-                self.btn_login_oauth.set_rect(-9999.0, -9999.0, 0.0, 0.0);
                 for (idx, &(_email_id, is_selected)) in filtered_email_ids.iter().enumerate() {
                     self.email_buttons[idx].selected = is_selected;
                     if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
@@ -2095,23 +1778,7 @@ impl Application for ClearEmailApp {
                 self.btn_compose_cancel.set_rect(modal_x + 410.0, modal_y + 375.0, 75.0, 28.0);
             }
 
-            // Add Account inputs layout
-            if self.account_dialog_open {
-                let modal_x = ((w_f32 - 500.0) / 2.0).max(0.0);
-                let modal_y = ((h_f32 - 360.0) / 2.0).max(0.0);
 
-                self.add_acc_email.set_rect(modal_x + 140.0, modal_y + 50.0, 340.0, 26.0);
-                self.add_acc_password.set_rect(modal_x + 140.0, modal_y + 90.0, 340.0, 26.0);
-                self.add_acc_imap.set_rect(modal_x + 140.0, modal_y + 130.0, 340.0, 26.0);
-                self.add_acc_smtp.set_rect(modal_x + 140.0, modal_y + 170.0, 340.0, 26.0);
-
-                self.btn_add_acc_save.set_rect(modal_x + 320.0, modal_y + 310.0, 75.0, 28.0);
-                self.btn_add_acc_cancel.set_rect(modal_x + 410.0, modal_y + 310.0, 75.0, 28.0);
-                self.btn_add_acc_oauth.set_rect(modal_x + 15.0, modal_y + 310.0, 140.0, 28.0);
-                self.btn_add_acc_icloud.set_rect(modal_x + 165.0, modal_y + 310.0, 140.0, 28.0);
-            } else {
-                self.btn_add_acc_icloud.set_rect(-9999.0, -9999.0, 0.0, 0.0);
-            }
 
             self.needs_rebuild = false;
         }
@@ -2162,7 +1829,7 @@ impl Application for ClearEmailApp {
 
         // Search box / Add Account and List
         if self.current_folder == Folder::Accounts {
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_add_account, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_manage_accounts, &mut *quads.pc);
         } else {
             self.search_box.prepare_text(&mut self.font_system);
             cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.search_box, &mut *quads.pc);
@@ -2206,10 +1873,6 @@ impl Application for ClearEmailApp {
                 quads.push((detail_panel_x, 0.0, w_f32 - detail_panel_x, 42.0, [0.08, 0.08, 0.12, 1.0]));
                 quads.push((detail_panel_x, 42.0, w_f32 - detail_panel_x, 1.0, [0.18, 0.18, 0.22, 1.0]));
 
-                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_make_default, &mut *quads.pc);
-                if self.accounts[self.selected_account_idx].is_oauth {
-                    cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_login_oauth, &mut *quads.pc);
-                }
             }
         } else if let Some(selected_id) = self.selected_email_id {
             if self.emails.iter().any(|e| e.id == selected_id) {
@@ -2225,7 +1888,7 @@ impl Application for ClearEmailApp {
                 // clipped to the pane (the TextBox walk drew each logical line as a
                 // single run, so long paragraphs truncated at the pane edge). Skipped
                 // while a modal is up — boxed text still renders above the panel.
-                if !self.compose_open && !self.account_dialog_open {
+                if !self.compose_open {
                     if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
                         let body_w = (w_f32 - (detail_x + 15.0)).max(100.0);
                         let body_h = (h_f32 - 190.0).max(100.0);
@@ -2303,34 +1966,7 @@ impl Application for ClearEmailApp {
             cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose_cancel, &mut *quads.pc);
         }
 
-        // 6. Add Account Dialog Overlay
-        if self.account_dialog_open {
-            let modal_x = ((w_f32 - 500.0) / 2.0).max(0.0);
-            let modal_y = ((h_f32 - 360.0) / 2.0).max(0.0);
 
-            // Semitransparent modal backdrop
-            quads.push((0.0, 0.0, w_f32, h_f32, [0.0, 0.0, 0.0, 0.6]));
-
-            // Modal dialog container
-            quads.push((modal_x, modal_y, 500.0, 360.0, [0.08, 0.08, 0.12, 1.0]));
-            quads.push((modal_x, modal_y, 500.0, 1.0, [0.25, 0.35, 0.50, 0.40]));
-            quads.push((modal_x, modal_y + 359.0, 500.0, 1.0, [0.25, 0.35, 0.50, 0.40]));
-            quads.push((modal_x, modal_y, 1.0, 360.0, [0.25, 0.35, 0.50, 0.40]));
-            quads.push((modal_x + 499.0, modal_y, 1.0, 360.0, [0.25, 0.35, 0.50, 0.40]));
-
-            self.add_acc_email.prepare_text(&mut self.font_system);
-            self.add_acc_password.prepare_text(&mut self.font_system);
-            self.add_acc_imap.prepare_text(&mut self.font_system);
-            self.add_acc_smtp.prepare_text(&mut self.font_system);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.add_acc_email, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.add_acc_password, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.add_acc_imap, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.add_acc_smtp, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_add_acc_save, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_add_acc_cancel, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_add_acc_oauth, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_add_acc_icloud, &mut *quads.pc);
-        }
 
         self.emit_text_prims(&mut __pc);
         Some(__pc.finish())
@@ -2346,7 +1982,7 @@ impl Application for ClearEmailApp {
         let py = pos.y as f32;
         // Active scrollbar-thumb drag tracks the pointer — before the
         // ui_context borrow (the sb helper takes &mut self).
-        if !self.account_dialog_open && !self.compose_open && self.body_sb_dragging {
+        if !self.compose_open && self.body_sb_dragging {
             if self.body_sb_drag_to(py) {
                 changed = true;
             }
@@ -2356,16 +1992,7 @@ impl Application for ClearEmailApp {
         let mv = cce_ui::widget::Event::PointerMove { x: px, y: py, local_x: px, local_y: py };
         let ctx = &mut self.ui_context;
 
-        if self.account_dialog_open {
-            if ctx.propagate_event(&mv, self.add_acc_email.id()) { changed = true; }
-            if ctx.propagate_event(&mv, self.add_acc_password.id()) { changed = true; }
-            if ctx.propagate_event(&mv, self.add_acc_imap.id()) { changed = true; }
-            if ctx.propagate_event(&mv, self.add_acc_smtp.id()) { changed = true; }
-            if ctx.propagate_event(&mv, self.btn_add_acc_save.id()) { changed = true; }
-            if ctx.propagate_event(&mv, self.btn_add_acc_cancel.id()) { changed = true; }
-            if ctx.propagate_event(&mv, self.btn_add_acc_oauth.id()) { changed = true; }
-            if ctx.propagate_event(&mv, self.btn_add_acc_icloud.id()) { changed = true; }
-        } else if self.compose_open {
+        if self.compose_open {
             if ctx.propagate_event(&mv, self.compose_to.id()) { changed = true; }
             if ctx.propagate_event(&mv, self.compose_subject.id()) { changed = true; }
             if ctx.propagate_event(&mv, self.compose_body.id()) { changed = true; }
@@ -2383,7 +2010,7 @@ impl Application for ClearEmailApp {
 
             // Search / Add account and lists
             if self.current_folder == Folder::Accounts {
-                if ctx.propagate_event(&mv, self.btn_add_account.id()) { changed = true; }
+                if ctx.propagate_event(&mv, self.btn_manage_accounts.id()) { changed = true; }
             } else {
                 if ctx.propagate_event(&mv, self.search_box.id()) { changed = true; }
             }
@@ -2398,14 +2025,7 @@ impl Application for ClearEmailApp {
             }
 
             // Detail view buttons
-            if self.current_folder == Folder::Accounts {
-                if self.selected_account_idx < self.accounts.len() {
-                    if ctx.propagate_event(&mv, self.btn_make_default.id()) { changed = true; }
-                    if self.accounts[self.selected_account_idx].is_oauth {
-                        if ctx.propagate_event(&mv, self.btn_login_oauth.id()) { changed = true; }
-                    }
-                }
-            } else if self.selected_email_id.is_some() {
+            if self.current_folder != Folder::Accounts && self.selected_email_id.is_some() {
                 if ctx.propagate_event(&mv, self.btn_reply.id()) { changed = true; }
                 if ctx.propagate_event(&mv, self.btn_delete.id()) { changed = true; }
                 if ctx.propagate_event(&mv, self.btn_unread.id()) { changed = true; }
@@ -2428,8 +2048,7 @@ impl Application for ClearEmailApp {
 
         // Detail-pane body scrollbar drag — before the ui_context borrow (the
         // sb helpers take &mut self).
-        if !self.account_dialog_open
-            && !self.compose_open
+        if !self.compose_open
             && button == MouseButton::Left
             && self.current_folder != Folder::Accounts
         {
@@ -2452,66 +2071,7 @@ impl Application for ClearEmailApp {
 
         let ctx = &mut self.ui_context;
 
-        if self.account_dialog_open {
-            if ctx.propagate_event(&ev, self.add_acc_email.id()) {
-                changed = true;
-                if state == ElementState::Pressed { ctx.set_focused(&mut self.add_acc_email); }
-            }
-            if ctx.propagate_event(&ev, self.add_acc_password.id()) {
-                changed = true;
-                if state == ElementState::Pressed { ctx.set_focused(&mut self.add_acc_password); }
-            }
-            if ctx.propagate_event(&ev, self.add_acc_imap.id()) {
-                changed = true;
-                if state == ElementState::Pressed { ctx.set_focused(&mut self.add_acc_imap); }
-            }
-            if ctx.propagate_event(&ev, self.add_acc_smtp.id()) {
-                changed = true;
-                if state == ElementState::Pressed { ctx.set_focused(&mut self.add_acc_smtp); }
-            }
-
-            if ctx.propagate_event(&ev, self.btn_add_acc_save.id()) {
-                changed = true;
-                if state == ElementState::Released && self.btn_add_acc_save.take_click() {
-                    msg_out = Some(AppMessage::AddAccountSave);
-                }
-            }
-            if ctx.propagate_event(&ev, self.btn_add_acc_cancel.id()) {
-                changed = true;
-                if state == ElementState::Released && self.btn_add_acc_cancel.take_click() {
-                    msg_out = Some(AppMessage::AddAccountCancel);
-                }
-            }
-            if ctx.propagate_event(&ev, self.btn_add_acc_oauth.id()) {
-                changed = true;
-                if state == ElementState::Released && self.btn_add_acc_oauth.take_click() {
-                    msg_out = Some(AppMessage::AddAccountOAuth);
-                }
-            }
-            if ctx.propagate_event(&ev, self.btn_add_acc_icloud.id()) {
-                changed = true;
-                if state == ElementState::Released && self.btn_add_acc_icloud.take_click() {
-                    msg_out = Some(AppMessage::AddAccountICloudHelp);
-                }
-            }
-
-            // Click outside the modal clears focus
-            if !changed && state == ElementState::Pressed && button == MouseButton::Left {
-                let w_f32 = self.width as f32;
-                let h_f32 = self.height as f32;
-                let modal_x = ((w_f32 - 500.0) / 2.0).max(0.0);
-                let modal_y = ((h_f32 - 360.0) / 2.0).max(0.0);
-
-                if px < modal_x || px > modal_x + 500.0 || py < modal_y || py > modal_y + 360.0 {
-                    ctx.clear_focus();
-                    self.add_acc_email.unfocus();
-                    self.add_acc_password.unfocus();
-                    self.add_acc_imap.unfocus();
-                    self.add_acc_smtp.unfocus();
-                    changed = true;
-                }
-            }
-        } else if self.compose_open {
+        if self.compose_open {
             if ctx.propagate_event(&ev, self.compose_to.id()) {
                 changed = true;
                 if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_to); }
@@ -2579,10 +2139,10 @@ impl Application for ClearEmailApp {
             }
 
             if self.current_folder == Folder::Accounts {
-                if ctx.propagate_event(&ev, self.btn_add_account.id()) {
+                if ctx.propagate_event(&ev, self.btn_manage_accounts.id()) {
                     changed = true;
-                    if state == ElementState::Released && self.btn_add_account.take_click() {
-                        msg_out = Some(AppMessage::AddAccount);
+                    if state == ElementState::Released && self.btn_manage_accounts.take_click() {
+                        msg_out = Some(AppMessage::ManageAccounts);
                     }
                 }
             } else {
@@ -2663,24 +2223,7 @@ impl Application for ClearEmailApp {
             }
 
             // Detail View action buttons
-            if self.current_folder == Folder::Accounts {
-                if self.selected_account_idx < self.accounts.len() {
-                    if ctx.propagate_event(&ev, self.btn_make_default.id()) {
-                        changed = true;
-                        if state == ElementState::Released && self.btn_make_default.take_click() {
-                            msg_out = Some(AppMessage::MakeDefaultAccount);
-                        }
-                    }
-                    if self.accounts[self.selected_account_idx].is_oauth {
-                        if ctx.propagate_event(&ev, self.btn_login_oauth.id()) {
-                            changed = true;
-                            if state == ElementState::Released && self.btn_login_oauth.take_click() {
-                                msg_out = Some(AppMessage::AddAccountOAuth);
-                            }
-                        }
-                    }
-                }
-            } else if self.selected_email_id.is_some() {
+            if self.current_folder != Folder::Accounts && self.selected_email_id.is_some() {
                 if ctx.propagate_event(&ev, self.btn_reply.id()) {
                     changed = true;
                     if state == ElementState::Released && self.btn_reply.take_click() {
@@ -2728,7 +2271,6 @@ impl Application for ClearEmailApp {
 
         // Detail-pane body scroll.
         if !self.compose_open
-            && !self.account_dialog_open
             && self.current_folder != Folder::Accounts
             && self.selected_email_id.is_some()
         {
@@ -2760,43 +2302,7 @@ impl Application for ClearEmailApp {
         let kev = cce_ui::widget::Event::KeyInput(event.clone());
         let ctx = &mut self.ui_context;
 
-        if self.account_dialog_open {
-            if self.add_acc_email.editing {
-                if ctx.propagate_event(&kev, self.add_acc_email.id()) {
-                    handled = true;
-                    // Auto-fill configuration based on email domain
-                    let email_val = self.add_acc_email.edit_buffer.trim().to_lowercase();
-                    if email_val.ends_with("@gmail.com") {
-                        self.add_acc_imap.text = "imap.gmail.com:993".to_string();
-                        self.add_acc_imap.edit_buffer = "imap.gmail.com:993".to_string();
-                        self.add_acc_smtp.text = "smtp.gmail.com:465".to_string();
-                        self.add_acc_smtp.edit_buffer = "smtp.gmail.com:465".to_string();
-                    } else if email_val.ends_with("@icloud.com") {
-                        self.add_acc_imap.text = "imap.mail.me.com:993".to_string();
-                        self.add_acc_imap.edit_buffer = "imap.mail.me.com:993".to_string();
-                        self.add_acc_smtp.text = "smtp.mail.me.com:587".to_string();
-                        self.add_acc_smtp.edit_buffer = "smtp.mail.me.com:587".to_string();
-                    } else if email_val.ends_with("@outlook.com") || email_val.ends_with("@hotmail.com") {
-                        self.add_acc_imap.text = "outlook.office365.com:993".to_string();
-                        self.add_acc_imap.edit_buffer = "outlook.office365.com:993".to_string();
-                        self.add_acc_smtp.text = "smtp.office365.com:587".to_string();
-                        self.add_acc_smtp.edit_buffer = "smtp.office365.com:587".to_string();
-                    }
-                }
-            } else if self.add_acc_password.editing {
-                if ctx.propagate_event(&kev, self.add_acc_password.id()) { handled = true; }
-            } else if self.add_acc_imap.editing {
-                if ctx.propagate_event(&kev, self.add_acc_imap.id()) { handled = true; }
-            } else if self.add_acc_smtp.editing {
-                if ctx.propagate_event(&kev, self.add_acc_smtp.id()) { handled = true; }
-            }
-
-            // Escape closes dialog
-            if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(cce_ui::widget::NamedKey::Escape) {
-                msg_out = Some(AppMessage::AddAccountCancel);
-                handled = true;
-            }
-        } else if self.compose_open {
+        if self.compose_open {
             if self.compose_to.editing {
                 if ctx.propagate_event(&kev, self.compose_to.id()) { handled = true; }
             } else if self.compose_subject.editing {
