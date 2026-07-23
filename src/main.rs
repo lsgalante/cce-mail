@@ -244,18 +244,9 @@ fn save_emails_for_account(email: &str, emails: &[Email]) {
     }
 }
 
-fn process_header(line: &str, from: &mut String, subject: &mut String, date: &mut String) {
-    if let Some(colon) = line.find(':') {
-        let key = line[..colon].trim().to_lowercase();
-        let val = line[colon+1..].trim().to_string();
-        match key.as_str() {
-            "from" => *from = val,
-            "subject" => *subject = val,
-            "date" => *date = val,
-            _ => {}
-        }
-    }
-}
+/// Newest-N window fetched per sync. Full messages (attachments included) come
+/// down the wire, so this trades sync time against history depth.
+const FETCH_COUNT: usize = 50;
 
 /// Char-boundary-safe ellipsized truncation. Byte slicing (`&s[..n]`) panics
 /// mid-UTF-8, and real-world mail headers/bodies are full of multi-byte chars.
@@ -266,33 +257,91 @@ fn ellipsize(s: &str, max_chars: usize) -> String {
     }
 }
 
-fn clean_body(body: &str) -> String {
-    let mut cleaned = String::new();
-    let mut in_headers = false;
-    for line in body.lines() {
-        let line_trimmed = line.trim();
-        if line_trimmed.starts_with("--") || line_trimmed.contains("Content-Type:") || line_trimmed.contains("Content-Transfer-Encoding:") {
-            in_headers = true;
-            continue;
+/// Display form of the From address: "Name <addr>", falling back through the
+/// parts. mail-parser has already decoded any RFC 2047 encoded-words.
+fn format_from(msg: &mail_parser::Message) -> String {
+    if let Some(addr) = msg.from().and_then(|a| a.first()) {
+        match (addr.name(), addr.address()) {
+            (Some(n), Some(a)) => format!("{} <{}>", n, a),
+            (None, Some(a)) => a.to_string(),
+            (Some(n), None) => n.to_string(),
+            (None, None) => "Unknown".to_string(),
         }
-        if in_headers && line_trimmed.is_empty() {
-            in_headers = false;
-            continue;
+    } else {
+        "Unknown".to_string()
+    }
+}
+
+/// "Jul 23 10:50" from the parsed Date header (raw header strings previously
+/// showed as e.g. "Wed, 23 Jul 2026 10:50:12 +0200 (CEST)").
+fn format_date(dt: Option<&mail_parser::DateTime>) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    match dt {
+        Some(d) => {
+            let month = MONTHS
+                .get((d.month as usize).wrapping_sub(1))
+                .copied()
+                .unwrap_or("?");
+            format!("{} {} {:02}:{:02}", month, d.day, d.hour, d.minute)
         }
-        if !in_headers {
-            cleaned.push_str(line);
-            cleaned.push('\n');
+        None => "Unknown".to_string(),
+    }
+}
+
+/// Readable body text: the first text part (mail-parser decodes transfer
+/// encoding + charset, and converts an HTML-only message to text), trimmed
+/// and capped for the 1-message display model.
+fn extract_body(msg: &mail_parser::Message) -> String {
+    let mut body = msg
+        .body_text(0)
+        .map(|t| t.to_string())
+        .or_else(|| msg.body_html(0).map(|h| strip_html(&h)))
+        .unwrap_or_default();
+    body = body.trim_end().to_string();
+    if let Some((idx, _)) = body.char_indices().nth(1200) {
+        body.truncate(idx);
+        body.push_str("...");
+    }
+    body
+}
+
+/// Last-resort HTML-to-text: drop tags, decode the common entities, collapse
+/// blank-line runs. Only reached if mail-parser yields no text conversion.
+fn strip_html(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() / 2);
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
         }
     }
-    if cleaned.len() > 1200 {
-        let mut cut = 1200;
-        while !cleaned.is_char_boundary(cut) {
-            cut -= 1;
+    let out = out
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    let mut collapsed = String::with_capacity(out.len());
+    let mut blank_run = 0;
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
         }
-        cleaned.truncate(cut);
-        cleaned.push_str("...");
+        collapsed.push_str(line.trim_end());
+        collapsed.push('\n');
     }
-    cleaned
+    collapsed
 }
 
 const GOOGLE_CLIENT_ID: &str = "946029775684-m4u4mme60a6a0qj3p5m5jvea8d2987o9.apps.googleusercontent.com";
@@ -606,38 +655,39 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
             return;
         }
 
-        // Fetch last 15 emails
-        let start_idx = if total > 15 { total - 15 } else { 0 };
+        // Fetch the newest FETCH_COUNT messages in full. PEEK keeps the server's
+        // \Seen flags untouched; FLAGS rides along so read-state comes from the
+        // server instead of being hardcoded.
+        let start_idx = total.saturating_sub(FETCH_COUNT);
         let range = &search_results[start_idx..total];
         let query_seq = range.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        let _ = sender.send(AppMessage::Status(format!("Fetching {} messages...", range.len())));
 
         let mut fetched_emails = Vec::new();
-        match session.fetch(&query_seq, "(RFC822.HEADER BODY[TEXT])") {
+        match session.fetch(&query_seq, "(FLAGS BODY.PEEK[])") {
             Ok(fetches) => {
+                let parser = mail_parser::MessageParser::default();
                 for fetch in fetches.iter() {
                     let id = fetch.message;
-                    let mut from = "Unknown".to_string();
-                    let mut subject = "(No Subject)".to_string();
-                    let mut date = "Unknown".to_string();
-                    let mut body = String::new();
+                    let read = fetch
+                        .flags()
+                        .iter()
+                        .any(|f| matches!(f, imap::types::Flag::Seen));
 
-                    if let Some(header) = fetch.header() {
-                        let header_str = String::from_utf8_lossy(header);
-                        let mut current_header = String::new();
-                        for line in header_str.lines() {
-                            if line.starts_with(' ') || line.starts_with('\t') {
-                                current_header.push_str(line.trim());
-                            } else {
-                                process_header(&current_header, &mut from, &mut subject, &mut date);
-                                current_header = line.trim().to_string();
-                            }
-                        }
-                        process_header(&current_header, &mut from, &mut subject, &mut date);
-                    }
-
-                    if let Some(text) = fetch.body() {
-                        body = clean_body(&String::from_utf8_lossy(text));
-                    }
+                    let (from, subject, date, body) = match fetch.body().and_then(|raw| parser.parse(raw)) {
+                        Some(msg) => (
+                            format_from(&msg),
+                            msg.subject().unwrap_or("(No Subject)").to_string(),
+                            format_date(msg.date()),
+                            extract_body(&msg),
+                        ),
+                        None => (
+                            "Unknown".to_string(),
+                            "(No Subject)".to_string(),
+                            "Unknown".to_string(),
+                            String::new(),
+                        ),
+                    };
 
                     fetched_emails.push(Email {
                         id: id as usize,
@@ -646,7 +696,7 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
                         subject,
                         body,
                         date,
-                        read: true,
+                        read,
                         folder: "inbox".to_string(),
                     });
                 }
@@ -1439,18 +1489,32 @@ impl Application for ClearEmailApp {
             AppMessage::EmailsSynced(email, list) => {
                 // Determine if we should update memory state (only if active account is still this one)
                 if let Some(acc) = self.accounts.get(self.selected_account_idx) {
+                    // The app never STOREs \Seen back, so a message read locally
+                    // would flip unread again on every sync — read-in-app wins
+                    // over the server flag (server-seen still wins over unseen).
+                    let keep_local_read = |prior: &[Email], fetched: Vec<Email>| -> Vec<Email> {
+                        fetched
+                            .into_iter()
+                            .map(|mut e| {
+                                if prior.iter().any(|p| p.id == e.id && p.folder == "inbox" && p.read) {
+                                    e.read = true;
+                                }
+                                e
+                            })
+                            .collect()
+                    };
                     if acc.email == email {
+                        let mut merged = keep_local_read(&self.emails, list.clone());
                         let mut local_other = self.emails.clone();
                         local_other.retain(|e| e.folder != "inbox");
-                        let mut merged = list.clone();
                         merged.extend(local_other);
                         self.emails = merged;
                         save_emails_for_account(&email, &self.emails);
                     } else {
                         // Just write cache to disk
                         let mut acc_emails = load_emails_for_account(&email);
+                        let mut merged = keep_local_read(&acc_emails, list.clone());
                         acc_emails.retain(|e| e.folder != "inbox");
-                        let mut merged = list.clone();
                         merged.extend(acc_emails);
                         save_emails_for_account(&email, &merged);
                     }
@@ -2460,4 +2524,90 @@ fn main() {
     let _guard = rt.enter();
 
     cce_ui::engine::run::<ClearEmailApp>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(raw: &str) -> mail_parser::Message<'_> {
+        mail_parser::MessageParser::default()
+            .parse(raw.as_bytes())
+            .expect("fixture parses")
+    }
+
+    #[test]
+    fn rfc2047_headers_decode() {
+        // Subject and From display-name as UTF-8 B encoded-words.
+        let raw = "From: =?UTF-8?B?SsO8cmdlbiBNw7xsbGVy?= <juergen@example.de>\r\n\
+                   To: me@example.org\r\n\
+                   Subject: =?UTF-8?B?UsOpdW5pb24gZ8OpbsOpcmFsZSDigJQgw4RuZGVydW5nZW4=?=\r\n\
+                   Date: Wed, 23 Jul 2026 10:50:12 +0200\r\n\
+                   \r\n\
+                   plain body\r\n";
+        let msg = parse(raw);
+        assert_eq!(msg.subject(), Some("Réunion générale — Änderungen"));
+        assert_eq!(format_from(&msg), "Jürgen Müller <juergen@example.de>");
+        assert_eq!(format_date(msg.date()), "Jul 23 10:50");
+    }
+
+    #[test]
+    fn multipart_prefers_decoded_text_part() {
+        // multipart/alternative: quoted-printable text + base64 HTML; the text
+        // part must win and arrive transfer-decoded with its charset applied.
+        let raw = "From: a@b.c\r\n\
+                   Subject: mp\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/alternative; boundary=\"XX\"\r\n\
+                   \r\n\
+                   --XX\r\n\
+                   Content-Type: text/plain; charset=utf-8\r\n\
+                   Content-Transfer-Encoding: quoted-printable\r\n\
+                   \r\n\
+                   Gr=C3=BC=C3=9Fe aus M=C3=BCnchen!\r\n\
+                   Caf=C3=A9 =E2=80=94 na=C3=AFve r=C3=A9sum=C3=A9.\r\n\
+                   --XX\r\n\
+                   Content-Type: text/html; charset=utf-8\r\n\
+                   Content-Transfer-Encoding: base64\r\n\
+                   \r\n\
+                   PGh0bWw+PGJvZHk+PHA+SMOpbGxvIDxiPndvcmxkPC9iPiAmYW1wOyBmcmllbmRzPC9wPjxwPlp3w6lpdGUgWmVpbGU8L3A+PC9ib2R5PjwvaHRtbD4=\r\n\
+                   --XX--\r\n";
+        let body = extract_body(&parse(raw));
+        assert!(body.contains("Grüße aus München!"), "qp not decoded: {body:?}");
+        assert!(body.contains("Café — naïve résumé."));
+        assert!(!body.contains("<b>"), "html part leaked: {body:?}");
+    }
+
+    #[test]
+    fn html_only_message_converts_to_text() {
+        let raw = "From: a@b.c\r\n\
+                   Subject: html\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: text/html; charset=utf-8\r\n\
+                   Content-Transfer-Encoding: base64\r\n\
+                   \r\n\
+                   PGh0bWw+PGJvZHk+PHA+SMOpbGxvIDxiPndvcmxkPC9iPiAmYW1wOyBmcmllbmRzPC9wPjxwPlp3w6lpdGUgWmVpbGU8L3A+PC9ib2R5PjwvaHRtbD4=\r\n";
+        let body = extract_body(&parse(raw));
+        assert!(body.contains("Héllo"), "not decoded: {body:?}");
+        assert!(body.contains("world & friends"), "entities/tags mishandled: {body:?}");
+        assert!(!body.contains('<'), "tags leaked: {body:?}");
+    }
+
+    #[test]
+    fn extract_body_caps_at_1200_chars() {
+        let long = "é".repeat(1500);
+        let raw = format!(
+            "From: a@b.c\r\nSubject: long\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{long}"
+        );
+        let body = extract_body(&parse(&raw));
+        assert_eq!(body.chars().count(), 1203); // 1200 + "..."
+        assert!(body.ends_with("..."));
+    }
+
+    #[test]
+    fn missing_headers_fall_back() {
+        let msg = parse("X-Nothing: here\r\n\r\nbody\r\n");
+        assert_eq!(format_from(&msg), "Unknown");
+        assert_eq!(format_date(msg.date()), "Unknown");
+    }
 }
