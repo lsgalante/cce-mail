@@ -5,7 +5,7 @@ use glyphon::FontSystem;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, WidgetHost,
-    TextBox, Button, TextLabel, Key, Paginator, PageSelector, MenuController, MenuBar
+    TextBox, Button, TextLabel, Key, MenuController, MenuBar
 };
 use cce_ui::context::UiContext;
 use native_tls::TlsConnector;
@@ -106,7 +106,7 @@ struct ClearEmailApp {
     // Navigation / Sidebar
     btn_compose: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     menubar: cce_ui::widget::Adapted<MenuBar>,
-    paginator: cce_ui::widget::Adapted<Paginator>,
+    btn_accounts: cce_ui::widget::Adapted<cce_ui::widget::Button>,
 
     // Search and List View
     search_box: cce_ui::widget::Adapted<TextBox>,
@@ -1190,6 +1190,8 @@ impl ClearEmailApp {
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.menubar.id(), self.menubar.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_accounts.id(), self.btn_accounts.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_compose_send.id(), self.btn_compose_send.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_compose_cancel.id(), self.btn_compose_cancel.as_ptr_mut());
@@ -1290,29 +1292,12 @@ impl ClearEmailApp {
         let w_f32 = self.width as f32;
         let h_f32 = self.height as f32;
 
-        let sidebar_w = self.paginator.sidebar_w();
-        let list_x = sidebar_w + 10.0;
+        let list_x = 10.0;
         let detail_x = list_x + 325.0;
         let separator_x = list_x + 310.0;
-        let tab_w = 46.0;
-        let margin_x = (sidebar_w - tab_w) / 2.0;
 
-        // Sidebar button/tab text now rides along with their chrome in display_list's
-        // paint_root_into walk — only app-composed labels are emitted here.
-
-        // Sidebar Folder Badges
-        let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
-        if inbox_unread > 0 {
-            let badge_text = inbox_unread.to_string();
-            let est_w = TextLabel::estimate_width(&badge_text, 10.0);
-            labels.push(TextLabel {
-                text: badge_text,
-                x: margin_x + (tab_w - est_w) / 2.0,
-                y: 114.0 + MENUBAR_H, // centers in the badge pill (by + 20 + ~2)
-                font_size: 10.0,
-                color: [0xff, 0xff, 0xff],
-            });
-        }
+        // Widget text rides along with chrome in display_list's paint_root_into
+        // walk — only app-composed labels are emitted here.
 
         // 3. Email List Labels / Accounts list labels.
         // Skipped while a modal is up: text always renders above geometry, and these
@@ -1538,17 +1523,17 @@ impl Application for ClearEmailApp {
         cce_ui::scale::set_scale_factor(1.0);
         let btn_compose = Button::new(10.0, 15.0, 26.0, 26.0).with_label("+");
 
+        // Folder selection is the bar's right-aligned title dropdown (the
+        // designer's pane-switcher idiom); Accounts is a plain button beside it.
         let menubar = MenuBar::new(0.0, 0.0, 800.0, MENUBAR_H)
             .with_recess(true)
+            .with_title("Inbox")
+            .with_right_aligned_title(true)
             .with_item("Mail", &["New Message", "Sync Now", "Quit"])
             .with_item("Message", &["Reply", "Delete", "Mark Read/Unread"])
-            .with_item("View", &["Inbox", "Sent", "Trash", "Accounts"]);
-        let paginator = Paginator::new(vec![
-            "Inbox".to_string(),
-            "Sent".to_string(),
-            "Trash".to_string(),
-            "Accounts".to_string(),
-        ]);
+            .with_context_options(vec!["Inbox".to_string(), "Sent".to_string(), "Trash".to_string()], 0);
+
+        let btn_accounts = Button::new(0.0, 5.0, 90.0, 26.0).with_label("Accounts");
 
         let mut search_box = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
         search_box.font_size = 11.0;
@@ -1604,7 +1589,7 @@ impl Application for ClearEmailApp {
             keys: EmailKeys::load(),
             btn_compose,
             menubar,
-            paginator,
+            btn_accounts,
             search_box,
             email_list,
             email_buttons: Vec::new(),
@@ -1953,10 +1938,6 @@ impl Application for ClearEmailApp {
                 self.needs_rebuild = true;
             }
         }
-        if self.paginator.tick(dt, &mut self.ui_context) {
-            *needs_rebuild = true;
-            self.needs_rebuild = true;
-        }
     }
 
     fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<cce_ui::scene::paint::DisplayList> {
@@ -1985,13 +1966,10 @@ impl Application for ClearEmailApp {
             Folder::Accounts => "accounts",
         };
 
-        let sidebar_w = self.paginator.sidebar_w();
-        let list_x = sidebar_w + 10.0;
+        let list_x = 10.0;
         let detail_x = list_x + 325.0;
         let separator_x = list_x + 310.0;
         let detail_panel_x = separator_x + 1.0;
-        let tab_w = 46.0;
-        let margin_x = (sidebar_w - tab_w) / 2.0;
 
         if self.needs_rebuild || size_changed {
             // Sidebar buttons layout
@@ -2003,26 +1981,37 @@ impl Application for ClearEmailApp {
             if self.menubar.popover_rect().is_some() {
                 self.ui_context.register_popover(&mut self.menubar);
             }
-            self.btn_compose.set_rect((sidebar_w - 26.0) / 2.0, 15.0 + MENUBAR_H, 26.0, 26.0);
-
-            // Set paginator layout — tabs start below the compose button (the two used
-            // to stack at y=0 and the "+" sat buried under the Inbox tab).
-            cce_ui::scale::set_scale_factor(scale as f32);
-            self.paginator.set_rect(0.0, 60.0 + MENUBAR_H, sidebar_w, h_f32 - 60.0 - MENUBAR_H);
-            let folder_idx = match self.current_folder {
-                Folder::Inbox => 0,
-                Folder::Sent => 1,
-                Folder::Trash => 2,
-                Folder::Accounts => 3,
+            // Bar title = current folder (the context-dropdown trigger), with
+            // the inbox unread count folded in where the sidebar badge lived.
+            let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
+            self.menubar.title = match self.current_folder {
+                Folder::Inbox if inbox_unread > 0 => format!("Inbox ({})", inbox_unread),
+                Folder::Inbox => "Inbox".to_string(),
+                Folder::Sent => "Sent".to_string(),
+                Folder::Trash => "Trash".to_string(),
+                Folder::Accounts => "Accounts".to_string(),
             };
-            self.paginator.set_selected_page(folder_idx);
+            if let Some(ci) = match self.current_folder {
+                Folder::Inbox => Some(0),
+                Folder::Sent => Some(1),
+                Folder::Trash => Some(2),
+                Folder::Accounts => None,
+            } {
+                self.menubar.set_context_selected(ci);
+            }
+            // Fixed offset from the right edge — anchoring to the title would
+            // make the button drift as the folder name changes length.
+            self.btn_accounts.set_rect(w_f32 - 250.0, 5.0, 90.0, 26.0);
+
+            cce_ui::scale::set_scale_factor(scale as f32);
+            self.btn_compose.set_rect(list_x, 15.0 + MENUBAR_H, 26.0, 26.0);
 
             // Search box / Add Account and Scrolling list
             let list_count = if self.current_folder == Folder::Accounts {
-                self.btn_manage_accounts.set_rect(list_x, 15.0 + MENUBAR_H, 300.0, 26.0);
+                self.btn_manage_accounts.set_rect(list_x + 36.0, 15.0 + MENUBAR_H, 264.0, 26.0);
                 self.accounts.len()
             } else {
-                self.search_box.set_rect(list_x, 15.0 + MENUBAR_H, 300.0, 26.0);
+                self.search_box.set_rect(list_x + 36.0, 15.0 + MENUBAR_H, 264.0, 26.0);
                 
                 // Get filtered emails count for bounds setup
                 self.emails.iter()
@@ -2160,25 +2149,13 @@ impl Application for ClearEmailApp {
         // 1. General window background (deep slate blue)
         quads.push((0.0, 0.0, w_f32, h_f32, [0.05, 0.05, 0.07, 1.0]));
 
-        // 2. Sidebar background panel
-        quads.push((0.0, 0.0, sidebar_w, h_f32, [0.08, 0.08, 0.12, 1.0]));
-        quads.push((sidebar_w, 0.0, 1.0, h_f32, [0.18, 0.18, 0.22, 1.0])); // sidebar separator
-
         // Compose Button and Folders Graphics — full paint walk: chrome (rounded rects,
         // hover/selected states) AND text in one pass. The legacy extra_quads bridge only
         // forwarded plain Prim::Quads, so every widget's rounded chrome was dropped.
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose, &mut *quads.pc);
-        // Menubar painted after the other roots below cannot work — its dropdown
-        // must overlay them, so it is painted at the END of display_list instead.
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.paginator, &mut *quads.pc);
-
-        // Draw badge pill for inbox unread (centered on vertical rotated tab)
-        let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
-        if inbox_unread > 0 {
-            let bx = margin_x;
-            let by = 92.0 + MENUBAR_H; // lower edge of the Inbox tab (tabs start 60 below the menubar)
-            quads.push((bx + (tab_w - 22.0) / 2.0, by + 20.0, 22.0, 16.0, [0.20, 0.45, 0.85, 0.8]));
-        }
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_accounts, &mut *quads.pc);
+        // The menubar itself paints at the END of display_list — its dropdown
+        // must overlay every pane beneath.
 
         // 3. Email List Panel Separator
         quads.push((separator_x, MENUBAR_H, 1.0, h_f32 - MENUBAR_H, [0.18, 0.18, 0.22, 1.0]));
@@ -2227,15 +2204,15 @@ impl Application for ClearEmailApp {
         if self.current_folder == Folder::Accounts {
             if self.selected_account_idx < self.accounts.len() {
                 // Top action toolbar background
-                quads.push((detail_panel_x, 0.0, w_f32 - detail_panel_x, 42.0, [0.08, 0.08, 0.12, 1.0]));
-                quads.push((detail_panel_x, 42.0, w_f32 - detail_panel_x, 1.0, [0.18, 0.18, 0.22, 1.0]));
+                quads.push((detail_panel_x, MENUBAR_H, w_f32 - detail_panel_x, 42.0, [0.08, 0.08, 0.12, 1.0]));
+                quads.push((detail_panel_x, MENUBAR_H + 42.0, w_f32 - detail_panel_x, 1.0, [0.18, 0.18, 0.22, 1.0]));
 
             }
         } else if let Some(selected_id) = self.selected_email_id {
             if self.emails.iter().any(|e| e.id == selected_id) {
                 // Top action toolbar background
-                quads.push((detail_panel_x, 0.0, w_f32 - detail_panel_x, 42.0, [0.08, 0.08, 0.12, 1.0]));
-                quads.push((detail_panel_x, 42.0, w_f32 - detail_panel_x, 1.0, [0.18, 0.18, 0.22, 1.0]));
+                quads.push((detail_panel_x, MENUBAR_H, w_f32 - detail_panel_x, 42.0, [0.08, 0.08, 0.12, 1.0]));
+                quads.push((detail_panel_x, MENUBAR_H + 42.0, w_f32 - detail_panel_x, 1.0, [0.18, 0.18, 0.22, 1.0]));
 
                 cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_reply, &mut *quads.pc);
                 cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_delete, &mut *quads.pc);
@@ -2391,12 +2368,7 @@ impl Application for ClearEmailApp {
         } else {
             // Sidebar buttons
             if ctx.propagate_event(&mv, self.btn_compose.id()) { changed = true; }
-            let sidebar_w = self.paginator.sidebar_w();
-            if px < sidebar_w {
-                // Self-routing composite: handle_event, not propagate — the router's
-                // children-first descent would let the embedded strip consume this.
-                if self.paginator.handle_event(&mv, ctx) { changed = true; }
-            }
+            if ctx.propagate_event(&mv, self.btn_accounts.id()) { changed = true; }
 
             // Search / Add account and lists
             if self.current_folder == Folder::Accounts {
@@ -2406,7 +2378,7 @@ impl Application for ClearEmailApp {
             }
             if self.email_list.cursor_moved(px, py) { changed = true; }
             // Hover scope for the detail-pane body scroll (wheel + keys).
-            self.detail_hovered = px > self.paginator.sidebar_w() + 10.0 + 310.0;
+            self.detail_hovered = px > 10.0 + 310.0;
 
             for btn in &mut self.email_buttons {
                 if btn.rect().0 > -9000.0 {
@@ -2461,10 +2433,30 @@ impl Application for ClearEmailApp {
 
         let ctx = &mut self.ui_context;
 
-        // Menubar first — an open dropdown overlays the panes, so a handled
+        // Accounts button first: it sits inside the bar band, and the menubar
+        // consumes any press within its rect — routed after, it would never
+        // see the click.
+        if ctx.propagate_event(&ev, self.btn_accounts.id()) {
+            if state == ElementState::Released && self.btn_accounts.take_click() {
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+                return Some(AppMessage::SwitchFolder(Folder::Accounts));
+            }
+            *needs_rebuild = true;
+            self.needs_rebuild = true;
+            return None;
+        }
+
+        // Menubar next — an open dropdown overlays the panes, so a handled
         // press/release must not fall through to the content beneath it.
         if ctx.propagate_event(&ev, self.menubar.id()) {
-            if let Some((menu_idx, item_idx)) = self.menubar.menu_click() {
+            if let Some(idx) = self.menubar.take_context_change() {
+                msg_out = Some(AppMessage::SwitchFolder(match idx {
+                    0 => Folder::Inbox,
+                    1 => Folder::Sent,
+                    _ => Folder::Trash,
+                }));
+            } else if let Some((menu_idx, item_idx)) = self.menubar.menu_click() {
                 msg_out = match (menu_idx, item_idx) {
                     (0, 0) => Some(AppMessage::ComposeNew),
                     (0, 1) => Some(AppMessage::SyncNow),
@@ -2472,10 +2464,6 @@ impl Application for ClearEmailApp {
                     (1, 0) => Some(AppMessage::Reply),
                     (1, 1) => Some(AppMessage::DeleteSelected),
                     (1, 2) => Some(AppMessage::ToggleUnread),
-                    (2, 0) => Some(AppMessage::SwitchFolder(Folder::Inbox)),
-                    (2, 1) => Some(AppMessage::SwitchFolder(Folder::Sent)),
-                    (2, 2) => Some(AppMessage::SwitchFolder(Folder::Trash)),
-                    (2, 3) => Some(AppMessage::SwitchFolder(Folder::Accounts)),
                     _ => None,
                 };
             }
@@ -2532,22 +2520,6 @@ impl Application for ClearEmailApp {
                 changed = true;
                 if state == ElementState::Released && self.btn_compose.take_click() {
                     msg_out = Some(AppMessage::ComposeNew);
-                }
-            }
-            let sidebar_w = self.paginator.sidebar_w();
-            if px < sidebar_w {
-                if self.paginator.handle_event(&ev, ctx) {
-                    changed = true;
-                    if let Some((page, _)) = self.paginator.menu_click() {
-                        let folder = match page {
-                            0 => Folder::Inbox,
-                            1 => Folder::Sent,
-                            2 => Folder::Trash,
-                            3 => Folder::Accounts,
-                            _ => Folder::Inbox,
-                        };
-                        msg_out = Some(AppMessage::SwitchFolder(folder));
-                    }
                 }
             }
 
@@ -2687,7 +2659,7 @@ impl Application for ClearEmailApp {
             && self.current_folder != Folder::Accounts
             && self.selected_email_id.is_some()
         {
-            let separator_x = self.paginator.sidebar_w() + 10.0 + 310.0;
+            let separator_x = 10.0 + 310.0;
             if px > separator_x {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
