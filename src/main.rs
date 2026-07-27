@@ -51,6 +51,11 @@ struct Email {
     date: String,
     read: bool,
     folder: String, // "inbox", "sent", "trash"
+    /// Server-side IMAP UID (INBOX message); None for mock or locally-created
+    /// mail. Server operations (delete) key on this, never on `id` — `id` is
+    /// the fetch-time sequence number, which shifts after any expunge.
+    #[serde(default)]
+    uid: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -575,82 +580,97 @@ fn block_on_worker<F: std::future::Future>(fut: F) -> Result<F::Output, String> 
         .map(|rt| rt.block_on(fut))
 }
 
+/// True for the built-in demo account — workers skip the network entirely.
+fn is_mock_account(account: &AccountInfo) -> bool {
+    account.password == "mock_password" || account.email == "lsgalante@cce-ui.org"
+}
+
+/// Connect + authenticate an IMAP session; shared by the sync and
+/// server-delete workers (call from a worker thread — it blocks). Refreshed
+/// OAuth tokens are reported back via UpdateAccountTokens; every failure
+/// surfaces as a Status toast and yields None.
+fn open_imap_session(
+    account: &mut AccountInfo,
+    sender: &calloop::channel::Sender<AppMessage>,
+) -> Option<imap::Session<native_tls::TlsStream<std::net::TcpStream>>> {
+    let mut access_token = account.password.clone();
+    if account.is_oauth {
+        let mut acc = account.clone();
+        match block_on_worker(refresh_access_token(&mut acc)).and_then(|r| r) {
+            Ok(token) => {
+                access_token = token;
+                // Send refreshed tokens back to main thread to save them
+                let _ = sender.send(AppMessage::UpdateAccountTokens(
+                    acc.email.clone(),
+                    acc.access_token.clone(),
+                    acc.token_expiry,
+                ));
+                account.access_token = acc.access_token;
+                account.token_expiry = acc.token_expiry;
+            }
+            Err(e) => {
+                let _ = sender.send(AppMessage::Status(format!("OAuth Refresh Failed: {}", e)));
+                return None;
+            }
+        }
+    }
+
+    let domain = account.imap.split(':').next()?;
+    let port = account
+        .imap
+        .split(':')
+        .nth(1)
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(993);
+
+    let _ = sender.send(AppMessage::Status(format!("Connecting to {}...", account.imap)));
+
+    let tls = match TlsConnector::new() {
+        Ok(t) => t,
+        Err(_) => {
+            let _ = sender.send(AppMessage::Status("Failed to create TLS connector".to_string()));
+            return None;
+        }
+    };
+
+    let client = match imap::connect((domain, port), domain, &tls) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = sender.send(AppMessage::Status(format!("IMAP Connection failed: {}", e)));
+            return None;
+        }
+    };
+
+    if account.is_oauth {
+        let auth = ImapOAuth2 {
+            user: account.email.clone(),
+            access_token,
+        };
+        match client.authenticate("XOAUTH2", &auth) {
+            Ok(s) => Some(s),
+            Err((e, _)) => {
+                let _ = sender.send(AppMessage::Status(format!("IMAP OAuth Login failed: {}", e)));
+                None
+            }
+        }
+    } else {
+        match client.login(&account.email, &account.password) {
+            Ok(s) => Some(s),
+            Err((e, _)) => {
+                let _ = sender.send(AppMessage::Status(format!("IMAP Login failed: {}", e)));
+                None
+            }
+        }
+    }
+}
+
 fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessage>) {
     std::thread::spawn(move || {
-        // Skip connecting for mock credentials
-        if account.password == "mock_password" || account.email == "lsgalante@cce-ui.org" {
+        if is_mock_account(&account) {
             return;
         }
-
-        let mut access_token = account.password.clone();
-        if account.is_oauth {
-            let mut acc = account.clone();
-            match block_on_worker(refresh_access_token(&mut acc)).and_then(|r| r) {
-                Ok(token) => {
-                    access_token = token;
-                    // Send refreshed tokens back to main thread to save them
-                    let _ = sender.send(AppMessage::UpdateAccountTokens(
-                        acc.email.clone(),
-                        acc.access_token.clone(),
-                        acc.token_expiry,
-                    ));
-                    account.access_token = acc.access_token;
-                    account.token_expiry = acc.token_expiry;
-                }
-                Err(e) => {
-                    let _ = sender.send(AppMessage::Status(format!("OAuth Refresh Failed: {}", e)));
-                    return;
-                }
-            }
-        }
-
-        let domain = match account.imap.split(':').next() {
-            Some(d) => d,
-            None => return,
-        };
-        let port = match account.imap.split(':').nth(1).and_then(|p| p.parse::<u16>().ok()) {
-            Some(p) => p,
-            None => 993,
-        };
-
-        let _ = sender.send(AppMessage::Status(format!("Connecting to {}...", account.imap)));
-        
-        let tls = match TlsConnector::new() {
-            Ok(t) => t,
-            Err(_) => {
-                let _ = sender.send(AppMessage::Status("Failed to create TLS connector".to_string()));
-                return;
-            }
-        };
-
-        let client = match imap::connect((domain, port), domain, &tls) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = sender.send(AppMessage::Status(format!("IMAP Connection failed: {}", e)));
-                return;
-            }
-        };
-
-        let mut session = if account.is_oauth {
-            let auth = ImapOAuth2 {
-                user: account.email.clone(),
-                access_token: access_token.clone(),
-            };
-            match client.authenticate("XOAUTH2", &auth) {
-                Ok(s) => s,
-                Err((e, _)) => {
-                    let _ = sender.send(AppMessage::Status(format!("IMAP OAuth Login failed: {}", e)));
-                    return;
-                }
-            }
-        } else {
-            match client.login(&account.email, &account.password) {
-                Ok(s) => s,
-                Err((e, _)) => {
-                    let _ = sender.send(AppMessage::Status(format!("IMAP Login failed: {}", e)));
-                    return;
-                }
-            }
+        let Some(mut session) = open_imap_session(&mut account, &sender) else {
+            return;
         };
 
         let _ = sender.send(AppMessage::Status("Syncing Inbox...".to_string()));
@@ -688,6 +708,7 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
 
         struct Pending {
             seq: u32,
+            uid: Option<u32>,
             read: bool,
             from: String,
             subject: String,
@@ -697,7 +718,7 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
         }
         let parser = mail_parser::MessageParser::default();
         let mut pending: Vec<Pending> = Vec::new();
-        match session.fetch(&query_seq, "(FLAGS RFC822.HEADER BODYSTRUCTURE)") {
+        match session.fetch(&query_seq, "(UID FLAGS RFC822.HEADER BODYSTRUCTURE)") {
             Ok(fetches) => {
                 for fetch in fetches.iter() {
                     let read = fetch
@@ -718,6 +739,7 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
                     };
                     pending.push(Pending {
                         seq: fetch.message,
+                        uid: fetch.uid,
                         read,
                         from,
                         subject,
@@ -793,6 +815,7 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
             .into_iter()
             .map(|p| Email {
                 id: p.seq as usize,
+                uid: p.uid,
                 from: p.from,
                 to: account.email.clone(),
                 subject: p.subject,
@@ -807,6 +830,44 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
 
         let _ = sender.send(AppMessage::EmailsSynced(account.email.clone(), fetched_emails));
         let _ = sender.send(AppMessage::Status("Sync Complete".to_string()));
+        let _ = session.logout();
+    });
+}
+
+/// Delete an INBOX message on the server, by UID. Best-effort trash-copy
+/// first: on Gmail a copy to [Gmail]/Trash removes the message everywhere,
+/// on generic servers a "Trash" copy keeps the conventional safety net; the
+/// STORE+expunge below is what actually removes it from INBOX either way.
+/// UIDPLUS uid_expunge targets just our message; plain EXPUNGE fallback also
+/// flushes any other \Deleted-flagged mail, which matches client convention.
+fn delete_on_server(mut account: AccountInfo, uid: u32, sender: calloop::channel::Sender<AppMessage>) {
+    std::thread::spawn(move || {
+        if is_mock_account(&account) {
+            return;
+        }
+        let Some(mut session) = open_imap_session(&mut account, &sender) else {
+            return;
+        };
+        if let Err(e) = session.select("INBOX") {
+            let _ = sender.send(AppMessage::Status(format!("Failed to select INBOX: {}", e)));
+            let _ = session.logout();
+            return;
+        }
+        let uid_set = uid.to_string();
+        for trash in ["[Gmail]/Trash", "Trash"] {
+            if session.uid_copy(&uid_set, trash).is_ok() {
+                break;
+            }
+        }
+        if let Err(e) = session.uid_store(&uid_set, "+FLAGS (\\Deleted)") {
+            let _ = sender.send(AppMessage::Status(format!("Server delete failed: {}", e)));
+            let _ = session.logout();
+            return;
+        }
+        if session.uid_expunge(&uid_set).is_err() {
+            let _ = session.expunge();
+        }
+        let _ = sender.send(AppMessage::Status("Deleted on server".to_string()));
         let _ = session.logout();
     });
 }
@@ -913,6 +974,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             date: "12:15 PM".to_string(),
             read: false,
             folder: "inbox".to_string(),
+            uid: None,
         },
         Email {
             id: 2,
@@ -923,6 +985,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             date: "Yesterday".to_string(),
             read: false,
             folder: "inbox".to_string(),
+            uid: None,
         },
         Email {
             id: 3,
@@ -933,6 +996,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             date: "June 3".to_string(),
             read: true,
             folder: "inbox".to_string(),
+            uid: None,
         },
         Email {
             id: 4,
@@ -943,6 +1007,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             date: "Yesterday".to_string(),
             read: true,
             folder: "sent".to_string(),
+            uid: None,
         },
     ]
 }
@@ -1515,6 +1580,7 @@ impl Application for ClearEmailApp {
                         date: "Just now".to_string(),
                         read: true,
                         folder: "sent".to_string(),
+                        uid: None,
                     };
                     self.emails.push(new_email);
                     self.save_emails();
@@ -1551,11 +1617,20 @@ impl Application for ClearEmailApp {
             AppMessage::DeleteSelected => {
                 if let Some(id) = self.selected_email_id {
                     let mut permanently_deleted = false;
+                    let mut server_uid = None;
                     if let Some(email) = self.emails.iter_mut().find(|e| e.id == id) {
                         if email.folder == "trash" {
                             permanently_deleted = true;
                         } else {
+                            if email.folder == "inbox" {
+                                server_uid = email.uid;
+                            }
                             email.folder = "trash".to_string();
+                        }
+                    }
+                    if let Some(uid) = server_uid {
+                        if let Some(acc) = self.accounts.get(self.selected_account_idx) {
+                            delete_on_server(acc.clone(), uid, self.sender.clone());
                         }
                     }
                     if permanently_deleted {
