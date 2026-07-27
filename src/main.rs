@@ -133,6 +133,7 @@ struct ClearEmailApp {
     body_sb_dragging: bool,
     body_sb_drag_offset: f32,
     compose_open: bool,
+    compose_title: String,
     status_message: Option<(String, f32)>, // (message, timer)
     sender: calloop::channel::Sender<AppMessage>,
 
@@ -1223,7 +1224,7 @@ impl ClearEmailApp {
             let modal_y = ((h_f32 - 420.0) / 2.0).max(0.0);
 
             labels.push(TextLabel {
-                text: "New Message".to_string(),
+                text: self.compose_title.clone(),
                 x: modal_x + 15.0,
                 y: modal_y + 16.0,
                 font_size: 13.0,
@@ -1297,7 +1298,7 @@ impl Application for ClearEmailApp {
         compose_to.font_size = 12.0;
         let mut compose_subject = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
         compose_subject.font_size = 12.0;
-        let mut compose_body = TextBox::new(String::new()).with_multiline(true).with_draw_bg_border(true);
+        let mut compose_body = TextBox::new(String::new()).with_multiline(true).with_line_wrap(true).with_draw_bg_border(true);
         compose_body.font_size = 12.0;
         compose_body.font_family = "sans-serif".to_string();
 
@@ -1343,6 +1344,7 @@ impl Application for ClearEmailApp {
             body_sb_dragging: false,
             body_sb_drag_offset: 0.0,
             compose_open: false,
+            compose_title: String::new(),
             status_message: None,
             sender: _sender.clone(),
             width: 1000,
@@ -1428,6 +1430,7 @@ impl Application for ClearEmailApp {
                 self.compose_subject.edit_buffer = String::new();
                 self.compose_body.text = String::new();
                 self.compose_body.edit_buffer = String::new();
+                self.compose_title = "New Message".to_string();
                 self.compose_open = true;
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
@@ -1486,6 +1489,7 @@ impl Application for ClearEmailApp {
                         self.compose_body.text = reply_intro.clone();
                         self.compose_body.edit_buffer = reply_intro;
                         self.compose_body.cursor_idx = 0;
+                        self.compose_title = "Reply".to_string();
                         self.compose_open = true;
                     }
                 }
