@@ -1114,10 +1114,11 @@ impl ClearEmailApp {
                         color: if !email.read { [0xff, 0xff, 0xff] } else { [0xb0, 0xb0, 0xb8] },
                     });
 
-                    // Date
+                    // Date — right-aligned inside the row, clear of the scrollbar strip
+                    let date_w = TextLabel::estimate_width(&email.date, 9.0);
                     labels.push(TextLabel {
                         text: email.date.clone(),
-                        x: list_x + 250.0,
+                        x: list_x + 300.0 - 14.0 - date_w,
                         y: draw_y + 7.0,
                         font_size: 9.0,
                         color: [0x70, 0x70, 0x75],
@@ -1132,8 +1133,10 @@ impl ClearEmailApp {
                         color: if !email.read { [0x3a, 0x9a, 0xff] } else { [0x83, 0x83, 0x8a] },
                     });
 
-                    // Snippet
-                    let snippet_raw = email.body.replace('\n', " ");
+                    // Snippet — collapse ALL whitespace: CRLF bodies leave bare '\r'
+                    // after a plain '\n' replace, and the renderer treats it as a
+                    // line break, bleeding preview lines into the next row.
+                    let snippet_raw = email.body.split_whitespace().collect::<Vec<_>>().join(" ");
                     let snippet = ellipsize(&snippet_raw, 37);
                     labels.push(TextLabel {
                         text: snippet,
