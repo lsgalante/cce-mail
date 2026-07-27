@@ -592,7 +592,15 @@ fn is_mock_account(account: &AccountInfo) -> bool {
 fn open_imap_session(
     account: &mut AccountInfo,
     sender: &calloop::channel::Sender<AppMessage>,
+    verbose: bool,
 ) -> Option<imap::Session<native_tls::TlsStream<std::net::TcpStream>>> {
+    macro_rules! say {
+        ($msg:expr) => {
+            if verbose {
+                let _ = sender.send(AppMessage::Status($msg));
+            }
+        };
+    }
     let mut access_token = account.password.clone();
     if account.is_oauth {
         let mut acc = account.clone();
@@ -609,7 +617,7 @@ fn open_imap_session(
                 account.token_expiry = acc.token_expiry;
             }
             Err(e) => {
-                let _ = sender.send(AppMessage::Status(format!("OAuth Refresh Failed: {}", e)));
+                say!(format!("OAuth Refresh Failed: {}", e));
                 return None;
             }
         }
@@ -623,12 +631,12 @@ fn open_imap_session(
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(993);
 
-    let _ = sender.send(AppMessage::Status(format!("Connecting to {}...", account.imap)));
+    say!(format!("Connecting to {}...", account.imap));
 
     let tls = match TlsConnector::new() {
         Ok(t) => t,
         Err(_) => {
-            let _ = sender.send(AppMessage::Status("Failed to create TLS connector".to_string()));
+            say!("Failed to create TLS connector".to_string());
             return None;
         }
     };
@@ -636,7 +644,7 @@ fn open_imap_session(
     let client = match imap::connect((domain, port), domain, &tls) {
         Ok(c) => c,
         Err(e) => {
-            let _ = sender.send(AppMessage::Status(format!("IMAP Connection failed: {}", e)));
+            say!(format!("IMAP Connection failed: {}", e));
             return None;
         }
     };
@@ -649,7 +657,7 @@ fn open_imap_session(
         match client.authenticate("XOAUTH2", &auth) {
             Ok(s) => Some(s),
             Err((e, _)) => {
-                let _ = sender.send(AppMessage::Status(format!("IMAP OAuth Login failed: {}", e)));
+                say!(format!("IMAP OAuth Login failed: {}", e));
                 None
             }
         }
@@ -657,7 +665,7 @@ fn open_imap_session(
         match client.login(&account.email, &account.password) {
             Ok(s) => Some(s),
             Err((e, _)) => {
-                let _ = sender.send(AppMessage::Status(format!("IMAP Login failed: {}", e)));
+                say!(format!("IMAP Login failed: {}", e));
                 None
             }
         }
@@ -669,7 +677,7 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
         if is_mock_account(&account) {
             return;
         }
-        let Some(mut session) = open_imap_session(&mut account, &sender) else {
+        let Some(mut session) = open_imap_session(&mut account, &sender, true) else {
             return;
         };
 
@@ -845,7 +853,7 @@ fn delete_on_server(mut account: AccountInfo, uid: u32, sender: calloop::channel
         if is_mock_account(&account) {
             return;
         }
-        let Some(mut session) = open_imap_session(&mut account, &sender) else {
+        let Some(mut session) = open_imap_session(&mut account, &sender, true) else {
             return;
         };
         if let Err(e) = session.select("INBOX") {
@@ -868,6 +876,26 @@ fn delete_on_server(mut account: AccountInfo, uid: u32, sender: calloop::channel
             let _ = session.expunge();
         }
         let _ = sender.send(AppMessage::Status("Deleted on server".to_string()));
+        let _ = session.logout();
+    });
+}
+
+/// Push a message's read state to the server (INBOX, by UID). Fully silent:
+/// this fires on every message open, so no Connecting/success toasts, and a
+/// failed push is self-healing — the EmailsSynced merge keeps locally-read
+/// mail read regardless of the server flag until a later push converges.
+fn set_seen_on_server(mut account: AccountInfo, uid: u32, seen: bool, sender: calloop::channel::Sender<AppMessage>) {
+    std::thread::spawn(move || {
+        if is_mock_account(&account) {
+            return;
+        }
+        let Some(mut session) = open_imap_session(&mut account, &sender, false) else {
+            return;
+        };
+        if session.select("INBOX").is_ok() {
+            let query = if seen { "+FLAGS (\\Seen)" } else { "-FLAGS (\\Seen)" };
+            let _ = session.uid_store(uid.to_string(), query);
+        }
         let _ = session.logout();
     });
 }
@@ -1524,10 +1552,19 @@ impl Application for ClearEmailApp {
             AppMessage::SelectEmail(id) => {
                 self.selected_email_id = Some(id);
                 self.body_scroll = 0.0;
+                let mut push_seen_uid = None;
                 if let Some(email) = self.emails.iter_mut().find(|e| e.id == id) {
                     if !email.read {
                         email.read = true;
+                        if email.folder == "inbox" {
+                            push_seen_uid = email.uid;
+                        }
                         self.save_emails();
+                    }
+                }
+                if let Some(uid) = push_seen_uid {
+                    if let Some(acc) = self.accounts.get(self.selected_account_idx) {
+                        set_seen_on_server(acc.clone(), uid, true, self.sender.clone());
                     }
                 }
                 *needs_rebuild = true;
@@ -1648,8 +1685,17 @@ impl Application for ClearEmailApp {
             }
             AppMessage::ToggleUnread => {
                 if let Some(id) = self.selected_email_id {
+                    let mut push = None;
                     if let Some(email) = self.emails.iter_mut().find(|e| e.id == id) {
                         email.read = !email.read;
+                        if email.folder == "inbox" {
+                            push = email.uid.map(|u| (u, email.read));
+                        }
+                    }
+                    if let Some((uid, seen)) = push {
+                        if let Some(acc) = self.accounts.get(self.selected_account_idx) {
+                            set_seen_on_server(acc.clone(), uid, seen, self.sender.clone());
+                        }
                     }
                     self.save_emails();
                 }
@@ -1687,9 +1733,10 @@ impl Application for ClearEmailApp {
             AppMessage::EmailsSynced(email, list) => {
                 // Determine if we should update memory state (only if active account is still this one)
                 if let Some(acc) = self.accounts.get(self.selected_account_idx) {
-                    // The app never STOREs \Seen back, so a message read locally
-                    // would flip unread again on every sync — read-in-app wins
-                    // over the server flag (server-seen still wins over unseen).
+                    // Read state is pushed to the server best-effort (silent
+                    // set_seen_on_server), so read-in-app still wins over the
+                    // server flag here — it covers in-flight or failed pushes
+                    // (server-seen still wins over unseen).
                     let keep_local_read = |prior: &[Email], fetched: Vec<Email>| -> Vec<Email> {
                         fetched
                             .into_iter()
