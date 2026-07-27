@@ -39,6 +39,10 @@ struct AccountInfo {
     client_id: Option<String>,
     #[serde(default)]
     client_secret: Option<String>,
+    /// True when the password came from (or was migrated into) the Secret
+    /// Service keyring — save_accounts blanks it on disk. Never serialized.
+    #[serde(skip)]
+    keyring_backed: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -175,7 +179,12 @@ fn load_accounts() -> Vec<AccountInfo> {
     let path = get_accounts_path();
     if path.exists() {
         if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(accounts) = serde_json::from_str(&content) {
+            if let Ok(mut accounts) = serde_json::from_str::<Vec<AccountInfo>>(&content) {
+                if resolve_account_secrets(&mut accounts) {
+                    // A plaintext password just moved into the keyring —
+                    // rewrite the file now so it stops living on disk.
+                    save_accounts(&accounts);
+                }
                 return accounts;
             }
         }
@@ -193,11 +202,53 @@ fn load_accounts() -> Vec<AccountInfo> {
             token_expiry: None,
             client_id: None,
             client_secret: None,
+            keyring_backed: false,
         },
     ]
 }
 
+/// Resolve account passwords through the Secret Service (KeePassXC here).
+/// An empty on-disk password field is filled from the keyring; a plaintext
+/// one is migrated INTO the keyring (returns true so the caller rewrites the
+/// redacted file). In-memory passwords stay resolved for the IMAP/SMTP
+/// workers. The mock account never touches the keyring. If the keyring is
+/// locked, the provider pops its unlock dialog and this blocks until the
+/// user answers — the standard desktop flow.
+fn resolve_account_secrets(accounts: &mut [AccountInfo]) -> bool {
+    let mut migrated = false;
+    for acc in accounts.iter_mut() {
+        if is_mock_account(acc) {
+            continue;
+        }
+        let Ok(entry) = keyring::Entry::new("cce-email", &acc.email) else {
+            continue;
+        };
+        if acc.password.is_empty() {
+            if let Ok(p) = entry.get_password() {
+                acc.password = p;
+                acc.keyring_backed = true;
+            }
+        } else if entry.set_password(&acc.password).is_ok() {
+            acc.keyring_backed = true;
+            migrated = true;
+        }
+    }
+    migrated
+}
+
 fn save_accounts(accounts: &[AccountInfo]) {
+    // Keyring-backed passwords never go back to disk.
+    let redacted: Vec<AccountInfo> = accounts
+        .iter()
+        .map(|a| {
+            let mut a = a.clone();
+            if a.keyring_backed {
+                a.password = String::new();
+            }
+            a
+        })
+        .collect();
+    let accounts = &redacted;
     let path = get_accounts_path();
     if let Ok(content) = serde_json::to_string_pretty(accounts) {
         let _ = std::fs::write(&path, content);
