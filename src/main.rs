@@ -1049,7 +1049,7 @@ impl ClearEmailApp {
             labels.push(TextLabel {
                 text: badge_text,
                 x: margin_x + (tab_w - est_w) / 2.0,
-                y: 106.0, // centers in the badge pill (by + 12 + ~2)
+                y: 114.0, // centers in the badge pill (by + 20 + ~2)
                 font_size: 10.0,
                 color: [0xff, 0xff, 0xff],
             });
@@ -1268,7 +1268,7 @@ impl Application for ClearEmailApp {
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
         cce_ui::scale::set_scale_factor(1.0);
-        let btn_compose = Button::new(10.0, 15.0, 36.0, 36.0).with_label("+");
+        let btn_compose = Button::new(10.0, 15.0, 26.0, 26.0).with_label("+");
         let paginator = Paginator::new(vec![
             "Inbox".to_string(),
             "Sent".to_string(),
@@ -1653,7 +1653,7 @@ impl Application for ClearEmailApp {
 
         if self.needs_rebuild || size_changed {
             // Sidebar buttons layout
-            self.btn_compose.set_rect((sidebar_w - 36.0) / 2.0, 15.0, 36.0, 36.0);
+            self.btn_compose.set_rect((sidebar_w - 26.0) / 2.0, 15.0, 26.0, 26.0);
 
             // Set paginator layout — tabs start below the compose button (the two used
             // to stack at y=0 and the "+" sat buried under the Inbox tab).
@@ -1761,7 +1761,7 @@ impl Application for ClearEmailApp {
                     self.btn_reply.set_rect(detail_x, 8.0, 70.0, 26.0);
                     self.btn_delete.set_rect(detail_x + 80.0, 8.0, 80.0, 26.0);
                     self.btn_unread.set_rect(detail_x + 170.0, 8.0, 110.0, 26.0);
-                    self.btn_unread.base_mut().label = Some((if read { "Mark Unread" } else { "Mark Read" }).to_string());
+                    self.btn_unread.set_label(if read { "Mark Unread" } else { "Mark Read" });
 
                     let detail_w = (w_f32 - (detail_x + 15.0)).max(100.0);
                     self.detail_body.set_rect(detail_x, 170.0, detail_w, (h_f32 - 190.0).max(100.0));
@@ -1825,7 +1825,7 @@ impl Application for ClearEmailApp {
         if inbox_unread > 0 {
             let bx = margin_x;
             let by = 92.0; // lower edge of the Inbox tab (tabs start at the y=60 paginator offset)
-            quads.push((bx + (tab_w - 22.0) / 2.0, by + 12.0, 22.0, 16.0, [0.20, 0.45, 0.85, 0.8]));
+            quads.push((bx + (tab_w - 22.0) / 2.0, by + 20.0, 22.0, 16.0, [0.20, 0.45, 0.85, 0.8]));
         }
 
         // 3. Email List Panel Separator
