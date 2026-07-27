@@ -386,6 +386,21 @@ fn format_from(msg: &mail_parser::Message) -> String {
     }
 }
 
+/// Display form of the To address; sent-folder rows lead with this. Falls
+/// back to the account's own address (inbox mail is addressed to us anyway).
+fn format_to(msg: &mail_parser::Message, fallback: &str) -> String {
+    if let Some(addr) = msg.to().and_then(|a| a.first()) {
+        match (addr.name(), addr.address()) {
+            (Some(n), Some(a)) => format!("{} <{}>", n, a),
+            (None, Some(a)) => a.to_string(),
+            (Some(n), None) => n.to_string(),
+            (None, None) => fallback.to_string(),
+        }
+    } else {
+        fallback.to_string()
+    }
+}
+
 /// "Jul 23 10:50" from the parsed Date header (raw header strings previously
 /// showed as e.g. "Wed, 23 Jul 2026 10:50:12 +0200 (CEST)").
 fn format_date(dt: Option<&mail_parser::DateTime>) -> String {
@@ -672,6 +687,186 @@ fn open_imap_session(
     }
 }
 
+/// Namespaces sent-folder ids away from inbox sequence numbers (both are
+/// fetch-time seq numbers; ids must stay unique across the merged list).
+const SENT_ID_OFFSET: usize = 1_000_000;
+
+/// Fetch the newest [`FETCH_COUNT`] messages of one mailbox with the two-pass
+/// BODYSTRUCTURE strategy (pass 1 headers/flags/structure, pass 2 text parts
+/// grouped by section, capped full-message fallback). Returns None when the
+/// mailbox can't be selected or a whole-mailbox step fails; per-message body
+/// fetch failures degrade to empty bodies. `verbose` gates the Status toasts
+/// (the sent fetch rides quietly behind the inbox one).
+fn fetch_mailbox(
+    session: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>,
+    sender: &calloop::channel::Sender<AppMessage>,
+    account_email: &str,
+    mailbox: &str,
+    folder_tag: &str,
+    id_offset: usize,
+    verbose: bool,
+) -> Option<Vec<Email>> {
+    macro_rules! say {
+        ($msg:expr) => {
+            if verbose {
+                let _ = sender.send(AppMessage::Status($msg));
+            }
+        };
+    }
+    if let Err(e) = session.select(mailbox) {
+        say!(format!("Failed to select {}: {}", mailbox, e));
+        return None;
+    }
+
+    let mut search_results: Vec<u32> = match session.search("ALL") {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(e) => {
+            say!(format!("IMAP Search failed: {}", e));
+            return None;
+        }
+    };
+    search_results.sort();
+
+    let total = search_results.len();
+    if total == 0 {
+        return Some(Vec::new());
+    }
+
+    // Pass 1: flags + headers + BODYSTRUCTURE — no body bytes yet, so
+    // attachments never ride along. PEEK semantics don't matter here
+    // (headers/structure don't set \Seen), but flags come from the server.
+    let start_idx = total.saturating_sub(FETCH_COUNT);
+    let range = &search_results[start_idx..total];
+    let query_seq = range.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+    say!(format!("Fetching {} messages...", range.len()));
+
+    struct Pending {
+        seq: u32,
+        uid: Option<u32>,
+        read: bool,
+        from: String,
+        to: String,
+        subject: String,
+        date: String,
+        part: Option<TextPartSpec>,
+        body: String,
+    }
+    let parser = mail_parser::MessageParser::default();
+    let mut pending: Vec<Pending> = Vec::new();
+    match session.fetch(&query_seq, "(UID FLAGS RFC822.HEADER BODYSTRUCTURE)") {
+        Ok(fetches) => {
+            for fetch in fetches.iter() {
+                let read = fetch
+                    .flags()
+                    .iter()
+                    .any(|f| matches!(f, imap::types::Flag::Seen));
+                let (from, to, subject, date) = match fetch.header().and_then(|h| parser.parse(h)) {
+                    Some(msg) => (
+                        format_from(&msg),
+                        format_to(&msg, account_email),
+                        msg.subject().unwrap_or("(No Subject)").to_string(),
+                        format_date(msg.date()),
+                    ),
+                    None => (
+                        "Unknown".to_string(),
+                        account_email.to_string(),
+                        "(No Subject)".to_string(),
+                        "Unknown".to_string(),
+                    ),
+                };
+                pending.push(Pending {
+                    seq: fetch.message,
+                    uid: fetch.uid,
+                    read,
+                    from,
+                    to,
+                    subject,
+                    date,
+                    part: fetch.bodystructure().and_then(find_text_part),
+                    body: String::new(),
+                });
+            }
+        }
+        Err(e) => {
+            say!(format!("IMAP Fetch failed: {}", e));
+            return None;
+        }
+    }
+
+    // Pass 2: fetch just the chosen text part, grouped by section path so a
+    // typical mailbox needs only 1-2 more round trips; capped so a giant
+    // text part can't stall the sync either.
+    let mut groups: std::collections::HashMap<Vec<u32>, Vec<u32>> = std::collections::HashMap::new();
+    for p in &pending {
+        if let Some(spec) = &p.part {
+            groups.entry(spec.path.clone()).or_default().push(p.seq);
+        }
+    }
+    for (path, seqs) in groups {
+        let seq_set = seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
+        let section = section_str(&path);
+        let query = format!("BODY.PEEK[{}]<0.{}>", section, PART_FETCH_CAP);
+        let section_path = imap_proto::types::SectionPath::Part(path, None);
+        match session.fetch(&seq_set, &query) {
+            Ok(fetches) => {
+                for fetch in fetches.iter() {
+                    let Some(bytes) = fetch.section(&section_path) else { continue };
+                    if let Some(p) = pending.iter_mut().find(|p| p.seq == fetch.message) {
+                        if let Some(spec) = &p.part {
+                            p.body = parser
+                                .parse(&spec.synthesize(bytes))
+                                .map(|m| extract_body(&m))
+                                .unwrap_or_default();
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                say!(format!("IMAP part fetch failed: {}", e));
+            }
+        }
+    }
+
+    // Fallback: no usable text part in the structure (or the walk failed) —
+    // one capped full-message fetch for those stragglers.
+    let no_part: Vec<u32> = pending.iter().filter(|p| p.part.is_none()).map(|p| p.seq).collect();
+    if !no_part.is_empty() {
+        let seq_set = no_part.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
+        let query = format!("BODY.PEEK[]<0.{}>", PART_FETCH_CAP * 4);
+        match session.fetch(&seq_set, &query) {
+            Ok(fetches) => {
+                for fetch in fetches.iter() {
+                    let Some(raw) = fetch.body() else { continue };
+                    if let Some(p) = pending.iter_mut().find(|p| p.seq == fetch.message) {
+                        p.body = parser.parse(raw).map(|m| extract_body(&m)).unwrap_or_default();
+                    }
+                }
+            }
+            Err(e) => {
+                say!(format!("IMAP fallback fetch failed: {}", e));
+            }
+        }
+    }
+
+    let mut fetched: Vec<Email> = pending
+        .into_iter()
+        .map(|p| Email {
+            id: p.seq as usize + id_offset,
+            uid: p.uid,
+            from: p.from,
+            to: p.to,
+            subject: p.subject,
+            body: p.body,
+            date: p.date,
+            read: p.read,
+            folder: folder_tag.to_string(),
+        })
+        .collect();
+
+    fetched.reverse(); // Newest first
+    Some(fetched)
+}
+
 fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessage>) {
     std::thread::spawn(move || {
         if is_mock_account(&account) {
@@ -683,160 +878,37 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
 
         let _ = sender.send(AppMessage::Status("Syncing Inbox...".to_string()));
 
-        if let Err(e) = session.select("INBOX") {
-            let _ = sender.send(AppMessage::Status(format!("Failed to select INBOX: {}", e)));
+        let Some(mut fetched) = fetch_mailbox(
+            &mut session,
+            &sender,
+            &account.email,
+            "INBOX",
+            "inbox",
+            0,
+            true,
+        ) else {
             let _ = session.logout();
             return;
-        }
-
-        let mut search_results: Vec<u32> = match session.search("ALL") {
-            Ok(ids) => ids.into_iter().collect(),
-            Err(e) => {
-                let _ = sender.send(AppMessage::Status(format!("IMAP Search failed: {}", e)));
-                let _ = session.logout();
-                return;
-            }
         };
-        search_results.sort();
 
-        let total = search_results.len();
-        if total == 0 {
-            let _ = sender.send(AppMessage::Status("Inbox is empty".to_string()));
-            let _ = session.logout();
-            return;
-        }
-
-        // Pass 1: flags + headers + BODYSTRUCTURE — no body bytes yet, so
-        // attachments never ride along. PEEK semantics don't matter here
-        // (headers/structure don't set \Seen), but flags come from the server.
-        let start_idx = total.saturating_sub(FETCH_COUNT);
-        let range = &search_results[start_idx..total];
-        let query_seq = range.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-        let _ = sender.send(AppMessage::Status(format!("Fetching {} messages...", range.len())));
-
-        struct Pending {
-            seq: u32,
-            uid: Option<u32>,
-            read: bool,
-            from: String,
-            subject: String,
-            date: String,
-            part: Option<TextPartSpec>,
-            body: String,
-        }
-        let parser = mail_parser::MessageParser::default();
-        let mut pending: Vec<Pending> = Vec::new();
-        match session.fetch(&query_seq, "(UID FLAGS RFC822.HEADER BODYSTRUCTURE)") {
-            Ok(fetches) => {
-                for fetch in fetches.iter() {
-                    let read = fetch
-                        .flags()
-                        .iter()
-                        .any(|f| matches!(f, imap::types::Flag::Seen));
-                    let (from, subject, date) = match fetch.header().and_then(|h| parser.parse(h)) {
-                        Some(msg) => (
-                            format_from(&msg),
-                            msg.subject().unwrap_or("(No Subject)").to_string(),
-                            format_date(msg.date()),
-                        ),
-                        None => (
-                            "Unknown".to_string(),
-                            "(No Subject)".to_string(),
-                            "Unknown".to_string(),
-                        ),
-                    };
-                    pending.push(Pending {
-                        seq: fetch.message,
-                        uid: fetch.uid,
-                        read,
-                        from,
-                        subject,
-                        date,
-                        part: fetch.bodystructure().and_then(find_text_part),
-                        body: String::new(),
-                    });
-                }
-            }
-            Err(e) => {
-                let _ = sender.send(AppMessage::Status(format!("IMAP Fetch failed: {}", e)));
-                let _ = session.logout();
-                return;
+        // Sent rides along quietly: Gmail's name first, the conventional one
+        // second; a server with neither just syncs the inbox.
+        for mailbox in ["[Gmail]/Sent Mail", "Sent"] {
+            if let Some(sent) = fetch_mailbox(
+                &mut session,
+                &sender,
+                &account.email,
+                mailbox,
+                "sent",
+                SENT_ID_OFFSET,
+                false,
+            ) {
+                fetched.extend(sent);
+                break;
             }
         }
 
-        // Pass 2: fetch just the chosen text part, grouped by section path so a
-        // typical mailbox needs only 1-2 more round trips; capped so a giant
-        // text part can't stall the sync either.
-        let mut groups: std::collections::HashMap<Vec<u32>, Vec<u32>> = std::collections::HashMap::new();
-        for p in &pending {
-            if let Some(spec) = &p.part {
-                groups.entry(spec.path.clone()).or_default().push(p.seq);
-            }
-        }
-        for (path, seqs) in groups {
-            let seq_set = seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
-            let section = section_str(&path);
-            let query = format!("BODY.PEEK[{}]<0.{}>", section, PART_FETCH_CAP);
-            let section_path = imap_proto::types::SectionPath::Part(path, None);
-            match session.fetch(&seq_set, &query) {
-                Ok(fetches) => {
-                    for fetch in fetches.iter() {
-                        let Some(bytes) = fetch.section(&section_path) else { continue };
-                        if let Some(p) = pending.iter_mut().find(|p| p.seq == fetch.message) {
-                            if let Some(spec) = &p.part {
-                                p.body = parser
-                                    .parse(&spec.synthesize(bytes))
-                                    .map(|m| extract_body(&m))
-                                    .unwrap_or_default();
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = sender.send(AppMessage::Status(format!("IMAP part fetch failed: {}", e)));
-                }
-            }
-        }
-
-        // Fallback: no usable text part in the structure (or the walk failed) —
-        // one capped full-message fetch for those stragglers.
-        let no_part: Vec<u32> = pending.iter().filter(|p| p.part.is_none()).map(|p| p.seq).collect();
-        if !no_part.is_empty() {
-            let seq_set = no_part.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
-            let query = format!("BODY.PEEK[]<0.{}>", PART_FETCH_CAP * 4);
-            match session.fetch(&seq_set, &query) {
-                Ok(fetches) => {
-                    for fetch in fetches.iter() {
-                        let Some(raw) = fetch.body() else { continue };
-                        if let Some(p) = pending.iter_mut().find(|p| p.seq == fetch.message) {
-                            p.body = parser.parse(raw).map(|m| extract_body(&m)).unwrap_or_default();
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = sender.send(AppMessage::Status(format!("IMAP fallback fetch failed: {}", e)));
-                }
-            }
-        }
-
-        let mut fetched_emails: Vec<Email> = pending
-            .into_iter()
-            .map(|p| Email {
-                id: p.seq as usize,
-                uid: p.uid,
-                from: p.from,
-                to: account.email.clone(),
-                subject: p.subject,
-                body: p.body,
-                date: p.date,
-                read: p.read,
-                folder: "inbox".to_string(),
-            })
-            .collect();
-
-        fetched_emails.reverse(); // Newest first
-
-        let _ = sender.send(AppMessage::EmailsSynced(account.email.clone(), fetched_emails));
+        let _ = sender.send(AppMessage::EmailsSynced(account.email.clone(), fetched));
         let _ = sender.send(AppMessage::Status("Sync Complete".to_string()));
         let _ = session.logout();
     });
@@ -1233,9 +1305,15 @@ impl ClearEmailApp {
 
             for (idx, email) in filtered.iter().enumerate() {
                 if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                    // Sender name
+                    // Sender — recipient on sent rows (every sent mail is
+                    // "from" ourselves; the interesting party is the other end)
+                    let row_head = if email.folder == "sent" {
+                        format!("To: {}", email.to)
+                    } else {
+                        email.from.clone()
+                    };
                     labels.push(TextLabel {
-                        text: ellipsize(&email.from, 21),
+                        text: ellipsize(&row_head, 21),
                         x: list_x + 20.0,
                         y: draw_y + 6.0,
                         font_size: 11.0,
@@ -1748,19 +1826,36 @@ impl Application for ClearEmailApp {
                             })
                             .collect()
                     };
+                    // Locally-kept mail alongside a fresh fetch: everything
+                    // except the server-backed folders — prior inbox rows are
+                    // replaced wholesale, prior server-fetched sent (uid set)
+                    // likewise, and a locally-appended sent copy (uid None)
+                    // is dropped once the server fetch carries the same
+                    // message (Gmail auto-saves SMTP sends to Sent Mail).
+                    let local_keep = |prior: &[Email], fetched: &[Email]| -> Vec<Email> {
+                        prior
+                            .iter()
+                            .filter(|e| e.folder != "inbox")
+                            .filter(|e| !(e.folder == "sent" && e.uid.is_some()))
+                            .filter(|e| {
+                                !(e.folder == "sent"
+                                    && fetched.iter().any(|f| {
+                                        f.folder == "sent" && f.subject == e.subject
+                                    }))
+                            })
+                            .cloned()
+                            .collect()
+                    };
                     if acc.email == email {
                         let mut merged = keep_local_read(&self.emails, list.clone());
-                        let mut local_other = self.emails.clone();
-                        local_other.retain(|e| e.folder != "inbox");
-                        merged.extend(local_other);
+                        merged.extend(local_keep(&self.emails, &list));
                         self.emails = merged;
                         save_emails_for_account(&email, &self.emails);
                     } else {
                         // Just write cache to disk
-                        let mut acc_emails = load_emails_for_account(&email);
+                        let acc_emails = load_emails_for_account(&email);
                         let mut merged = keep_local_read(&acc_emails, list.clone());
-                        acc_emails.retain(|e| e.folder != "inbox");
-                        merged.extend(acc_emails);
+                        merged.extend(local_keep(&acc_emails, &list));
                         save_emails_for_account(&email, &merged);
                     }
                 }
