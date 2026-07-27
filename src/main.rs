@@ -134,6 +134,9 @@ struct ClearEmailApp {
     body_sb_drag_offset: f32,
     compose_open: bool,
     compose_title: String,
+    /// When the most recent IMAP sync was spawned — folder switches re-sync
+    /// through [`Self::start_sync`], throttled against tab-hopping.
+    last_sync_start: Option<std::time::Instant>,
     status_message: Option<(String, f32)>, // (message, timer)
     sender: calloop::channel::Sender<AppMessage>,
 
@@ -203,6 +206,24 @@ fn save_accounts(accounts: &[AccountInfo]) {
             }
         }
     }
+}
+
+/// Sidecar remembering which account was last selected, so a restart returns
+/// to (and on-start syncs) the account the user actually reads. Deliberately
+/// not in accounts.json — that file is owned by cce-system-settings.
+fn selected_account_path() -> std::path::PathBuf {
+    cce_ui::config::cce_config_dir().join("cce-email-account.txt")
+}
+
+fn load_selected_account_email() -> Option<String> {
+    std::fs::read_to_string(selected_account_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn save_selected_account_email(email: &str) {
+    let _ = std::fs::write(selected_account_path(), email);
 }
 
 fn get_account_emails_path(email: &str) -> std::path::PathBuf {
@@ -964,6 +985,20 @@ impl ClearEmailApp {
     }
 
 
+    /// Spawn an IMAP sync for the selected account. Unforced calls (folder
+    /// switches) are throttled so tab-hopping doesn't stack connections;
+    /// forced calls (explicit account selection) always run.
+    fn start_sync(&mut self, force: bool) {
+        const MIN_SYNC_GAP: std::time::Duration = std::time::Duration::from_secs(30);
+        if !force && self.last_sync_start.is_some_and(|t| t.elapsed() < MIN_SYNC_GAP) {
+            return;
+        }
+        if let Some(acc) = self.accounts.get(self.selected_account_idx) {
+            sync_imap(acc.clone(), self.sender.clone());
+            self.last_sync_start = Some(std::time::Instant::now());
+        }
+    }
+
     fn save_emails(&self) {
         if let Some(acc) = self.accounts.get(self.selected_account_idx) {
             save_emails_for_account(&acc.email, &self.emails);
@@ -1289,7 +1324,13 @@ impl Application for ClearEmailApp {
         let btn_unread = Button::new(561.0, 8.0, 110.0, 26.0).with_label("Mark Unread");
 
         let accounts = load_accounts();
-        let selected_account_idx = accounts.iter().position(|a| a.is_default).unwrap_or(0);
+        // Last-used account wins (sidecar file), else the configured default:
+        // the on-start sync below should hit the account the user actually
+        // reads, not whichever entry carries the is_default flag.
+        let selected_account_idx = load_selected_account_email()
+            .and_then(|e| accounts.iter().position(|a| a.email == e))
+            .or_else(|| accounts.iter().position(|a| a.is_default))
+            .unwrap_or(0);
 
         let btn_manage_accounts = Button::new(66.0, 15.0, 300.0, 26.0).with_label("Manage Accounts...");
 
@@ -1315,11 +1356,15 @@ impl Application for ClearEmailApp {
             Vec::new()
         };
 
-        if let Some(acc) = accounts.get(selected_account_idx) {
+        let last_sync_start = if let Some(acc) = accounts.get(selected_account_idx) {
             sync_imap(acc.clone(), _sender.clone());
-        }
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         Self {
+            last_sync_start,
             keys: EmailKeys::load(),
             btn_compose,
             paginator,
@@ -1396,13 +1441,17 @@ impl Application for ClearEmailApp {
                         self.accounts.get(new_idx).map(|a| a.email.as_str()) != prev_email.as_deref();
                     self.selected_account_idx = new_idx;
                     if changed_account {
-                        if let Some(acc) = self.accounts.get(new_idx) {
-                            self.emails = load_emails_for_account(&acc.email);
-                            sync_imap(acc.clone(), self.sender.clone());
+                        if let Some(email) = self.accounts.get(new_idx).map(|a| a.email.clone()) {
+                            self.emails = load_emails_for_account(&email);
+                            save_selected_account_email(&email);
+                            self.start_sync(true);
                         } else {
                             self.emails = Vec::new();
                         }
                     }
+                } else {
+                    // Mail folders refresh from the server on entry (throttled).
+                    self.start_sync(false);
                 }
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
@@ -1534,9 +1583,10 @@ impl Application for ClearEmailApp {
             }
             AppMessage::SelectAccount(idx) => {
                 self.selected_account_idx = idx;
-                if let Some(acc) = self.accounts.get(idx) {
-                    self.emails = load_emails_for_account(&acc.email);
-                    sync_imap(acc.clone(), self.sender.clone());
+                if let Some(email) = self.accounts.get(idx).map(|a| a.email.clone()) {
+                    self.emails = load_emails_for_account(&email);
+                    save_selected_account_email(&email);
+                    self.start_sync(true);
                 } else {
                     self.emails = Vec::new();
                 }
