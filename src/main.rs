@@ -5,7 +5,7 @@ use glyphon::FontSystem;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, WidgetHost,
-    TextBox, Button, TextLabel, Key, Paginator, PageSelector, MenuController
+    TextBox, Button, TextLabel, Key, Paginator, PageSelector, MenuController, MenuBar
 };
 use cce_ui::context::UiContext;
 use native_tls::TlsConnector;
@@ -77,6 +77,8 @@ enum AppMessage {
     /// Open cce-system-settings on its Accounts page — account add/remove/
     /// default/OAuth all live there now; this app only reads accounts.json.
     ManageAccounts,
+    SyncNow,
+    Quit,
     Status(String),
     EmailsSynced(String, Vec<Email>),
     UpdateAccountTokens(String, Option<String>, Option<u64>),
@@ -103,6 +105,7 @@ struct ClearEmailApp {
 
     // Navigation / Sidebar
     btn_compose: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    menubar: cce_ui::widget::Adapted<MenuBar>,
     paginator: cce_ui::widget::Adapted<Paginator>,
 
     // Search and List View
@@ -315,6 +318,9 @@ fn save_emails_for_account(email: &str, emails: &[Email]) {
 
 /// Newest-N window fetched per sync. Only headers, structure, and the chosen
 /// text part come down the wire, so attachments never inflate a sync.
+/// Menubar height; all chrome below the bar offsets by this.
+const MENUBAR_H: f32 = 36.0;
+
 const FETCH_COUNT: usize = 50;
 
 /// Byte cap on a fetched text part (pre-decode); the display model caps at
@@ -1182,6 +1188,8 @@ impl ClearEmailApp {
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_compose.id(), self.btn_compose.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.menubar.id(), self.menubar.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_compose_send.id(), self.btn_compose_send.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_compose_cancel.id(), self.btn_compose_cancel.as_ptr_mut());
@@ -1227,7 +1235,7 @@ impl ClearEmailApp {
     fn body_scrollbar_geom(&self) -> Option<(f32, f32, f32, f32, f32, f32)> {
         let w = self.width as f32;
         let h = self.height as f32;
-        let body_h = (h - 190.0).max(100.0);
+        let body_h = (h - 190.0 - MENUBAR_H).max(100.0);
         let max_scroll = (self.body_content_h - body_h).max(0.0);
         if max_scroll <= 0.0 {
             return None;
@@ -1235,8 +1243,8 @@ impl ClearEmailApp {
         let sb_w = cce_ui::layout::scrollbar_width();
         let sb_x = w - sb_w - 4.0;
         let thumb_h = (body_h * body_h / self.body_content_h).clamp(20.0, body_h);
-        let thumb_y = 170.0 + (self.body_scroll / max_scroll) * (body_h - thumb_h);
-        Some((sb_x, 170.0, sb_w, body_h, thumb_y, thumb_h))
+        let thumb_y = 170.0 + MENUBAR_H + (self.body_scroll / max_scroll) * (body_h - thumb_h);
+        Some((sb_x, 170.0 + MENUBAR_H, sb_w, body_h, thumb_y, thumb_h))
     }
 
     /// Left press on the scrollbar strip (±4px slop like ScrollRegion): grab the
@@ -1263,7 +1271,7 @@ impl ClearEmailApp {
         let Some((_, track_y, _, track_h, _, thumb_h)) = self.body_scrollbar_geom() else {
             return false;
         };
-        let body_h = (self.height as f32 - 190.0).max(100.0);
+        let body_h = (self.height as f32 - 190.0 - MENUBAR_H).max(100.0);
         let max_scroll = (self.body_content_h - body_h).max(0.0);
         let target = py - self.body_sb_drag_offset;
         let ratio = if track_h - thumb_h > 0.0 {
@@ -1300,7 +1308,7 @@ impl ClearEmailApp {
             labels.push(TextLabel {
                 text: badge_text,
                 x: margin_x + (tab_w - est_w) / 2.0,
-                y: 114.0, // centers in the badge pill (by + 20 + ~2)
+                y: 114.0 + MENUBAR_H, // centers in the badge pill (by + 20 + ~2)
                 font_size: 10.0,
                 color: [0xff, 0xff, 0xff],
             });
@@ -1416,24 +1424,24 @@ impl ClearEmailApp {
                 labels.push(TextLabel {
                     text: acc.email.clone(),
                     x: detail_x,
-                    y: 60.0,
+                    y: 60.0 + MENUBAR_H,
                     font_size: 15.0,
                     color: [0xff, 0xff, 0xff],
                 });
 
                 // Settings details
-                labels.push(TextLabel { text: format!("Incoming Server (IMAP): {}", acc.imap), x: detail_x, y: 95.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
-                labels.push(TextLabel { text: format!("Outgoing Server (SMTP): {}", acc.smtp), x: detail_x, y: 120.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
+                labels.push(TextLabel { text: format!("Incoming Server (IMAP): {}", acc.imap), x: detail_x, y: 95.0 + MENUBAR_H, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
+                labels.push(TextLabel { text: format!("Outgoing Server (SMTP): {}", acc.smtp), x: detail_x, y: 120.0 + MENUBAR_H, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
                 let auth_text = if acc.is_oauth {
                     "Authentication:          OAuth2 (Google)"
                 } else {
                     "Authentication:          SSL/TLS, Normal Password"
                 };
-                labels.push(TextLabel { text: auth_text.to_string(), x: detail_x, y: 145.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                labels.push(TextLabel { text: auth_text.to_string(), x: detail_x, y: 145.0 + MENUBAR_H, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
                 labels.push(TextLabel {
                     text: format!("Default Account:         {}", if acc.is_default { "Yes" } else { "No" }),
                     x: detail_x,
-                    y: 170.0,
+                    y: 170.0 + MENUBAR_H,
                     font_size: 11.0,
                     color: if acc.is_default { [0x3a, 0xff, 0x80] } else { [0x83, 0x83, 0x8a] },
                 });
@@ -1444,15 +1452,15 @@ impl ClearEmailApp {
                 labels.push(TextLabel {
                     text: email.subject.clone(),
                     x: detail_x,
-                    y: 60.0,
+                    y: 60.0 + MENUBAR_H,
                     font_size: 15.0,
                     color: [0xff, 0xff, 0xff],
                 });
 
                 // Metadata
-                labels.push(TextLabel { text: format!("From: {}", email.from), x: detail_x, y: 85.0, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
-                labels.push(TextLabel { text: format!("To:   {}", email.to), x: detail_x, y: 105.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-                labels.push(TextLabel { text: format!("Date: {}", email.date), x: detail_x, y: 125.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                labels.push(TextLabel { text: format!("From: {}", email.from), x: detail_x, y: 85.0 + MENUBAR_H, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
+                labels.push(TextLabel { text: format!("To:   {}", email.to), x: detail_x, y: 105.0 + MENUBAR_H, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                labels.push(TextLabel { text: format!("Date: {}", email.date), x: detail_x, y: 125.0 + MENUBAR_H, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
             }
         } else {
             let placeholder = "Select an email to view its content".to_string();
@@ -1529,6 +1537,12 @@ impl Application for ClearEmailApp {
     fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
         cce_ui::scale::set_scale_factor(1.0);
         let btn_compose = Button::new(10.0, 15.0, 26.0, 26.0).with_label("+");
+
+        let menubar = MenuBar::new(0.0, 0.0, 800.0, MENUBAR_H)
+            .with_recess(true)
+            .with_item("Mail", &["New Message", "Sync Now", "Quit"])
+            .with_item("Message", &["Reply", "Delete", "Mark Read/Unread"])
+            .with_item("View", &["Inbox", "Sent", "Trash", "Accounts"]);
         let paginator = Paginator::new(vec![
             "Inbox".to_string(),
             "Sent".to_string(),
@@ -1589,6 +1603,7 @@ impl Application for ClearEmailApp {
             last_sync_start,
             keys: EmailKeys::load(),
             btn_compose,
+            menubar,
             paginator,
             search_box,
             email_list,
@@ -1637,7 +1652,7 @@ impl Application for ClearEmailApp {
         }
     }
 
-    fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, _exit: &mut bool) {
+    fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, exit: &mut bool) {
         match msg {
             AppMessage::SwitchFolder(f) => {
                 self.current_folder = f;
@@ -1854,6 +1869,12 @@ impl Application for ClearEmailApp {
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
+            AppMessage::SyncNow => {
+                self.start_sync(true);
+            }
+            AppMessage::Quit => {
+                *exit = true;
+            }
             AppMessage::Status(msg) => {
                 self.status_message = Some((msg, 4.0));
                 *needs_rebuild = true;
@@ -1974,12 +1995,20 @@ impl Application for ClearEmailApp {
 
         if self.needs_rebuild || size_changed {
             // Sidebar buttons layout
-            self.btn_compose.set_rect((sidebar_w - 26.0) / 2.0, 15.0, 26.0, 26.0);
+            self.menubar.set_rect(0.0, 0.0, w_f32, MENUBAR_H);
+            // An open menubar dropdown is a popover: registration feeds the
+            // dl-text occlusion clamp, and the render loop at the end of this
+            // function draws it on top of everything.
+            self.ui_context.clear_popovers();
+            if self.menubar.popover_rect().is_some() {
+                self.ui_context.register_popover(&mut self.menubar);
+            }
+            self.btn_compose.set_rect((sidebar_w - 26.0) / 2.0, 15.0 + MENUBAR_H, 26.0, 26.0);
 
             // Set paginator layout — tabs start below the compose button (the two used
             // to stack at y=0 and the "+" sat buried under the Inbox tab).
             cce_ui::scale::set_scale_factor(scale as f32);
-            self.paginator.set_rect(0.0, 60.0, sidebar_w, h_f32 - 60.0);
+            self.paginator.set_rect(0.0, 60.0 + MENUBAR_H, sidebar_w, h_f32 - 60.0 - MENUBAR_H);
             let folder_idx = match self.current_folder {
                 Folder::Inbox => 0,
                 Folder::Sent => 1,
@@ -1990,10 +2019,10 @@ impl Application for ClearEmailApp {
 
             // Search box / Add Account and Scrolling list
             let list_count = if self.current_folder == Folder::Accounts {
-                self.btn_manage_accounts.set_rect(list_x, 15.0, 300.0, 26.0);
+                self.btn_manage_accounts.set_rect(list_x, 15.0 + MENUBAR_H, 300.0, 26.0);
                 self.accounts.len()
             } else {
-                self.search_box.set_rect(list_x, 15.0, 300.0, 26.0);
+                self.search_box.set_rect(list_x, 15.0 + MENUBAR_H, 300.0, 26.0);
                 
                 // Get filtered emails count for bounds setup
                 self.emails.iter()
@@ -2012,8 +2041,8 @@ impl Application for ClearEmailApp {
                     .count()
             };
 
-            self.email_list.set_rect(list_x, 55.0, 300.0, h_f32 - 70.0);
-            self.email_list.update_bounds(list_count, 55.0, h_f32 - 70.0);
+            self.email_list.set_rect(list_x, 55.0 + MENUBAR_H, 300.0, h_f32 - 70.0 - MENUBAR_H);
+            self.email_list.update_bounds(list_count, 55.0 + MENUBAR_H, h_f32 - 70.0 - MENUBAR_H);
 
             if self.email_buttons.len() != list_count {
                 self.email_buttons = (0..list_count)
@@ -2079,13 +2108,13 @@ impl Application for ClearEmailApp {
 
                 // Detail View
                 if let Some((read, body)) = selected_email_state {
-                    self.btn_reply.set_rect(detail_x, 8.0, 70.0, 26.0);
-                    self.btn_delete.set_rect(detail_x + 80.0, 8.0, 80.0, 26.0);
-                    self.btn_unread.set_rect(detail_x + 170.0, 8.0, 110.0, 26.0);
+                    self.btn_reply.set_rect(detail_x, 8.0 + MENUBAR_H, 70.0, 26.0);
+                    self.btn_delete.set_rect(detail_x + 80.0, 8.0 + MENUBAR_H, 80.0, 26.0);
+                    self.btn_unread.set_rect(detail_x + 170.0, 8.0 + MENUBAR_H, 110.0, 26.0);
                     self.btn_unread.set_label(if read { "Mark Unread" } else { "Mark Read" });
 
                     let detail_w = (w_f32 - (detail_x + 15.0)).max(100.0);
-                    self.detail_body.set_rect(detail_x, 170.0, detail_w, (h_f32 - 190.0).max(100.0));
+                    self.detail_body.set_rect(detail_x, 170.0 + MENUBAR_H, detail_w, (h_f32 - 190.0 - MENUBAR_H).max(100.0));
                     self.detail_body.text = body;
                 }
             }
@@ -2139,24 +2168,27 @@ impl Application for ClearEmailApp {
         // hover/selected states) AND text in one pass. The legacy extra_quads bridge only
         // forwarded plain Prim::Quads, so every widget's rounded chrome was dropped.
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose, &mut *quads.pc);
+        // Menubar painted after the other roots below cannot work — its dropdown
+        // must overlay them, so it is painted at the END of display_list instead.
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.paginator, &mut *quads.pc);
 
         // Draw badge pill for inbox unread (centered on vertical rotated tab)
         let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
         if inbox_unread > 0 {
             let bx = margin_x;
-            let by = 92.0; // lower edge of the Inbox tab (tabs start at the y=60 paginator offset)
+            let by = 92.0 + MENUBAR_H; // lower edge of the Inbox tab (tabs start 60 below the menubar)
             quads.push((bx + (tab_w - 22.0) / 2.0, by + 20.0, 22.0, 16.0, [0.20, 0.45, 0.85, 0.8]));
         }
 
         // 3. Email List Panel Separator
-        quads.push((separator_x, 0.0, 1.0, h_f32, [0.18, 0.18, 0.22, 1.0]));
+        quads.push((separator_x, MENUBAR_H, 1.0, h_f32 - MENUBAR_H, [0.18, 0.18, 0.22, 1.0]));
 
         // Search box / Add Account and List
         if self.current_folder == Folder::Accounts {
             cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_manage_accounts, &mut *quads.pc);
         } else {
             self.search_box.prepare_text(&mut self.font_system);
+            cce_ui::widget::WidgetHost::prepare_text(&mut self.menubar, &mut self.font_system);
             cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.search_box, &mut *quads.pc);
         }
         {
@@ -2216,7 +2248,7 @@ impl Application for ClearEmailApp {
                 if !self.compose_open {
                     if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
                         let body_w = (w_f32 - (detail_x + 15.0)).max(100.0);
-                        let body_h = (h_f32 - 190.0).max(100.0);
+                        let body_h = (h_f32 - 190.0 - MENUBAR_H).max(100.0);
                         let line_h = 12.0 * 1.4; // get_text_buffer_laid_out's placed-text metric
 
                         // Measure with the exact shaping the renderer will use, so the
@@ -2248,11 +2280,11 @@ impl Application for ClearEmailApp {
                         quads.pc.text_boxed(
                             email.body.clone(),
                             detail_x,
-                            170.0 - self.body_scroll,
+                            170.0 + MENUBAR_H - self.body_scroll,
                             12.0,
                             [0xc8, 0xc8, 0xd0],
                             Some("sans-serif".to_string()),
-                            Some([detail_x, 170.0, detail_x + body_w, 170.0 + body_h]),
+                            Some([detail_x, 170.0 + MENUBAR_H, detail_x + body_w, 170.0 + MENUBAR_H + body_h]),
                             cce_ui::scene::paint::TextAttrs::default(),
                             cce_ui::scene::paint::TextLayout {
                                 wrap_width: Some(body_w),
@@ -2293,6 +2325,35 @@ impl Application for ClearEmailApp {
 
 
 
+        // Menubar last: its open dropdown must overlay every pane beneath.
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.menubar, &mut __pc);
+
+        // Popover pass (the data-editor pattern): geometry and labels on top of
+        // everything, exactly where they hit-test; labels carry bounds equal to
+        // the overlay rect (the is-overlay-text convention).
+        {
+            use cce_ui::scene::layout::Rect;
+            for &pop_id in &self.ui_context.active_popovers {
+                let Some(pop_ptr) = self.ui_context.tree.get_ptr(pop_id) else { continue };
+                let popover = unsafe { &*pop_ptr };
+                let Some((px2, py2, pw2, ph2)) = popover.popover_rect() else { continue };
+                let mut coll = cce_ui::layout::PopoverCollector::new();
+                popover.render_popover(&mut coll);
+                for &(c, x, y, qw, qh) in &coll.rects {
+                    __pc.quad(Rect { x, y, width: qw, height: qh }, c);
+                }
+                let pop_bounds = Some([px2, py2, px2 + pw2, py2 + ph2]);
+                for (content, size, tx, ty, color, font, _bounds) in coll.texts {
+                    let color_u8 = [
+                        (color[0] * 255.0).clamp(0.0, 255.0) as u8,
+                        (color[1] * 255.0).clamp(0.0, 255.0) as u8,
+                        (color[2] * 255.0).clamp(0.0, 255.0) as u8,
+                    ];
+                    __pc.text_with(content, tx, ty, size, color_u8, font, pop_bounds);
+                }
+            }
+        }
+
         self.emit_text_prims(&mut __pc);
         Some(__pc.finish())
     }
@@ -2316,6 +2377,10 @@ impl Application for ClearEmailApp {
         // Routed dispatch (6bd shrink): one Event per widget root through the router.
         let mv = cce_ui::widget::Event::PointerMove { x: px, y: py, local_x: px, local_y: py };
         let ctx = &mut self.ui_context;
+
+        if ctx.propagate_event(&mv, self.menubar.id()) {
+            changed = true;
+        }
 
         if self.compose_open {
             if ctx.propagate_event(&mv, self.compose_to.id()) { changed = true; }
@@ -2395,6 +2460,29 @@ impl Application for ClearEmailApp {
         }
 
         let ctx = &mut self.ui_context;
+
+        // Menubar first — an open dropdown overlays the panes, so a handled
+        // press/release must not fall through to the content beneath it.
+        if ctx.propagate_event(&ev, self.menubar.id()) {
+            if let Some((menu_idx, item_idx)) = self.menubar.menu_click() {
+                msg_out = match (menu_idx, item_idx) {
+                    (0, 0) => Some(AppMessage::ComposeNew),
+                    (0, 1) => Some(AppMessage::SyncNow),
+                    (0, 2) => Some(AppMessage::Quit),
+                    (1, 0) => Some(AppMessage::Reply),
+                    (1, 1) => Some(AppMessage::DeleteSelected),
+                    (1, 2) => Some(AppMessage::ToggleUnread),
+                    (2, 0) => Some(AppMessage::SwitchFolder(Folder::Inbox)),
+                    (2, 1) => Some(AppMessage::SwitchFolder(Folder::Sent)),
+                    (2, 2) => Some(AppMessage::SwitchFolder(Folder::Trash)),
+                    (2, 3) => Some(AppMessage::SwitchFolder(Folder::Accounts)),
+                    _ => None,
+                };
+            }
+            *needs_rebuild = true;
+            self.needs_rebuild = true;
+            return msg_out;
+        }
 
         if self.compose_open {
             if ctx.propagate_event(&ev, self.compose_to.id()) {
@@ -2605,7 +2693,7 @@ impl Application for ClearEmailApp {
                     MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
                     MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
                 };
-                let body_h = (self.height as f32 - 190.0).max(100.0);
+                let body_h = (self.height as f32 - 190.0 - MENUBAR_H).max(100.0);
                 let max = (self.body_content_h - body_h).max(0.0);
                 let old = self.body_scroll;
                 self.body_scroll = (self.body_scroll + dy).clamp(0.0, max);
@@ -2664,7 +2752,7 @@ impl Application for ClearEmailApp {
                 && !self.search_box.editing
                 && event.state == ElementState::Pressed
             {
-                let body_h = (self.height as f32 - 190.0).max(100.0);
+                let body_h = (self.height as f32 - 190.0 - MENUBAR_H).max(100.0);
                 let max = (self.body_content_h - body_h).max(0.0);
                 let old = self.body_scroll;
                 match &event.logical_key {
