@@ -1930,6 +1930,15 @@ impl Application for ClearEmailApp {
     }
 
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
+        // Pump the widget tick walk: animating widgets (dropdown menus'
+        // expand/contract) register as tick receivers and report changed
+        // until their transition lands — without this a closing menu freezes
+        // fully open.
+        if self.ui_context.tick(dt) {
+            *needs_rebuild = true;
+            self.needs_rebuild = true;
+        }
+
         if let Some((_, ref mut timer)) = self.status_message {
             *timer -= dt;
             if *timer <= 0.0 {
