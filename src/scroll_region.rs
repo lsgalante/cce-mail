@@ -1,5 +1,5 @@
 //! App-owned scroll region replacing the dissolved `List` embedded base (the Phase 6q
-//! ScrollRegion, ported from cce-system-settings). The email list was a pure scroll
+//! ScrollRegion, ported from cce-system-interface). The email list was a pure scroll
 //! frame (`List` with `columns: None`, whose visuals were just its internal ScrollBox):
 //! the rows are drawn by the app at `get_item_draw_y` positions, so the widget
 //! contributed only the flat background, the scrollbar, the scroll/virtualization math,
@@ -293,6 +293,7 @@ mod tests {
             repeat: false,
             ctrl: false,
             shift: false,
+            alt: false,
         };
         assert!(!r.keyboard(&down)); // neither hovered nor focused
         r.cursor_moved(50.0, 50.0);
