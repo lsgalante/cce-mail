@@ -74,7 +74,7 @@ enum AppMessage {
     DeleteSelected,
     ToggleUnread,
     SelectAccount(usize),
-    /// Open cce-system-settings on its Accounts page — account add/remove/
+    /// Open cce-system-interface on its Accounts page — account add/remove/
     /// default/OAuth all live there now; this app only reads accounts.json.
     ManageAccounts,
     SyncNow,
@@ -126,7 +126,7 @@ struct ClearEmailApp {
     btn_compose_send: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     btn_compose_cancel: cce_ui::widget::Adapted<cce_ui::widget::Button>,
 
-    // Accounts (view/switch only — management lives in cce-system-settings)
+    // Accounts (view/switch only — management lives in cce-system-interface)
     accounts: Vec<AccountInfo>,
     selected_account_idx: usize,
     btn_manage_accounts: cce_ui::widget::Adapted<cce_ui::widget::Button>,
@@ -269,7 +269,7 @@ fn save_accounts(accounts: &[AccountInfo]) {
 
 /// Sidecar remembering which account was last selected, so a restart returns
 /// to (and on-start syncs) the account the user actually reads. Deliberately
-/// not in accounts.json — that file is owned by cce-system-settings.
+/// not in accounts.json — that file is owned by cce-system-interface.
 fn selected_account_path() -> std::path::PathBuf {
     cce_ui::config::cce_config_dir().join("cce-email-account.txt")
 }
@@ -1645,7 +1645,7 @@ impl Application for ClearEmailApp {
                 self.email_list.set_scroll_y(0.0);
                 self.body_scroll = 0.0;
                 if f == Folder::Accounts {
-                    // Accounts are managed by cce-system-settings — re-read the
+                    // Accounts are managed by cce-system-interface — re-read the
                     // shared accounts.json on every entry so its changes appear
                     // without an app restart. Keep the selection by email; if
                     // that account is gone, fall to the default.
@@ -1847,7 +1847,7 @@ impl Application for ClearEmailApp {
                 self.needs_rebuild = true;
             }
             AppMessage::ManageAccounts => {
-                let mut cmd = std::process::Command::new("cce-system-settings");
+                let mut cmd = std::process::Command::new("cce-system-interface");
                 cmd.arg("accounts");
                 let _ = cce_ui::process::spawn_detached(cmd);
                 self.status_message = Some(("Opening System Settings...".to_string(), 4.0));
