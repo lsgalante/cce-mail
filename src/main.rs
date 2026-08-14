@@ -2563,6 +2563,11 @@ impl Application for ClearEmailApp {
                 }
             }
 
+            // The scrollbar strip sits inside the row rects (rows span x 10..310, the strip
+            // ~294..310), so a press the scrollbar consumed must not also reach the row
+            // underneath it — grabbing the thumb used to press+release the row behind it and
+            // fire SelectEmail.
+            let mut scrollbar_took_press = false;
             if button == MouseButton::Left {
                 let handled = match state {
                     ElementState::Pressed => self.email_list.press(px, py),
@@ -2570,11 +2575,16 @@ impl Application for ClearEmailApp {
                 };
                 if handled {
                     changed = true;
+                    if state == ElementState::Pressed {
+                        scrollbar_took_press = true;
+                    }
                 }
             }
 
 
-            if self.current_folder == Folder::Accounts {
+            if scrollbar_took_press {
+                // fall through to the rest of the handler, but not to the rows
+            } else if self.current_folder == Folder::Accounts {
                 for (idx, _) in self.accounts.iter().enumerate() {
                     if idx < self.email_buttons.len() {
                         let btn = &mut self.email_buttons[idx];
