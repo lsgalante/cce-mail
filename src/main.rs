@@ -1,7 +1,7 @@
 mod scroll_region;
 use scroll_region::ScrollRegion;
 use wayland_client::QueueHandle;
-use glyphon::FontSystem;
+use cce_ui::cosmic_text::FontSystem;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, WidgetHost,
