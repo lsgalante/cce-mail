@@ -2043,6 +2043,15 @@ impl Application for ClearEmailApp {
             self.email_list.update_bounds(list_count, 55.0 + MENUBAR_H, h_f32 - 70.0 - MENUBAR_H);
 
             if self.email_buttons.len() != list_count {
+                // Widget ids are globally monotonic and never reused, so the fresh buttons
+                // register under NEW ids — the outgoing ones would linger in the registry
+                // pointing into this Vec's freed buffer, and the engine walks the whole
+                // registry and derefs it on every left press
+                // (`close_popovers_missed_by_press`). Drop them before the reallocation.
+                let stale: Vec<_> = self.email_buttons.iter().map(|b| b.id()).collect();
+                for id in stale {
+                    self.ui_context.unregister_widget(id);
+                }
                 self.email_buttons = (0..list_count)
                     .map(|_| Button::new_list_row(0.0, 0.0, 0.0, 0.0))
                     .collect();
