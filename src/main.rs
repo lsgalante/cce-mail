@@ -16,6 +16,7 @@ use lettre::{Message, SmtpTransport, Transport};
 enum Folder {
     Inbox,
     Sent,
+    Drafts,
     Trash,
     Accounts,
 }
@@ -54,7 +55,19 @@ struct Email {
     body: String,
     date: String,
     read: bool,
-    folder: String, // "inbox", "sent", "trash"
+    folder: String, // "inbox", "sent", "drafts", "trash"
+    /// Cc line of locally-composed mail (sent copies and drafts); fetched
+    /// mail leaves it empty. Defaults keep pre-existing caches loading.
+    #[serde(default)]
+    cc: String,
+    /// Bcc is only ever populated on drafts — a sent copy records who was
+    /// bcc'd nowhere, which is the point of bcc.
+    #[serde(default)]
+    bcc: String,
+    /// Drafts: absolute paths still to be attached. Sent copies: just the
+    /// file names, for display.
+    #[serde(default)]
+    attachments: Vec<String>,
     /// Server-side IMAP UID (INBOX message); None for mock or locally-created
     /// mail. Server operations (delete) key on this, never on `id` — `id` is
     /// the fetch-time sequence number, which shifts after any expunge.
@@ -70,6 +83,11 @@ enum AppMessage {
     ComposeNew,
     ComposeCancel,
     ComposeSend,
+    /// Attach button in the compose dialog: pick a file, append a chip.
+    ComposeAttach,
+    /// Outcome of a send: `None` = delivered (record in Sent); `Some(err)` =
+    /// failed (save the content to Drafts and say why).
+    SendResult(OutgoingMail, Option<String>),
     Reply,
     DeleteSelected,
     ToggleUnread,
@@ -121,10 +139,15 @@ struct ClearEmailApp {
 
     // Compose Dialog
     compose_to: cce_ui::widget::Adapted<TextBox>,
+    compose_cc: cce_ui::widget::Adapted<TextBox>,
+    compose_bcc: cce_ui::widget::Adapted<TextBox>,
     compose_subject: cce_ui::widget::Adapted<TextBox>,
     compose_body: cce_ui::widget::Adapted<TextBox>,
+    /// Absolute paths queued for the next send; drawn as removable chips.
+    compose_attachments: Vec<String>,
     btn_compose_send: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     btn_compose_cancel: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_compose_attach: cce_ui::widget::Adapted<cce_ui::widget::Button>,
 
     // Accounts (view/switch only — management lives in cce-system-interface)
     accounts: Vec<AccountInfo>,
@@ -351,6 +374,40 @@ fn save_emails_for_account(email: &str, emails: &[Email]) {
 /// Menubar height; all chrome below the bar offsets by this.
 const MENUBAR_H: f32 = 36.0;
 
+// Compose modal geometry. One source of truth: the background quads, the
+// input rects, the labels, the chip row and the outside-click test all
+// derive from these — the old duplicated 500.0/420.0 literals meant growing
+// the dialog required finding every site by hand.
+const COMPOSE_W: f32 = 500.0;
+const COMPOSE_H: f32 = 520.0;
+
+fn compose_modal_origin(w: f32, h: f32) -> (f32, f32) {
+    (((w - COMPOSE_W) / 2.0).max(0.0), ((h - COMPOSE_H) / 2.0).max(0.0))
+}
+
+/// Rects of the attachment chips (one per queued file), in the row between
+/// the body and the buttons. Paint and hit-test both call this, so a click
+/// lands exactly on what was drawn.
+fn compose_chip_rects(attachments: &[String], modal_x: f32, modal_y: f32) -> Vec<(f32, f32, f32, f32)> {
+    let mut rects = Vec::with_capacity(attachments.len());
+    let mut x = modal_x + 15.0;
+    let y = modal_y + 413.0;
+    for path in attachments {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment");
+        let shown = ellipsize(name, 22);
+        // Estimated glyph advance at font_size 10 — the chip is a painted
+        // quad, not a widget, so an estimate only has to be consistent
+        // between paint and hit-test (it is: both use this fn).
+        let w = shown.chars().count() as f32 * 6.0 + 26.0;
+        rects.push((x, y, w, 24.0));
+        x += w + 8.0;
+    }
+    rects
+}
+
 const FETCH_COUNT: usize = 50;
 
 /// Byte cap on a fetched text part (pre-decode); the display model caps at
@@ -564,6 +621,8 @@ fn strip_html(html: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Default)]
 struct MailtoPrefill {
     to: String,
+    cc: String,
+    bcc: String,
     subject: String,
     body: String,
 }
@@ -595,41 +654,43 @@ fn percent_decode(s: &str) -> String {
 
 /// Parse a `mailto:` URL (RFC 6068) into compose-dialog prefills.
 ///
-/// Recipients come from the path *and* any `to` query key; `cc`/`bcc` are
-/// folded into the To line as well — the dialog has a single recipient field,
-/// and merging delivers to everyone where dropping would silently lose them
-/// (the merged line is visible in the dialog before anything is sent).
-/// Header names are case-insensitive; unknown ones are ignored per spec.
+/// Recipients come from the path *and* any `to` query key; `cc` and `bcc`
+/// keep their own header fields — the compose dialog has all three, and bcc
+/// folded anywhere visible would defeat what bcc is for. Header names are
+/// case-insensitive; unknown ones are ignored per spec.
 fn parse_mailto(arg: &str) -> Option<MailtoPrefill> {
     let rest = arg.strip_prefix("mailto:").or_else(|| arg.strip_prefix("MAILTO:"))?;
     let (path, query) = match rest.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (rest, None),
     };
-    let mut recipients: Vec<String> = path
-        .split(',')
-        .map(percent_decode)
-        .map(|a| a.trim().to_string())
-        .filter(|a| !a.is_empty())
-        .collect();
+    fn addr_list(raw: &str) -> Vec<String> {
+        percent_decode(raw)
+            .split(',')
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect()
+    }
+    let mut to = addr_list(path);
+    let mut cc = Vec::new();
+    let mut bcc = Vec::new();
     let mut prefill = MailtoPrefill::default();
     if let Some(q) = query {
         for pair in q.split('&') {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
             match k.to_ascii_lowercase().as_str() {
-                "to" | "cc" | "bcc" => recipients.extend(
-                    percent_decode(v)
-                        .split(',')
-                        .map(|a| a.trim().to_string())
-                        .filter(|a| !a.is_empty()),
-                ),
+                "to" => to.extend(addr_list(v)),
+                "cc" => cc.extend(addr_list(v)),
+                "bcc" => bcc.extend(addr_list(v)),
                 "subject" => prefill.subject = percent_decode(v),
                 "body" => prefill.body = percent_decode(v),
                 _ => {}
             }
         }
     }
-    prefill.to = recipients.join(", ");
+    prefill.to = to.join(", ");
+    prefill.cc = cc.join(", ");
+    prefill.bcc = bcc.join(", ");
     Some(prefill)
 }
 
@@ -1020,6 +1081,9 @@ fn fetch_mailbox(
             date: p.date,
             read: p.read,
             folder: folder_tag.to_string(),
+            cc: String::new(),
+            bcc: String::new(),
+            attachments: Vec::new(),
         })
         .collect();
 
@@ -1132,10 +1196,117 @@ fn set_seen_on_server(mut account: AccountInfo, uid: u32, seen: bool, sender: ca
     });
 }
 
-fn send_smtp(mut account: AccountInfo, to: String, subject: String, body: String, sender: calloop::channel::Sender<AppMessage>) {
+/// One outgoing message, exactly as composed. This travels to the send
+/// thread and comes back in [`AppMessage::SendResult`] so the outcome
+/// handler still holds the full content — a success records it in Sent, a
+/// failure lands it in Drafts instead of losing it.
+#[derive(Debug, Clone)]
+struct OutgoingMail {
+    to: String,
+    cc: String,
+    bcc: String,
+    subject: String,
+    body: String,
+    /// Absolute paths; read at build time on the send thread.
+    attachments: Vec<String>,
+}
+
+/// Content type for an attachment, by extension. A tiny map beats a mime
+/// dependency: anything unlisted is application/octet-stream, which every
+/// receiver treats as "download it".
+fn attachment_content_type(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("txt") | Some("md") | Some("log") => "text/plain",
+        Some("html") | Some("htm") => "text/html",
+        Some("json") => "application/json",
+        Some("zip") => "application/zip",
+        Some("gz") | Some("tgz") => "application/gzip",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Build the lettre message for one [`OutgoingMail`].
+///
+/// To and Cc become headers; **Bcc deliberately never becomes a header** —
+/// bcc recipients ride only in the SMTP envelope, so no copy of the message
+/// can name them regardless of how the library formats headers. Attachments
+/// are read here (the send thread), each as one part of a multipart/mixed.
+fn build_outgoing(from: &str, mail: &OutgoingMail) -> Result<lettre::Message, String> {
+    use lettre::message::{Attachment, MultiPart, SinglePart, header::ContentType};
+
+    fn mailboxes(field: &str, label: &str) -> Result<Vec<lettre::message::Mailbox>, String> {
+        field
+            .split(',')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(|a| a.parse().map_err(|e| format!("Invalid {} address {}: {}", label, a, e)))
+            .collect()
+    }
+
+    let from_mb: lettre::message::Mailbox =
+        from.parse().map_err(|e| format!("Invalid From address: {}", e))?;
+    let to = mailboxes(&mail.to, "To")?;
+    let cc = mailboxes(&mail.cc, "Cc")?;
+    let bcc = mailboxes(&mail.bcc, "Bcc")?;
+    if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+        return Err("No recipients".to_string());
+    }
+
+    // Envelope = actual delivery list: To + Cc + Bcc.
+    let rcpts: Vec<lettre::Address> =
+        to.iter().chain(cc.iter()).chain(bcc.iter()).map(|m| m.email.clone()).collect();
+    let envelope = lettre::address::Envelope::new(Some(from_mb.email.clone()), rcpts)
+        .map_err(|e| format!("Invalid envelope: {}", e))?;
+
+    let mut builder = Message::builder().from(from_mb).envelope(envelope).subject(&mail.subject);
+    for mb in to {
+        builder = builder.to(mb);
+    }
+    for mb in cc {
+        builder = builder.cc(mb);
+    }
+
+    let msg = if mail.attachments.is_empty() {
+        builder.body(mail.body.clone())
+    } else {
+        let mut mp = MultiPart::mixed().singlepart(SinglePart::plain(mail.body.clone()));
+        for path in &mail.attachments {
+            let bytes = std::fs::read(path).map_err(|e| format!("Cannot read {}: {}", path, e))?;
+            let name = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("attachment")
+                .to_string();
+            let ct = ContentType::parse(attachment_content_type(path))
+                .map_err(|e| format!("Bad content type: {}", e))?;
+            mp = mp.singlepart(Attachment::new(name).body(bytes, ct));
+        }
+        builder.multipart(mp)
+    };
+    msg.map_err(|e| format!("Failed to build message: {}", e))
+}
+
+fn send_smtp(mut account: AccountInfo, mail: OutgoingMail, sender: calloop::channel::Sender<AppMessage>) {
     std::thread::spawn(move || {
+        // Every exit reports through SendResult so the app can file the
+        // message (Sent on success, Drafts on failure) — a bare Status would
+        // discard the composed content.
+        let fail = |sender: &calloop::channel::Sender<AppMessage>, mail: OutgoingMail, err: String| {
+            let _ = sender.send(AppMessage::SendResult(mail, Some(err)));
+        };
+
         if account.password == "mock_password" {
-            let _ = sender.send(AppMessage::Status("Mock Email Sent Successfully".to_string()));
+            let _ = sender.send(AppMessage::SendResult(mail, None));
             return;
         }
 
@@ -1154,7 +1325,7 @@ fn send_smtp(mut account: AccountInfo, to: String, subject: String, body: String
                     account.token_expiry = acc.token_expiry;
                 }
                 Err(e) => {
-                    let _ = sender.send(AppMessage::Status(format!("OAuth Refresh Failed: {}", e)));
+                    fail(&sender, mail, format!("OAuth Refresh Failed: {}", e));
                     return;
                 }
             }
@@ -1163,7 +1334,7 @@ fn send_smtp(mut account: AccountInfo, to: String, subject: String, body: String
         let domain = match account.smtp.split(':').next() {
             Some(d) => d,
             None => {
-                let _ = sender.send(AppMessage::Status("Invalid SMTP hostname".to_string()));
+                fail(&sender, mail, "Invalid SMTP hostname".to_string());
                 return;
             }
         };
@@ -1174,34 +1345,13 @@ fn send_smtp(mut account: AccountInfo, to: String, subject: String, body: String
 
         let _ = sender.send(AppMessage::Status("Sending SMTP mail...".to_string()));
 
-        let mut builder = Message::builder().from(match account.email.parse() {
-            Ok(f) => f,
+        let email = match build_outgoing(&account.email, &mail) {
+            Ok(m) => m,
             Err(e) => {
-                let _ = sender.send(AppMessage::Status(format!("Invalid From Address: {}", e)));
+                fail(&sender, mail, e);
                 return;
             }
-        });
-        // The To line may hold several comma-separated addresses (a
-        // multi-recipient mailto: prefills it that way); each gets its own
-        // .to(), since lettre's Mailbox parse takes exactly one address.
-        for addr in to.split(',').map(str::trim).filter(|a| !a.is_empty()) {
-            builder = builder.to(match addr.parse() {
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = sender.send(AppMessage::Status(format!("Invalid Recipient {}: {}", addr, e)));
-                    return;
-                }
-            });
-        }
-        let email = match builder
-            .subject(subject)
-            .body(body) {
-                Ok(m) => m,
-                Err(e) => {
-                    let _ = sender.send(AppMessage::Status(format!("Failed to build message: {}", e)));
-                    return;
-                }
-            };
+        };
 
         let creds = Credentials::new(account.email.clone(), access_token);
 
@@ -1219,10 +1369,10 @@ fn send_smtp(mut account: AccountInfo, to: String, subject: String, body: String
 
         match mailer.send(&email) {
             Ok(_) => {
-                let _ = sender.send(AppMessage::Status("Email Sent Successfully".to_string()));
+                let _ = sender.send(AppMessage::SendResult(mail, None));
             }
             Err(e) => {
-                let _ = sender.send(AppMessage::Status(format!("SMTP send failed: {}", e)));
+                fail(&sender, mail, format!("SMTP send failed: {}", e));
             }
         }
     });
@@ -1240,6 +1390,9 @@ fn get_default_mock_emails() -> Vec<Email> {
             read: false,
             folder: "inbox".to_string(),
             uid: None,
+            cc: String::new(),
+            bcc: String::new(),
+            attachments: Vec::new(),
         },
         Email {
             id: 2,
@@ -1251,6 +1404,9 @@ fn get_default_mock_emails() -> Vec<Email> {
             read: false,
             folder: "inbox".to_string(),
             uid: None,
+            cc: String::new(),
+            bcc: String::new(),
+            attachments: Vec::new(),
         },
         Email {
             id: 3,
@@ -1262,6 +1418,9 @@ fn get_default_mock_emails() -> Vec<Email> {
             read: true,
             folder: "inbox".to_string(),
             uid: None,
+            cc: String::new(),
+            bcc: String::new(),
+            attachments: Vec::new(),
         },
         Email {
             id: 4,
@@ -1273,11 +1432,76 @@ fn get_default_mock_emails() -> Vec<Email> {
             read: true,
             folder: "sent".to_string(),
             uid: None,
+            cc: String::new(),
+            bcc: String::new(),
+            attachments: Vec::new(),
         },
     ]
 }
 
 impl ClearEmailApp {
+    /// Effective To/Cc/Bcc/Subject/Body/attachments as composed right now.
+    /// Each box reads whichever side its `editing` flag selects — the same
+    /// split ComposeSend always honored.
+    fn gather_compose(&self) -> OutgoingMail {
+        fn val(tb: &TextBox) -> String {
+            if tb.editing { tb.edit_buffer.trim().to_string() } else { tb.text.trim().to_string() }
+        }
+        OutgoingMail {
+            to: val(&self.compose_to),
+            cc: val(&self.compose_cc),
+            bcc: val(&self.compose_bcc),
+            subject: val(&self.compose_subject),
+            body: if self.compose_body.editing {
+                self.compose_body.edit_buffer.clone()
+            } else {
+                self.compose_body.text.clone()
+            },
+            attachments: self.compose_attachments.clone(),
+        }
+    }
+
+    /// Reset every compose field (text and edit_buffer both — the reader
+    /// picks a side by the editing flag, so they must always agree).
+    fn clear_compose(&mut self) {
+        for tb in [
+            &mut self.compose_to,
+            &mut self.compose_cc,
+            &mut self.compose_bcc,
+            &mut self.compose_subject,
+            &mut self.compose_body,
+        ] {
+            tb.text = String::new();
+            tb.edit_buffer = String::new();
+        }
+        self.compose_attachments.clear();
+    }
+
+    /// File content in the local Drafts folder (never synced — drafts have
+    /// no uid and a folder the retention filters don't touch).
+    fn file_as_draft(&mut self, mail: &OutgoingMail) {
+        let new_id = self.emails.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        self.emails.push(Email {
+            id: new_id,
+            from: self
+                .accounts
+                .get(self.selected_account_idx)
+                .map(|a| a.email.clone())
+                .unwrap_or_default(),
+            to: mail.to.clone(),
+            subject: mail.subject.clone(),
+            body: mail.body.clone(),
+            date: "Draft".to_string(),
+            read: true,
+            folder: "drafts".to_string(),
+            uid: None,
+            cc: mail.cc.clone(),
+            bcc: mail.bcc.clone(),
+            attachments: mail.attachments.clone(),
+        });
+        self.save_emails();
+    }
+
     /// Register every dispatch root in the ui_context (idempotent, runs each frame).
     /// The id-rooted router (`propagate_event(event, WidgetId)`) resolves roots through
     /// the registry; email assembles its frame by hand and never goes through
@@ -1289,6 +1513,10 @@ impl ClearEmailApp {
         let (id, ptr) = (self.detail_body.id(), self.detail_body.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.compose_to.id(), self.compose_to.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.compose_cc.id(), self.compose_cc.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.compose_bcc.id(), self.compose_bcc.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.compose_subject.id(), self.compose_subject.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
@@ -1303,6 +1531,8 @@ impl ClearEmailApp {
         let (id, ptr) = (self.btn_compose_send.id(), self.btn_compose_send.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_compose_cancel.id(), self.btn_compose_cancel.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.btn_compose_attach.id(), self.btn_compose_attach.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_reply.id(), self.btn_reply.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
@@ -1437,6 +1667,7 @@ impl ClearEmailApp {
             let current_folder_str = match self.current_folder {
                 Folder::Inbox => "inbox",
                 Folder::Sent => "sent",
+                Folder::Drafts => "drafts",
                 Folder::Trash => "trash",
                 _ => "inbox",
             };
@@ -1581,8 +1812,7 @@ impl ClearEmailApp {
 
         // 6. Compose Dialog Content
         if self.compose_open {
-            let modal_x = ((w_f32 - 500.0) / 2.0).max(0.0);
-            let modal_y = ((h_f32 - 420.0) / 2.0).max(0.0);
+            let (modal_x, modal_y) = compose_modal_origin(w_f32, h_f32);
 
             labels.push(TextLabel {
                 text: self.compose_title.clone(),
@@ -1593,8 +1823,29 @@ impl ClearEmailApp {
             });
 
             labels.push(TextLabel { text: "To:".to_string(), x: modal_x + 15.0, y: modal_y + 54.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-            labels.push(TextLabel { text: "Subject:".to_string(), x: modal_x + 15.0, y: modal_y + 94.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+            labels.push(TextLabel { text: "Cc:".to_string(), x: modal_x + 15.0, y: modal_y + 94.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+            labels.push(TextLabel { text: "Bcc:".to_string(), x: modal_x + 15.0, y: modal_y + 134.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+            labels.push(TextLabel { text: "Subject:".to_string(), x: modal_x + 15.0, y: modal_y + 174.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
 
+            // Attachment chips: name + "×", clickable to remove (hit-test in
+            // handle_mouse_input via the same compose_chip_rects).
+            for (path, (cx, cy, _cw, _ch)) in self
+                .compose_attachments
+                .iter()
+                .zip(compose_chip_rects(&self.compose_attachments, modal_x, modal_y))
+            {
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("attachment");
+                labels.push(TextLabel {
+                    text: format!("{} \u{00d7}", ellipsize(name, 22)),
+                    x: cx + 8.0,
+                    y: cy + 6.0,
+                    font_size: 10.0,
+                    color: [0xc8, 0xc8, 0xd2],
+                });
+            }
         }
 
         // Emit accumulated static labels as text prims.
@@ -1639,7 +1890,7 @@ impl Application for ClearEmailApp {
             .with_right_aligned_title(true)
             .with_item("Mail", &["New Message", "Sync Now", "Quit"])
             .with_item("Message", &["Reply", "Delete", "Mark Read/Unread"])
-            .with_context_options(vec!["Inbox".to_string(), "Sent".to_string(), "Trash".to_string()], 0);
+            .with_context_options(vec!["Inbox".to_string(), "Sent".to_string(), "Drafts".to_string(), "Trash".to_string()], 0);
 
         let btn_accounts = Button::new(0.0, 5.0, 90.0, 26.0).with_label("Accounts");
 
@@ -1669,6 +1920,10 @@ impl Application for ClearEmailApp {
 
         let mut compose_to = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
         compose_to.font_size = 12.0;
+        let mut compose_cc = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
+        compose_cc.font_size = 12.0;
+        let mut compose_bcc = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
+        compose_bcc.font_size = 12.0;
         let mut compose_subject = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
         compose_subject.font_size = 12.0;
         let mut compose_body = TextBox::new(String::new()).with_multiline(true).with_line_wrap(true).with_draw_bg_border(true);
@@ -1677,6 +1932,7 @@ impl Application for ClearEmailApp {
 
         let btn_compose_send = Button::new(0.0, 0.0, 75.0, 28.0).with_label("Send");
         let btn_compose_cancel = Button::new_reset(0.0, 0.0, 75.0, 28.0).with_label("Cancel");
+        let btn_compose_attach = Button::new(0.0, 0.0, 80.0, 28.0).with_label("Attach...");
 
         // A mailto: argv (this is the x-scheme-handler/mailto handler) opens
         // the compose dialog prefilled. Both text and edit_buffer are set,
@@ -1688,6 +1944,10 @@ impl Application for ClearEmailApp {
             Some(m) => {
                 compose_to.text = m.to.clone();
                 compose_to.edit_buffer = m.to.clone();
+                compose_cc.text = m.cc.clone();
+                compose_cc.edit_buffer = m.cc.clone();
+                compose_bcc.text = m.bcc.clone();
+                compose_bcc.edit_buffer = m.bcc.clone();
                 compose_subject.text = m.subject.clone();
                 compose_subject.edit_buffer = m.subject.clone();
                 compose_body.text = m.body.clone();
@@ -1725,10 +1985,14 @@ impl Application for ClearEmailApp {
             btn_unread,
             detail_body,
             compose_to,
+            compose_cc,
+            compose_bcc,
             compose_subject,
             compose_body,
+            compose_attachments: Vec::new(),
             btn_compose_send,
             btn_compose_cancel,
+            btn_compose_attach,
             accounts,
             selected_account_idx,
             btn_manage_accounts,
@@ -1806,6 +2070,31 @@ impl Application for ClearEmailApp {
                 self.needs_rebuild = true;
             }
             AppMessage::SelectEmail(id) => {
+                // A draft doesn't open in the read pane — it resumes in the
+                // compose dialog and leaves the folder (Cancel re-files it,
+                // Send delivers it, a send failure re-files it too).
+                if let Some(pos) = self.emails.iter().position(|e| e.id == id && e.folder == "drafts") {
+                    let draft = self.emails.remove(pos);
+                    self.save_emails();
+                    self.clear_compose();
+                    for (tb, v) in [
+                        (&mut self.compose_to, &draft.to),
+                        (&mut self.compose_cc, &draft.cc),
+                        (&mut self.compose_bcc, &draft.bcc),
+                        (&mut self.compose_subject, &draft.subject),
+                        (&mut self.compose_body, &draft.body),
+                    ] {
+                        tb.text = v.clone();
+                        tb.edit_buffer = v.clone();
+                    }
+                    self.compose_attachments = draft.attachments;
+                    self.compose_title = "Draft".to_string();
+                    self.compose_open = true;
+                    self.selected_email_id = None;
+                    *needs_rebuild = true;
+                    self.needs_rebuild = true;
+                    return;
+                }
                 self.selected_email_id = Some(id);
                 self.body_scroll = 0.0;
                 let mut push_seen_uid = None;
@@ -1834,49 +2123,50 @@ impl Application for ClearEmailApp {
                 self.needs_rebuild = true;
             }
             AppMessage::ComposeNew => {
-                self.compose_to.text = String::new();
-                self.compose_to.edit_buffer = String::new();
-                self.compose_subject.text = String::new();
-                self.compose_subject.edit_buffer = String::new();
-                self.compose_body.text = String::new();
-                self.compose_body.edit_buffer = String::new();
+                self.clear_compose();
                 self.compose_title = "New Message".to_string();
                 self.compose_open = true;
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
             AppMessage::ComposeCancel => {
+                // Cancel is "put it down", not "throw it away": any content
+                // goes to Drafts, where clicking it resumes the compose.
+                let mail = self.gather_compose();
+                if !mail.to.is_empty()
+                    || !mail.cc.is_empty()
+                    || !mail.bcc.is_empty()
+                    || !mail.subject.is_empty()
+                    || !mail.body.is_empty()
+                    || !mail.attachments.is_empty()
+                {
+                    self.file_as_draft(&mail);
+                    self.status_message = Some(("Saved to Drafts".to_string(), 3.0));
+                }
+                self.clear_compose();
                 self.compose_open = false;
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
+            AppMessage::ComposeAttach => {
+                // rfd blocks this thread until the chooser closes — the same
+                // trade cce-data-editor and cce-preview already make.
+                if let Some(path) = cce_ui::file_dialog::pick_file("Attach File", &[]) {
+                    self.compose_attachments.push(path.to_string_lossy().into_owned());
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
             AppMessage::ComposeSend => {
-                let to = if self.compose_to.editing { &self.compose_to.edit_buffer } else { &self.compose_to.text }.trim().to_string();
-                let subject = if self.compose_subject.editing { &self.compose_subject.edit_buffer } else { &self.compose_subject.text }.trim().to_string();
-                let body = if self.compose_body.editing { &self.compose_body.edit_buffer } else { &self.compose_body.text }.to_string();
-
-                if !to.is_empty() {
+                let mail = self.gather_compose();
+                if !mail.to.is_empty() || !mail.cc.is_empty() || !mail.bcc.is_empty() {
                     let active_acc = self.accounts[self.selected_account_idx].clone();
-                    let sender_email = active_acc.email.clone();
-                    
-                    // Trigger asynchronous SMTP send in background
-                    send_smtp(active_acc, to.clone(), subject.clone(), body.clone(), self.sender.clone());
-
-                    // Save email in sent folder locally
-                    let new_id = self.emails.iter().map(|e| e.id).max().unwrap_or(0) + 1;
-                    let new_email = Email {
-                        id: new_id,
-                        from: sender_email,
-                        to: to.clone(),
-                        subject: if subject.is_empty() { "(No Subject)".to_string() } else { subject },
-                        body,
-                        date: "Just now".to_string(),
-                        read: true,
-                        folder: "sent".to_string(),
-                        uid: None,
-                    };
-                    self.emails.push(new_email);
-                    self.save_emails();
+                    // The outcome comes back as SendResult: Sent on success,
+                    // Drafts on failure. Nothing is recorded optimistically —
+                    // the old flow filed a Sent copy before SMTP even ran, so
+                    // a failed send looked exactly like a delivered one.
+                    send_smtp(active_acc, mail, self.sender.clone());
+                    self.clear_compose();
                     self.compose_open = false;
                 } else {
                     self.status_message = Some(("Recipient is required".to_string(), 4.0));
@@ -1884,9 +2174,58 @@ impl Application for ClearEmailApp {
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
+            AppMessage::SendResult(mail, outcome) => {
+                let new_id = self.emails.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+                let from = self
+                    .accounts
+                    .get(self.selected_account_idx)
+                    .map(|a| a.email.clone())
+                    .unwrap_or_default();
+                match outcome {
+                    None => {
+                        self.emails.push(Email {
+                            id: new_id,
+                            from,
+                            to: mail.to,
+                            subject: if mail.subject.is_empty() { "(No Subject)".to_string() } else { mail.subject },
+                            body: mail.body,
+                            date: "Just now".to_string(),
+                            read: true,
+                            folder: "sent".to_string(),
+                            uid: None,
+                            cc: mail.cc,
+                            // A sent copy records who was bcc'd nowhere; the
+                            // attachment paths shrink to names for display.
+                            bcc: String::new(),
+                            attachments: mail
+                                .attachments
+                                .iter()
+                                .map(|p| {
+                                    std::path::Path::new(p)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("attachment")
+                                        .to_string()
+                                })
+                                .collect(),
+                        });
+                        self.save_emails();
+                        self.status_message = Some(("Email Sent Successfully".to_string(), 4.0));
+                    }
+                    Some(err) => {
+                        self.file_as_draft(&mail);
+                        self.status_message = Some((format!("Send failed — saved to Drafts: {}", err), 6.0));
+                    }
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
             AppMessage::Reply => {
                 if let Some(id) = self.selected_email_id {
-                    if let Some(email) = self.emails.iter().find(|e| e.id == id) {
+                    if let Some(email) = self.emails.iter().find(|e| e.id == id).cloned() {
+                        // Start from a clean slate: a Cc/Bcc/attachment left
+                        // over from an earlier compose must not ride along.
+                        self.clear_compose();
                         self.compose_to.text = email.from.clone();
                         self.compose_to.edit_buffer = email.from.clone();
                         self.compose_subject.text = if email.subject.starts_with("Re:") {
@@ -2098,6 +2437,7 @@ impl Application for ClearEmailApp {
         let current_folder_str = match self.current_folder {
             Folder::Inbox => "inbox",
             Folder::Sent => "sent",
+            Folder::Drafts => "drafts",
             Folder::Trash => "trash",
             Folder::Accounts => "accounts",
         };
@@ -2124,13 +2464,15 @@ impl Application for ClearEmailApp {
                 Folder::Inbox if inbox_unread > 0 => format!("Inbox ({})", inbox_unread),
                 Folder::Inbox => "Inbox".to_string(),
                 Folder::Sent => "Sent".to_string(),
+                Folder::Drafts => "Drafts".to_string(),
                 Folder::Trash => "Trash".to_string(),
                 Folder::Accounts => "Accounts".to_string(),
             };
             if let Some(ci) = match self.current_folder {
                 Folder::Inbox => Some(0),
                 Folder::Sent => Some(1),
-                Folder::Trash => Some(2),
+                Folder::Drafts => Some(2),
+                Folder::Trash => Some(3),
                 Folder::Accounts => None,
             } {
                 self.menubar.set_context_selected(ci);
@@ -2255,15 +2597,17 @@ impl Application for ClearEmailApp {
 
             // Compose inputs layout
             if self.compose_open {
-                let modal_x = ((w_f32 - 500.0) / 2.0).max(0.0);
-                let modal_y = ((h_f32 - 420.0) / 2.0).max(0.0);
+                let (modal_x, modal_y) = compose_modal_origin(w_f32, h_f32);
 
                 self.compose_to.set_rect(modal_x + 80.0, modal_y + 50.0, 400.0, 26.0);
-                self.compose_subject.set_rect(modal_x + 80.0, modal_y + 90.0, 400.0, 26.0);
-                self.compose_body.set_rect(modal_x + 15.0, modal_y + 130.0, 470.0, 230.0);
+                self.compose_cc.set_rect(modal_x + 80.0, modal_y + 90.0, 400.0, 26.0);
+                self.compose_bcc.set_rect(modal_x + 80.0, modal_y + 130.0, 400.0, 26.0);
+                self.compose_subject.set_rect(modal_x + 80.0, modal_y + 170.0, 400.0, 26.0);
+                self.compose_body.set_rect(modal_x + 15.0, modal_y + 210.0, 470.0, 195.0);
 
-                self.btn_compose_send.set_rect(modal_x + 320.0, modal_y + 375.0, 75.0, 28.0);
-                self.btn_compose_cancel.set_rect(modal_x + 410.0, modal_y + 375.0, 75.0, 28.0);
+                self.btn_compose_attach.set_rect(modal_x + 15.0, modal_y + 452.0, 80.0, 28.0);
+                self.btn_compose_send.set_rect(modal_x + 320.0, modal_y + 452.0, 75.0, 28.0);
+                self.btn_compose_cancel.set_rect(modal_x + 410.0, modal_y + 452.0, 75.0, 28.0);
             }
 
 
@@ -2422,27 +2766,41 @@ impl Application for ClearEmailApp {
 
         // 5. Compose Dialog Overlay
         if self.compose_open {
-            let modal_x = ((w_f32 - 500.0) / 2.0).max(0.0);
-            let modal_y = ((h_f32 - 420.0) / 2.0).max(0.0);
+            let (modal_x, modal_y) = compose_modal_origin(w_f32, h_f32);
 
             // Semitransparent modal backdrop
             quads.push((0.0, 0.0, w_f32, h_f32, [0.0, 0.0, 0.0, 0.6]));
 
             // Modal dialog container
-            quads.push((modal_x, modal_y, 500.0, 420.0, [0.08, 0.08, 0.12, 1.0]));
-            quads.push((modal_x, modal_y, 500.0, 1.0, [0.25, 0.35, 0.50, 0.40]));
-            quads.push((modal_x, modal_y + 419.0, 500.0, 1.0, [0.25, 0.35, 0.50, 0.40]));
-            quads.push((modal_x, modal_y, 1.0, 420.0, [0.25, 0.35, 0.50, 0.40]));
-            quads.push((modal_x + 499.0, modal_y, 1.0, 420.0, [0.25, 0.35, 0.50, 0.40]));
+            quads.push((modal_x, modal_y, COMPOSE_W, COMPOSE_H, [0.08, 0.08, 0.12, 1.0]));
+            quads.push((modal_x, modal_y, COMPOSE_W, 1.0, [0.25, 0.35, 0.50, 0.40]));
+            quads.push((modal_x, modal_y + COMPOSE_H - 1.0, COMPOSE_W, 1.0, [0.25, 0.35, 0.50, 0.40]));
+            quads.push((modal_x, modal_y, 1.0, COMPOSE_H, [0.25, 0.35, 0.50, 0.40]));
+            quads.push((modal_x + COMPOSE_W - 1.0, modal_y, 1.0, COMPOSE_H, [0.25, 0.35, 0.50, 0.40]));
+
+            // Attachment chips: quads here, labels in the labels pass — both
+            // laid out by compose_chip_rects.
+            for (cx, cy, cw, ch) in compose_chip_rects(&self.compose_attachments, modal_x, modal_y) {
+                quads.push((cx, cy, cw, ch, [0.14, 0.14, 0.20, 1.0]));
+                quads.push((cx, cy, cw, 1.0, [0.25, 0.35, 0.50, 0.40]));
+                quads.push((cx, cy + ch - 1.0, cw, 1.0, [0.25, 0.35, 0.50, 0.40]));
+                quads.push((cx, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
+                quads.push((cx + cw - 1.0, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
+            }
 
             self.compose_to.prepare_text(&mut self.font_system);
+            self.compose_cc.prepare_text(&mut self.font_system);
+            self.compose_bcc.prepare_text(&mut self.font_system);
             self.compose_subject.prepare_text(&mut self.font_system);
             self.compose_body.prepare_text(&mut self.font_system);
             cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_to, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_cc, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_bcc, &mut *quads.pc);
             cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_subject, &mut *quads.pc);
             cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_body, &mut *quads.pc);
             cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose_send, &mut *quads.pc);
             cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose_cancel, &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose_attach, &mut *quads.pc);
         }
 
 
@@ -2506,10 +2864,13 @@ impl Application for ClearEmailApp {
 
         if self.compose_open {
             if ctx.propagate_event(&mv, self.compose_to.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.compose_cc.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.compose_bcc.id()) { changed = true; }
             if ctx.propagate_event(&mv, self.compose_subject.id()) { changed = true; }
             if ctx.propagate_event(&mv, self.compose_body.id()) { changed = true; }
             if ctx.propagate_event(&mv, self.btn_compose_send.id()) { changed = true; }
             if ctx.propagate_event(&mv, self.btn_compose_cancel.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.btn_compose_attach.id()) { changed = true; }
         } else {
             // Sidebar buttons
             if ctx.propagate_event(&mv, self.btn_compose.id()) { changed = true; }
@@ -2599,6 +2960,7 @@ impl Application for ClearEmailApp {
                 msg_out = Some(AppMessage::SwitchFolder(match idx {
                     0 => Folder::Inbox,
                     1 => Folder::Sent,
+                    2 => Folder::Drafts,
                     _ => Folder::Trash,
                 }));
             } else if let Some((menu_idx, item_idx)) = self.menubar.menu_click() {
@@ -2622,6 +2984,14 @@ impl Application for ClearEmailApp {
                 changed = true;
                 if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_to); }
             }
+            if ctx.propagate_event(&ev, self.compose_cc.id()) {
+                changed = true;
+                if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_cc); }
+            }
+            if ctx.propagate_event(&ev, self.compose_bcc.id()) {
+                changed = true;
+                if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_bcc); }
+            }
             if ctx.propagate_event(&ev, self.compose_subject.id()) {
                 changed = true;
                 if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_subject); }
@@ -2643,17 +3013,37 @@ impl Application for ClearEmailApp {
                     msg_out = Some(AppMessage::ComposeCancel);
                 }
             }
+            if ctx.propagate_event(&ev, self.btn_compose_attach.id()) {
+                changed = true;
+                if state == ElementState::Released && self.btn_compose_attach.take_click() {
+                    msg_out = Some(AppMessage::ComposeAttach);
+                }
+            }
+
+            // Attachment chips are painted, not widgets: hit-test against the
+            // same rects the paint pass used and remove the clicked one.
+            if !changed && state == ElementState::Pressed && button == MouseButton::Left {
+                let (modal_x, modal_y) = compose_modal_origin(self.width as f32, self.height as f32);
+                let hit = compose_chip_rects(&self.compose_attachments, modal_x, modal_y)
+                    .iter()
+                    .position(|&(cx, cy, cw, ch)| px >= cx && px <= cx + cw && py >= cy && py <= cy + ch);
+                if let Some(i) = hit {
+                    self.compose_attachments.remove(i);
+                    changed = true;
+                }
+            }
 
             // Click outside the modal clears focus or behaves neutrally
             if !changed && state == ElementState::Pressed && button == MouseButton::Left {
                 let w_f32 = self.width as f32;
                 let h_f32 = self.height as f32;
-                let modal_x = ((w_f32 - 500.0) / 2.0).max(0.0);
-                let modal_y = ((h_f32 - 420.0) / 2.0).max(0.0);
+                let (modal_x, modal_y) = compose_modal_origin(w_f32, h_f32);
 
-                if px < modal_x || px > modal_x + 500.0 || py < modal_y || py > modal_y + 420.0 {
+                if px < modal_x || px > modal_x + COMPOSE_W || py < modal_y || py > modal_y + COMPOSE_H {
                     ctx.clear_focus();
                     self.compose_to.unfocus();
+                    self.compose_cc.unfocus();
+                    self.compose_bcc.unfocus();
                     self.compose_subject.unfocus();
                     self.compose_body.unfocus();
                     changed = true;
@@ -2726,11 +3116,16 @@ impl Application for ClearEmailApp {
                     }
                 }
             } else {
+                // Mirrors the paint pass's folder filter — this decides which
+                // email a row click lands on. No wildcard: a new folder
+                // absorbed into "inbox" here routes clicks to the wrong list
+                // (Drafts was, briefly).
                 let current_folder_str = match self.current_folder {
                     Folder::Inbox => "inbox",
                     Folder::Sent => "sent",
+                    Folder::Drafts => "drafts",
                     Folder::Trash => "trash",
-                    _ => "inbox",
+                    Folder::Accounts => "accounts",
                 };
                 let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
                 let search_lower = search_text.to_lowercase();
@@ -2845,6 +3240,10 @@ impl Application for ClearEmailApp {
         if self.compose_open {
             if self.compose_to.editing {
                 if ctx.propagate_event(&kev, self.compose_to.id()) { handled = true; }
+            } else if self.compose_cc.editing {
+                if ctx.propagate_event(&kev, self.compose_cc.id()) { handled = true; }
+            } else if self.compose_bcc.editing {
+                if ctx.propagate_event(&kev, self.compose_bcc.id()) { handled = true; }
             } else if self.compose_subject.editing {
                 if ctx.propagate_event(&kev, self.compose_subject.id()) { handled = true; }
             } else if self.compose_body.editing {
@@ -2954,14 +3353,83 @@ mod tests {
     #[test]
     fn mailto_full_query() {
         // %20 decodes; '+' stays literal (mailto is not form encoding);
-        // header names are case-insensitive; cc/bcc fold into To.
+        // header names are case-insensitive; cc/bcc keep their own fields.
         let m = parse_mailto(
             "mailto:a@x.org,b@y.org?Subject=Hello%20W%C3%B6rld&body=line1%0Aline2+plus&cc=c@z.org&BCC=d@w.org&to=e@v.org",
         )
         .unwrap();
-        assert_eq!(m.to, "a@x.org, b@y.org, c@z.org, d@w.org, e@v.org");
+        assert_eq!(m.to, "a@x.org, b@y.org, e@v.org");
+        assert_eq!(m.cc, "c@z.org");
+        assert_eq!(m.bcc, "d@w.org");
         assert_eq!(m.subject, "Hello Wörld");
         assert_eq!(m.body, "line1\nline2+plus");
+    }
+
+    fn outgoing(to: &str, cc: &str, bcc: &str, attachments: Vec<String>) -> OutgoingMail {
+        OutgoingMail {
+            to: to.to_string(),
+            cc: cc.to_string(),
+            bcc: bcc.to_string(),
+            subject: "S".to_string(),
+            body: "B".to_string(),
+            attachments,
+        }
+    }
+
+    #[test]
+    fn outgoing_bcc_delivers_without_a_header() {
+        let msg = build_outgoing(
+            "me@example.org",
+            &outgoing("a@x.org, b@y.org", "c@z.org", "hidden@w.org", vec![]),
+        )
+        .unwrap();
+
+        // Envelope (actual delivery) covers To + Cc + Bcc…
+        let rcpts: Vec<String> = msg.envelope().to().iter().map(|a| a.to_string()).collect();
+        assert!(rcpts.contains(&"a@x.org".to_string()));
+        assert!(rcpts.contains(&"b@y.org".to_string()));
+        assert!(rcpts.contains(&"c@z.org".to_string()));
+        assert!(rcpts.contains(&"hidden@w.org".to_string()));
+
+        // …but the transmitted bytes never name the bcc recipient.
+        let formatted = String::from_utf8_lossy(&msg.formatted()).into_owned();
+        assert!(formatted.contains("To: a@x.org, b@y.org"), "{formatted}");
+        assert!(formatted.contains("Cc: c@z.org"), "{formatted}");
+        assert!(!formatted.contains("hidden@w.org"), "bcc leaked into headers: {formatted}");
+    }
+
+    #[test]
+    fn outgoing_rejects_empty_and_bad_addresses() {
+        assert!(build_outgoing("me@example.org", &outgoing("", "", "", vec![])).is_err());
+        assert!(build_outgoing("me@example.org", &outgoing("not-an-address", "", "", vec![])).is_err());
+        // Bcc-only is a legitimate message.
+        assert!(build_outgoing("me@example.org", &outgoing("", "", "b@y.org", vec![])).is_ok());
+    }
+
+    #[test]
+    fn outgoing_attachment_builds_multipart() {
+        let dir = std::env::temp_dir().join("cce-mail-attach-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("note.txt");
+        std::fs::write(&p, "hello attachment").unwrap();
+
+        let msg = build_outgoing(
+            "me@example.org",
+            &outgoing("a@x.org", "", "", vec![p.to_string_lossy().into_owned()]),
+        )
+        .unwrap();
+        let formatted = String::from_utf8_lossy(&msg.formatted()).into_owned();
+        assert!(formatted.contains("multipart/mixed"), "{formatted}");
+        assert!(formatted.contains("note.txt"), "{formatted}");
+
+        // Unreadable path = build error = the send fails into Drafts rather
+        // than silently mailing without the file.
+        assert!(build_outgoing(
+            "me@example.org",
+            &outgoing("a@x.org", "", "", vec!["/nonexistent/gone.pdf".to_string()]),
+        )
+        .is_err());
+        std::fs::remove_file(&p).unwrap();
     }
 
     #[test]
