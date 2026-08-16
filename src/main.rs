@@ -85,7 +85,7 @@ enum AppMessage {
 }
 
 /// App shortcuts, resolved once at startup from input.kdl
-/// (`cce-email` domain → `cce-ui` domain), defaulting to the historical keys.
+/// (`cce-mail` domain → `cce-ui` domain), defaulting to the historical keys.
 struct EmailKeys {
     compose: String,
     open_search: String,
@@ -210,6 +210,13 @@ fn load_accounts() -> Vec<AccountInfo> {
     ]
 }
 
+/// Secret Service entries are keyed by (service, address). The app was renamed
+/// from `cce-email`, so entries created before the rename still live under the
+/// old service name; `resolve_account_secrets` adopts them on first run.
+/// cce-system-interface writes the same pair when it saves an account.
+const KEYRING_SERVICE: &str = "cce-mail";
+const KEYRING_SERVICE_LEGACY: &str = "cce-email";
+
 /// Resolve account passwords through the Secret Service (KeePassXC here).
 /// An empty on-disk password field is filled from the keyring; a plaintext
 /// one is migrated INTO the keyring (returns true so the caller rewrites the
@@ -223,13 +230,26 @@ fn resolve_account_secrets(accounts: &mut [AccountInfo]) -> bool {
         if is_mock_account(acc) {
             continue;
         }
-        let Ok(entry) = keyring::Entry::new("cce-email", &acc.email) else {
+        let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &acc.email) else {
             continue;
         };
         if acc.password.is_empty() {
             if let Ok(p) = entry.get_password() {
                 acc.password = p;
                 acc.keyring_backed = true;
+            } else if let Some(p) = legacy_keyring_password(&acc.email) {
+                // Pre-rename entry. Copy it forward FIRST and drop the old one
+                // only once the new one holds it: deleting first would destroy
+                // the sole copy whenever the write failed, and `keyring_backed`
+                // would then blank the on-disk field on top of that. A failed
+                // write just leaves the legacy entry for the next start.
+                acc.password = p.clone();
+                if entry.set_password(&p).is_ok() {
+                    acc.keyring_backed = true;
+                    if let Ok(legacy) = keyring::Entry::new(KEYRING_SERVICE_LEGACY, &acc.email) {
+                        let _ = legacy.delete_credential();
+                    }
+                }
             }
         } else if entry.set_password(&acc.password).is_ok() {
             acc.keyring_backed = true;
@@ -237,6 +257,16 @@ fn resolve_account_secrets(accounts: &mut [AccountInfo]) -> bool {
         }
     }
     migrated
+}
+
+/// This address's password as left by the pre-rename `cce-email` service.
+/// None when there is nothing to adopt — including when the keyring is locked,
+/// in which case the entry is simply picked up on a later start.
+fn legacy_keyring_password(email: &str) -> Option<String> {
+    keyring::Entry::new(KEYRING_SERVICE_LEGACY, email)
+        .ok()?
+        .get_password()
+        .ok()
 }
 
 fn save_accounts(accounts: &[AccountInfo]) {
@@ -271,7 +301,7 @@ fn save_accounts(accounts: &[AccountInfo]) {
 /// to (and on-start syncs) the account the user actually reads. Deliberately
 /// not in accounts.json — that file is owned by cce-system-interface.
 fn selected_account_path() -> std::path::PathBuf {
-    cce_ui::config::cce_config_dir().join("cce-email-account.txt")
+    cce_ui::config::cce_config_dir().join("cce-mail-account.txt")
 }
 
 fn load_selected_account_email() -> Option<String> {
@@ -1148,8 +1178,8 @@ fn get_default_mock_emails() -> Vec<Email> {
             id: 3,
             from: "Codeberg CI <ci@codeberg.org>".to_string(),
             to: "lsgalante@cce-ui.org".to_string(),
-            subject: "Build Success: cce-email (main)".to_string(),
-            body: "Repository: lsgalante/cce-email\nBranch: main\nCommit: da8cf20fcb2c993c1c048ced4020\nStatus: SUCCESS\n\nAll unit tests passed. Binary compiled in 48.2s.\n\n---\nCodeberg Actions".to_string(),
+            subject: "Build Success: cce-mail (main)".to_string(),
+            body: "Repository: lsgalante/cce-mail\nBranch: main\nCommit: da8cf20fcb2c993c1c048ced4020\nStatus: SUCCESS\n\nAll unit tests passed. Binary compiled in 48.2s.\n\n---\nCodeberg Actions".to_string(),
             date: "June 3".to_string(),
             read: true,
             folder: "inbox".to_string(),
@@ -1628,8 +1658,8 @@ impl Application for ClearEmailApp {
 
     fn settings(&self) -> WindowSettings {
         WindowSettings {
-            title: "Clear Email Client".to_string(),
-            app_id: "cce-email".to_string(),
+            title: "Mail".to_string(),
+            app_id: "cce-mail".to_string(),
             width: 1000,
             height: 600,
             fullscreen: false,
@@ -2730,7 +2760,7 @@ impl Application for ClearEmailApp {
                 handled = true;
             }
         } else {
-            // General keyboard shortcuts (input.kdl `cce-email` domain)
+            // General keyboard shortcuts (input.kdl `cce-mail` domain)
             if event.state == ElementState::Pressed {
                 if cce_ui::widget::match_key_shortcut(event, &self.keys.compose) {
                     msg_out = Some(AppMessage::ComposeNew);

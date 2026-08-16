@@ -9,7 +9,7 @@ build:
 # helpers uninstalled for weeks.
 install: build
 	@command -v ccebuild >/dev/null || { echo "ccebuild not installed — run: make -C ../cce-compositor install"; exit 1; }
-	ccebuild install --no-build cce-email
+	ccebuild install --no-build cce-mail
 
 run:
 	cargo run

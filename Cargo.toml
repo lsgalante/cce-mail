@@ -1,5 +1,5 @@
 [package]
-name = "cce-email"
+name = "cce-mail"
 version = "0.1.0"
 edition = "2021"
 
