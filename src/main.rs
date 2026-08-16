@@ -560,6 +560,79 @@ fn strip_html(html: &str) -> String {
     collapsed
 }
 
+/// What a `mailto:` argv prefills into the compose dialog.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct MailtoPrefill {
+    to: String,
+    subject: String,
+    body: String,
+}
+
+/// RFC 6068 percent-decoding. Unlike form encoding, `+` is a literal plus in
+/// a mailto URL — spaces arrive as `%20` — so only `%XX` sequences decode.
+/// Decoding happens on bytes and re-validates as UTF-8, since an encoded
+/// subject/body may hold multi-byte sequences split across several `%XX`.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            // get() covers a trailing "%" or "%X"; a non-hex pair falls
+            // through and the '%' stays literal, matching lenient browsers.
+            let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok());
+            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse a `mailto:` URL (RFC 6068) into compose-dialog prefills.
+///
+/// Recipients come from the path *and* any `to` query key; `cc`/`bcc` are
+/// folded into the To line as well — the dialog has a single recipient field,
+/// and merging delivers to everyone where dropping would silently lose them
+/// (the merged line is visible in the dialog before anything is sent).
+/// Header names are case-insensitive; unknown ones are ignored per spec.
+fn parse_mailto(arg: &str) -> Option<MailtoPrefill> {
+    let rest = arg.strip_prefix("mailto:").or_else(|| arg.strip_prefix("MAILTO:"))?;
+    let (path, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    let mut recipients: Vec<String> = path
+        .split(',')
+        .map(percent_decode)
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect();
+    let mut prefill = MailtoPrefill::default();
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            match k.to_ascii_lowercase().as_str() {
+                "to" | "cc" | "bcc" => recipients.extend(
+                    percent_decode(v)
+                        .split(',')
+                        .map(|a| a.trim().to_string())
+                        .filter(|a| !a.is_empty()),
+                ),
+                "subject" => prefill.subject = percent_decode(v),
+                "body" => prefill.body = percent_decode(v),
+                _ => {}
+            }
+        }
+    }
+    prefill.to = recipients.join(", ");
+    Some(prefill)
+}
+
 const GOOGLE_CLIENT_ID: &str = "946029775684-m4u4mme60a6a0qj3p5m5jvea8d2987o9.apps.googleusercontent.com";
 const GOOGLE_CLIENT_SECRET: &str = "GOCSPX-dummysecret";
 
@@ -1101,21 +1174,26 @@ fn send_smtp(mut account: AccountInfo, to: String, subject: String, body: String
 
         let _ = sender.send(AppMessage::Status("Sending SMTP mail...".to_string()));
 
-        let email = match Message::builder()
-            .from(match account.email.parse() {
-                Ok(f) => f,
-                Err(e) => {
-                    let _ = sender.send(AppMessage::Status(format!("Invalid From Address: {}", e)));
-                    return;
-                }
-            })
-            .to(match to.parse() {
+        let mut builder = Message::builder().from(match account.email.parse() {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = sender.send(AppMessage::Status(format!("Invalid From Address: {}", e)));
+                return;
+            }
+        });
+        // The To line may hold several comma-separated addresses (a
+        // multi-recipient mailto: prefills it that way); each gets its own
+        // .to(), since lettre's Mailbox parse takes exactly one address.
+        for addr in to.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+            builder = builder.to(match addr.parse() {
                 Ok(t) => t,
                 Err(e) => {
-                    let _ = sender.send(AppMessage::Status(format!("Invalid Recipient: {}", e)));
+                    let _ = sender.send(AppMessage::Status(format!("Invalid Recipient {}: {}", addr, e)));
                     return;
                 }
-            })
+            });
+        }
+        let email = match builder
             .subject(subject)
             .body(body) {
                 Ok(m) => m,
@@ -1600,6 +1678,25 @@ impl Application for ClearEmailApp {
         let btn_compose_send = Button::new(0.0, 0.0, 75.0, 28.0).with_label("Send");
         let btn_compose_cancel = Button::new_reset(0.0, 0.0, 75.0, 28.0).with_label("Cancel");
 
+        // A mailto: argv (this is the x-scheme-handler/mailto handler) opens
+        // the compose dialog prefilled. Both text and edit_buffer are set,
+        // same as ComposeNew/Reply: ComposeSend reads whichever side the
+        // editing flag selects, so a box left untouched must agree with one
+        // the user clicked into.
+        let mailto = std::env::args().nth(1).and_then(|a| parse_mailto(&a));
+        let (compose_open, compose_title) = match &mailto {
+            Some(m) => {
+                compose_to.text = m.to.clone();
+                compose_to.edit_buffer = m.to.clone();
+                compose_subject.text = m.subject.clone();
+                compose_subject.edit_buffer = m.subject.clone();
+                compose_body.text = m.body.clone();
+                compose_body.edit_buffer = m.body.clone();
+                (true, "New Message".to_string())
+            }
+            None => (false, String::new()),
+        };
+
 
         let emails = if let Some(acc) = accounts.get(selected_account_idx) {
             load_emails_for_account(&acc.email)
@@ -1643,8 +1740,8 @@ impl Application for ClearEmailApp {
             detail_hovered: false,
             body_sb_dragging: false,
             body_sb_drag_offset: 0.0,
-            compose_open: false,
-            compose_title: String::new(),
+            compose_open,
+            compose_title,
             status_message: None,
             sender: _sender.clone(),
             width: 1000,
@@ -2845,6 +2942,36 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mailto_bare_address() {
+        let m = parse_mailto("mailto:a@example.com").unwrap();
+        assert_eq!(m.to, "a@example.com");
+        assert_eq!(m.subject, "");
+        assert_eq!(m.body, "");
+    }
+
+    #[test]
+    fn mailto_full_query() {
+        // %20 decodes; '+' stays literal (mailto is not form encoding);
+        // header names are case-insensitive; cc/bcc fold into To.
+        let m = parse_mailto(
+            "mailto:a@x.org,b@y.org?Subject=Hello%20W%C3%B6rld&body=line1%0Aline2+plus&cc=c@z.org&BCC=d@w.org&to=e@v.org",
+        )
+        .unwrap();
+        assert_eq!(m.to, "a@x.org, b@y.org, c@z.org, d@w.org, e@v.org");
+        assert_eq!(m.subject, "Hello Wörld");
+        assert_eq!(m.body, "line1\nline2+plus");
+    }
+
+    #[test]
+    fn mailto_rejects_non_mailto_and_keeps_bad_escapes() {
+        assert!(parse_mailto("https://example.com").is_none());
+        assert!(parse_mailto("a@example.com").is_none());
+        // Truncated/invalid %-escapes stay literal rather than erroring.
+        let m = parse_mailto("mailto:a@x.org?subject=100%25%2").unwrap();
+        assert_eq!(m.subject, "100%%2");
+    }
 
     fn parse(raw: &str) -> mail_parser::Message<'_> {
         mail_parser::MessageParser::default()

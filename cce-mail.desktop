@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Mail
+GenericName=Email Client
+Comment=Read and send email
+Exec=cce-mail %u
+Icon=cce-mail
+Terminal=false
+Categories=Network;Email;
+MimeType=x-scheme-handler/mailto;
+StartupNotify=true
+StartupWMClass=cce-mail
