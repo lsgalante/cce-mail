@@ -68,6 +68,11 @@ struct Email {
     /// file names, for display.
     #[serde(default)]
     attachments: Vec<String>,
+    /// Attachments discovered on the server (fetched mail only): metadata
+    /// from the BODYSTRUCTURE pass, enough to fetch the part on demand.
+    /// Locally-created mail leaves this empty.
+    #[serde(default)]
+    remote_attachments: Vec<RemoteAttachment>,
     /// Server-side IMAP UID (INBOX message); None for mock or locally-created
     /// mail. Server operations (delete) key on this, never on `id` — `id` is
     /// the fetch-time sequence number, which shifts after any expunge.
@@ -88,6 +93,11 @@ enum AppMessage {
     /// Outcome of a send: `None` = delivered (record in Sent); `Some(err)` =
     /// failed (save the content to Drafts and say why).
     SendResult(OutgoingMail, Option<String>),
+    /// A detail-pane attachment chip was clicked: fetch part `1` of the
+    /// email with id `0` from the server.
+    OpenAttachment(usize, usize),
+    /// Fetch outcome: Ok(saved path) — open it; Err(why) — status line.
+    AttachmentFetched(Result<String, String>),
     Reply,
     DeleteSelected,
     ToggleUnread,
@@ -408,6 +418,33 @@ fn compose_chip_rects(attachments: &[String], modal_x: f32, modal_y: f32) -> Vec
     rects
 }
 
+/// Chip label for a server attachment: name plus a humanized size.
+fn detail_chip_label(att: &RemoteAttachment) -> String {
+    let size = if att.size >= 1_048_576 {
+        format!("{:.1} MB", att.size as f32 / 1_048_576.0)
+    } else if att.size >= 1024 {
+        format!("{} KB", att.size / 1024)
+    } else {
+        format!("{} B", att.size)
+    };
+    format!("{} \u{00b7} {}", ellipsize(&att.name, 26), size)
+}
+
+/// Rects of the detail pane's attachment chips, one per server attachment,
+/// in the fixed header band between Date and the body (the body top never
+/// moves). Paint and hit-test both call this — the compose-chip convention.
+fn detail_chip_rects(atts: &[RemoteAttachment], detail_x: f32) -> Vec<(f32, f32, f32, f32)> {
+    let mut rects = Vec::with_capacity(atts.len());
+    let mut x = detail_x;
+    let y = 140.0 + MENUBAR_H;
+    for att in atts {
+        let w = detail_chip_label(att).chars().count() as f32 * 6.0 + 16.0;
+        rects.push((x, y, w, 22.0));
+        x += w + 8.0;
+    }
+    rects
+}
+
 const FETCH_COUNT: usize = 50;
 
 /// Byte cap on a fetched text part (pre-decode); the display model caps at
@@ -504,6 +541,111 @@ fn find_text_part(bs: &imap_proto::types::BodyStructure<'_>) -> Option<TextPartS
     let mut best = None;
     walk(bs, &mut Vec::new(), &mut best);
     best.map(|(_, spec)| spec)
+}
+
+/// One attachment as the server describes it: everything needed to list it
+/// in the detail pane and to fetch exactly that part on demand.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct RemoteAttachment {
+    name: String,
+    /// BODYSTRUCTURE part path (dotted section = section_str(&section)).
+    section: Vec<u32>,
+    /// Content-Transfer-Encoding, for the decode after the fetch.
+    encoding: String,
+    mime: String,
+    /// Transfer-encoded size in octets, as reported by the server.
+    size: u32,
+}
+
+/// DFS over a BODYSTRUCTURE for the parts that are attachments: anything
+/// with an `attachment` disposition, or any part carrying a filename (many
+/// senders attach with only a Content-Type `name` param). The filename falls
+/// back through disposition `filename` → type `name` → a synthesized
+/// `attachment.<subtype>`. Same path numbering as [`find_text_part`].
+fn find_attachment_parts(bs: &imap_proto::types::BodyStructure<'_>) -> Vec<RemoteAttachment> {
+    use imap_proto::types::BodyStructure as B;
+
+    fn param<'a>(params: &'a imap_proto::types::BodyParams<'_>, key: &str) -> Option<String> {
+        params.as_ref().and_then(|ps| {
+            ps.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.to_string())
+        })
+    }
+
+    fn single(
+        common: &imap_proto::types::BodyContentCommon<'_>,
+        other: &imap_proto::types::BodyContentSinglePart<'_>,
+        path: &[u32],
+        out: &mut Vec<RemoteAttachment>,
+    ) {
+        let disp_attachment = common
+            .disposition
+            .as_ref()
+            .is_some_and(|d| d.ty.eq_ignore_ascii_case("attachment"));
+        let filename = common
+            .disposition
+            .as_ref()
+            .and_then(|d| param(&d.params, "filename"))
+            .or_else(|| param(&common.ty.params, "name"));
+        if !disp_attachment && filename.is_none() {
+            return;
+        }
+        let mime = format!(
+            "{}/{}",
+            common.ty.ty.to_ascii_lowercase(),
+            common.ty.subtype.to_ascii_lowercase()
+        );
+        out.push(RemoteAttachment {
+            name: filename
+                .unwrap_or_else(|| format!("attachment.{}", common.ty.subtype.to_ascii_lowercase())),
+            section: if path.is_empty() { vec![1] } else { path.to_vec() },
+            encoding: encoding_str(&other.transfer_encoding),
+            mime,
+            size: other.octets,
+        });
+    }
+
+    fn walk(bs: &B<'_>, path: &mut Vec<u32>, out: &mut Vec<RemoteAttachment>) {
+        match bs {
+            B::Basic { common, other, .. }
+            | B::Text { common, other, .. }
+            | B::Message { common, other, .. } => single(common, other, path, out),
+            B::Multipart { bodies, .. } => {
+                for (i, b) in bodies.iter().enumerate() {
+                    path.push(i as u32 + 1);
+                    walk(b, path, out);
+                    path.pop();
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(bs, &mut Vec::new(), &mut out);
+    out
+}
+
+/// Decode fetched part bytes per their Content-Transfer-Encoding, by the
+/// same trick [`TextPartSpec::synthesize`] uses for bodies: wrap the raw
+/// bytes as a minimal single-part message and let mail-parser do the decode
+/// (it already handles base64/quoted-printable and their whitespace forms).
+/// Content-Type is forced to application/octet-stream so the part parses as
+/// an opaque attachment — the real MIME type only matters to the opener.
+fn decode_part_bytes(encoding: &str, bytes: &[u8]) -> Vec<u8> {
+    match encoding.to_ascii_lowercase().as_str() {
+        "7bit" | "8bit" | "binary" | "" => bytes.to_vec(),
+        enc => {
+            let mut raw = format!(
+                "MIME-Version: 1.0\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: {}\r\nContent-Disposition: attachment\r\n\r\n",
+                enc
+            )
+            .into_bytes();
+            raw.extend_from_slice(bytes);
+            mail_parser::MessageParser::default()
+                .parse(&raw)
+                .and_then(|m| m.attachments().next().map(|a| a.contents().to_vec()))
+                .unwrap_or_else(|| bytes.to_vec())
+        }
+    }
 }
 
 /// Char-boundary-safe ellipsized truncation. Byte slicing (`&s[..n]`) panics
@@ -971,6 +1113,7 @@ fn fetch_mailbox(
         date: String,
         part: Option<TextPartSpec>,
         body: String,
+        remote: Vec<RemoteAttachment>,
     }
     let parser = mail_parser::MessageParser::default();
     let mut pending: Vec<Pending> = Vec::new();
@@ -1005,6 +1148,7 @@ fn fetch_mailbox(
                     date,
                     part: fetch.bodystructure().and_then(find_text_part),
                     body: String::new(),
+                    remote: fetch.bodystructure().map(find_attachment_parts).unwrap_or_default(),
                 });
             }
         }
@@ -1084,6 +1228,7 @@ fn fetch_mailbox(
             cc: String::new(),
             bcc: String::new(),
             attachments: Vec::new(),
+            remote_attachments: p.remote,
         })
         .collect();
 
@@ -1180,6 +1325,79 @@ fn delete_on_server(mut account: AccountInfo, uid: u32, sender: calloop::channel
 /// this fires on every message open, so no Connecting/success toasts, and a
 /// failed push is self-healing — the EmailsSynced merge keeps locally-read
 /// mail read regardless of the server flag until a later push converges.
+/// Write attachment bytes into ~/Downloads under a collision-safe name.
+/// The server-supplied filename is reduced to its final path component —
+/// a hostile "../.ssh/authorized_keys" must not escape the directory.
+fn save_to_downloads(name: &str, bytes: &[u8]) -> Result<String, String> {
+    let dir = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+        .map_err(|_| "No HOME".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {}", dir.display(), e))?;
+
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+        .unwrap_or("attachment");
+    let (stem, ext) = match base.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{}", e)),
+        _ => (base.to_string(), String::new()),
+    };
+    let mut path = dir.join(base);
+    let mut n = 1;
+    while path.exists() {
+        path = dir.join(format!("{} ({}){}", stem, n, ext));
+        n += 1;
+    }
+    std::fs::write(&path, bytes).map_err(|e| format!("Cannot write {}: {}", path.display(), e))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Fetch one attachment part by UID, decode it, and save it to ~/Downloads.
+/// Same thread shape as [`set_seen_on_server`]; the outcome comes back as
+/// [`AppMessage::AttachmentFetched`].
+fn fetch_attachment(
+    mut account: AccountInfo,
+    folder: String,
+    uid: u32,
+    att: RemoteAttachment,
+    sender: calloop::channel::Sender<AppMessage>,
+) {
+    std::thread::spawn(move || {
+        let report = |sender: &calloop::channel::Sender<AppMessage>, r: Result<String, String>| {
+            let _ = sender.send(AppMessage::AttachmentFetched(r));
+        };
+        if is_mock_account(&account) {
+            report(&sender, Err("This account has no server copy".to_string()));
+            return;
+        }
+        let Some(mut session) = open_imap_session(&mut account, &sender, false) else {
+            report(&sender, Err("IMAP connection failed".to_string()));
+            return;
+        };
+        // Same mailbox names the sync uses; sent-folder mail lives under
+        // Gmail's name first, the conventional one second.
+        let mailboxes: &[&str] =
+            if folder == "sent" { &["[Gmail]/Sent Mail", "Sent"] } else { &["INBOX"] };
+        if !mailboxes.iter().any(|mb| session.select(mb).is_ok()) {
+            report(&sender, Err("Cannot select mailbox".to_string()));
+            let _ = session.logout();
+            return;
+        }
+        let query = format!("(BODY.PEEK[{}])", section_str(&att.section));
+        let section_path = imap_proto::types::SectionPath::Part(att.section.clone(), None);
+        let outcome = match session.uid_fetch(uid.to_string(), &query) {
+            Ok(fetches) => match fetches.iter().next().and_then(|f| f.section(&section_path)) {
+                Some(bytes) => save_to_downloads(&att.name, &decode_part_bytes(&att.encoding, bytes)),
+                None => Err("Server returned no data for the part".to_string()),
+            },
+            Err(e) => Err(format!("Fetch failed: {}", e)),
+        };
+        report(&sender, outcome);
+        let _ = session.logout();
+    });
+}
+
 fn set_seen_on_server(mut account: AccountInfo, uid: u32, seen: bool, sender: calloop::channel::Sender<AppMessage>) {
     std::thread::spawn(move || {
         if is_mock_account(&account) {
@@ -1393,6 +1611,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             cc: String::new(),
             bcc: String::new(),
             attachments: Vec::new(),
+            remote_attachments: Vec::new(),
         },
         Email {
             id: 2,
@@ -1407,6 +1626,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             cc: String::new(),
             bcc: String::new(),
             attachments: Vec::new(),
+            remote_attachments: Vec::new(),
         },
         Email {
             id: 3,
@@ -1421,6 +1641,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             cc: String::new(),
             bcc: String::new(),
             attachments: Vec::new(),
+            remote_attachments: Vec::new(),
         },
         Email {
             id: 4,
@@ -1435,6 +1656,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             cc: String::new(),
             bcc: String::new(),
             attachments: Vec::new(),
+            remote_attachments: Vec::new(),
         },
     ]
 }
@@ -1498,6 +1720,7 @@ impl ClearEmailApp {
             cc: mail.cc.clone(),
             bcc: mail.bcc.clone(),
             attachments: mail.attachments.clone(),
+            remote_attachments: Vec::new(),
         });
         self.save_emails();
     }
@@ -1785,6 +2008,22 @@ impl ClearEmailApp {
                 labels.push(TextLabel { text: format!("From: {}", email.from), x: detail_x, y: 85.0 + MENUBAR_H, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
                 labels.push(TextLabel { text: format!("To:   {}", email.to), x: detail_x, y: 105.0 + MENUBAR_H, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
                 labels.push(TextLabel { text: format!("Date: {}", email.date), x: detail_x, y: 125.0 + MENUBAR_H, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+
+                // Server-attachment chip labels (quads paint in display_list;
+                // both sides lay out via detail_chip_rects).
+                for (att, (cx, cy, _, _)) in email
+                    .remote_attachments
+                    .iter()
+                    .zip(detail_chip_rects(&email.remote_attachments, detail_x))
+                {
+                    labels.push(TextLabel {
+                        text: detail_chip_label(att),
+                        x: cx + 8.0,
+                        y: cy + 5.0,
+                        font_size: 10.0,
+                        color: [0xc8, 0xc8, 0xd2],
+                    });
+                }
             }
         } else {
             let placeholder = "Select an email to view its content".to_string();
@@ -2174,6 +2413,52 @@ impl Application for ClearEmailApp {
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
+            AppMessage::OpenAttachment(email_id, att_idx) => {
+                let target = self
+                    .emails
+                    .iter()
+                    .find(|e| e.id == email_id)
+                    .and_then(|e| {
+                        e.remote_attachments.get(att_idx).map(|a| (e.folder.clone(), e.uid, a.clone()))
+                    });
+                match target {
+                    Some((folder, Some(uid), att)) => {
+                        if let Some(acc) = self.accounts.get(self.selected_account_idx) {
+                            self.status_message = Some((format!("Fetching {}...", att.name), 4.0));
+                            fetch_attachment(acc.clone(), folder, uid, att, self.sender.clone());
+                        }
+                    }
+                    Some((_, None, _)) => {
+                        self.status_message =
+                            Some(("No server copy for this message".to_string(), 4.0));
+                    }
+                    None => {}
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::AttachmentFetched(outcome) => {
+                match outcome {
+                    Ok(path) => {
+                        let name = std::path::Path::new(&path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("attachment")
+                            .to_string();
+                        self.status_message = Some((format!("Saved {} — opening...", name), 4.0));
+                        // Route through the XDG default — which, since the
+                        // Default Apps work, is a cce app for pdf/images.
+                        let mut cmd = std::process::Command::new("xdg-open");
+                        cmd.arg(&path);
+                        let _ = cce_ui::process::spawn_detached(cmd);
+                    }
+                    Err(e) => {
+                        self.status_message = Some((format!("Attachment: {}", e), 6.0));
+                    }
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
             AppMessage::SendResult(mail, outcome) => {
                 let new_id = self.emails.iter().map(|e| e.id).max().unwrap_or(0) + 1;
                 let from = self
@@ -2208,6 +2493,7 @@ impl Application for ClearEmailApp {
                                         .to_string()
                                 })
                                 .collect(),
+                            remote_attachments: Vec::new(),
                         });
                         self.save_emails();
                         self.status_message = Some(("Email Sent Successfully".to_string(), 4.0));
@@ -2713,6 +2999,16 @@ impl Application for ClearEmailApp {
                 // while a modal is up — boxed text still renders above the panel.
                 if !self.compose_open {
                     if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
+                        // Server-attachment chips in the header band (labels
+                        // ride in the labels pass; same rect fn both places).
+                        for (cx, cy, cw, ch) in detail_chip_rects(&email.remote_attachments, detail_x) {
+                            quads.push((cx, cy, cw, ch, [0.14, 0.14, 0.20, 1.0]));
+                            quads.push((cx, cy, cw, 1.0, [0.25, 0.35, 0.50, 0.40]));
+                            quads.push((cx, cy + ch - 1.0, cw, 1.0, [0.25, 0.35, 0.50, 0.40]));
+                            quads.push((cx, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
+                            quads.push((cx + cw - 1.0, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
+                        }
+
                         let body_w = (w_f32 - (detail_x + 15.0)).max(100.0);
                         let body_h = (h_f32 - 190.0 - MENUBAR_H).max(100.0);
                         let line_h = 12.0 * 1.4; // get_text_buffer_laid_out's placed-text metric
@@ -2927,6 +3223,25 @@ impl Application for ClearEmailApp {
                     self.body_sb_dragging = false;
                     if self.selected_email_id.is_some() && self.body_sb_press(px, py) {
                         changed = true;
+                    }
+                    // Server-attachment chips: hit-test against the same
+                    // rects the paint pass laid out.
+                    if let Some(email) = self
+                        .selected_email_id
+                        .and_then(|id| self.emails.iter().find(|e| e.id == id))
+                    {
+                        if !email.remote_attachments.is_empty() {
+                            let detail_x = 10.0 + 325.0;
+                            let hit = detail_chip_rects(&email.remote_attachments, detail_x)
+                                .iter()
+                                .position(|&(cx, cy, cw, ch)| {
+                                    px >= cx && px <= cx + cw && py >= cy && py <= cy + ch
+                                });
+                            if let Some(i) = hit {
+                                msg_out = Some(AppMessage::OpenAttachment(email.id, i));
+                                changed = true;
+                            }
+                        }
                     }
                 }
                 ElementState::Released => {
@@ -3439,6 +3754,129 @@ mod tests {
         // Truncated/invalid %-escapes stay literal rather than erroring.
         let m = parse_mailto("mailto:a@x.org?subject=100%25%2").unwrap();
         assert_eq!(m.subject, "100%%2");
+    }
+
+    fn attach_part<'a>(
+        ty: &'a str,
+        subtype: &'a str,
+        ty_params: imap_proto::types::BodyParams<'a>,
+        disposition: Option<(&'a str, imap_proto::types::BodyParams<'a>)>,
+        encoding: imap_proto::types::ContentEncoding<'a>,
+        octets: u32,
+    ) -> imap_proto::types::BodyStructure<'a> {
+        use imap_proto::types::*;
+        BodyStructure::Basic {
+            common: BodyContentCommon {
+                ty: ContentType { ty, subtype, params: ty_params },
+                disposition: disposition
+                    .map(|(t, params)| ContentDisposition { ty: t, params }),
+                language: None,
+                location: None,
+            },
+            other: BodyContentSinglePart {
+                id: None,
+                md5: None,
+                description: None,
+                transfer_encoding: encoding,
+                octets,
+            },
+            extension: None,
+        }
+    }
+
+    #[test]
+    fn attachment_parts_found_with_paths_and_name_fallbacks() {
+        use imap_proto::types::*;
+        // multipart/mixed: [text/plain body, pdf w/ disposition filename,
+        // image w/ only a Content-Type name, csv w/ disposition but NO name].
+        let text = BodyStructure::Text {
+            common: BodyContentCommon {
+                ty: ContentType { ty: "TEXT", subtype: "PLAIN", params: None },
+                disposition: None,
+                language: None,
+                location: None,
+            },
+            other: BodyContentSinglePart {
+                id: None,
+                md5: None,
+                description: None,
+                transfer_encoding: ContentEncoding::SevenBit,
+                octets: 10,
+            },
+            lines: 1,
+            extension: None,
+        };
+        let pdf = attach_part(
+            "APPLICATION",
+            "PDF",
+            None,
+            Some(("ATTACHMENT", Some(vec![("FILENAME", "report.pdf")]))),
+            ContentEncoding::Base64,
+            2048,
+        );
+        let img = attach_part(
+            "IMAGE",
+            "PNG",
+            Some(vec![("NAME", "shot.png")]),
+            None,
+            ContentEncoding::Base64,
+            4096,
+        );
+        let csv = attach_part(
+            "TEXT",
+            "CSV",
+            None,
+            Some(("ATTACHMENT", None)),
+            ContentEncoding::QuotedPrintable,
+            100,
+        );
+        let root = BodyStructure::Multipart {
+            common: BodyContentCommon {
+                ty: ContentType { ty: "MULTIPART", subtype: "MIXED", params: None },
+                disposition: None,
+                language: None,
+                location: None,
+            },
+            bodies: vec![text, pdf, img, csv],
+            extension: None,
+        };
+
+        let atts = find_attachment_parts(&root);
+        assert_eq!(atts.len(), 3, "body text part must not be listed: {atts:?}");
+        assert_eq!(atts[0].name, "report.pdf");
+        assert_eq!(atts[0].section, vec![2]);
+        assert_eq!(atts[0].mime, "application/pdf");
+        assert_eq!(atts[0].encoding, "base64");
+        assert_eq!(atts[1].name, "shot.png"); // Content-Type name fallback
+        assert_eq!(atts[1].section, vec![3]);
+        assert_eq!(atts[2].name, "attachment.csv"); // synthesized
+        assert_eq!(atts[2].section, vec![4]);
+
+        // A bare single-part attachment is section 1.
+        let solo = attach_part(
+            "APPLICATION",
+            "ZIP",
+            Some(vec![("NAME", "a.zip")]),
+            None,
+            ContentEncoding::Base64,
+            9,
+        );
+        assert_eq!(find_attachment_parts(&solo)[0].section, vec![1]);
+    }
+
+    #[test]
+    fn decode_part_bytes_handles_the_transfer_encodings() {
+        // "hello attachment" in base64, with the line-wrap noise real
+        // servers emit.
+        let b64 = b"aGVsbG8g\r\nYXR0YWNobWVudA==";
+        assert_eq!(decode_part_bytes("base64", b64), b"hello attachment");
+        assert_eq!(
+            decode_part_bytes("quoted-printable", b"gr=C3=BC=C3=9Fe"),
+            "grüße".as_bytes()
+        );
+        // Identity encodings pass through untouched.
+        assert_eq!(decode_part_bytes("7bit", b"plain"), b"plain");
+        assert_eq!(decode_part_bytes("", b"raw"), b"raw");
     }
 
     fn parse(raw: &str) -> mail_parser::Message<'_> {
