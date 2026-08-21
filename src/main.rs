@@ -107,8 +107,34 @@ enum AppMessage {
     SyncNow,
     Quit,
     Status(String),
+    /// A failure a user must not miss: shown as a sticky red toast (no
+    /// timer) where [`AppMessage::Status`] is a green 4-second one.
+    StatusError(String),
     EmailsSynced(String, Vec<Email>),
     UpdateAccountTokens(String, Option<String>, Option<u64>),
+}
+
+/// The single status slot at the bottom of the window. Info toasts count
+/// down in `tick` and expire; errors carry no timer — they stay until
+/// clicked away or replaced, so a failed sync can't vanish unseen.
+#[derive(Debug, Clone)]
+enum StatusToast {
+    Info { text: String, ttl: f32 },
+    Error { text: String },
+}
+
+impl StatusToast {
+    fn info(text: impl Into<String>, ttl: f32) -> Self {
+        StatusToast::Info { text: text.into(), ttl }
+    }
+    fn error(text: impl Into<String>) -> Self {
+        StatusToast::Error { text: text.into() }
+    }
+    fn text(&self) -> &str {
+        match self {
+            StatusToast::Info { text, .. } | StatusToast::Error { text } => text,
+        }
+    }
 }
 
 /// App shortcuts, resolved once at startup from input.kdl
@@ -190,7 +216,7 @@ struct ClearEmailApp {
     /// When the most recent IMAP sync was spawned — folder switches re-sync
     /// through [`Self::start_sync`], throttled against tab-hopping.
     last_sync_start: Option<std::time::Instant>,
-    status_message: Option<(String, f32)>, // (message, timer)
+    status_message: Option<StatusToast>,
     sender: calloop::channel::Sender<AppMessage>,
 
     // UI state
@@ -987,18 +1013,31 @@ fn is_mock_account(account: &AccountInfo) -> bool {
 /// Connect + authenticate an IMAP session; shared by the sync and
 /// server-delete workers (call from a worker thread — it blocks). Refreshed
 /// OAuth tokens are reported back via UpdateAccountTokens; every failure
-/// surfaces as a Status toast and yields None.
+/// lands on stderr and (when `verbose`) as a sticky error toast, then
+/// yields None.
 fn open_imap_session(
     account: &mut AccountInfo,
     sender: &calloop::channel::Sender<AppMessage>,
     verbose: bool,
 ) -> Option<imap::Session<native_tls::TlsStream<std::net::TcpStream>>> {
+    // Everything mirrors to stderr regardless of `verbose` — the quiet
+    // paths (seen-push, sent fetch) stay UI-silent but must not be
+    // undebuggable. `err:` = sticky red toast, plain = timed green one.
     macro_rules! say {
-        ($msg:expr) => {
+        (err: $msg:expr) => {{
+            let msg: String = $msg;
+            eprintln!("cce-mail: {}", msg);
             if verbose {
-                let _ = sender.send(AppMessage::Status($msg));
+                let _ = sender.send(AppMessage::StatusError(msg));
             }
-        };
+        }};
+        ($msg:expr) => {{
+            let msg: String = $msg;
+            eprintln!("cce-mail: {}", msg);
+            if verbose {
+                let _ = sender.send(AppMessage::Status(msg));
+            }
+        }};
     }
     let mut access_token = account.password.clone();
     if account.is_oauth {
@@ -1016,7 +1055,7 @@ fn open_imap_session(
                 account.token_expiry = acc.token_expiry;
             }
             Err(e) => {
-                say!(format!("OAuth Refresh Failed: {}", e));
+                say!(err: format!("OAuth Refresh Failed: {}", e));
                 return None;
             }
         }
@@ -1035,7 +1074,7 @@ fn open_imap_session(
     let tls = match TlsConnector::new() {
         Ok(t) => t,
         Err(_) => {
-            say!("Failed to create TLS connector".to_string());
+            say!(err: "Failed to create TLS connector".to_string());
             return None;
         }
     };
@@ -1043,7 +1082,7 @@ fn open_imap_session(
     let client = match imap::connect((domain, port), domain, &tls) {
         Ok(c) => c,
         Err(e) => {
-            say!(format!("IMAP Connection failed: {}", e));
+            say!(err: format!("IMAP Connection failed: {}", e));
             return None;
         }
     };
@@ -1056,7 +1095,7 @@ fn open_imap_session(
         match client.authenticate("XOAUTH2", &auth) {
             Ok(s) => Some(s),
             Err((e, _)) => {
-                say!(format!("IMAP OAuth Login failed: {}", e));
+                say!(err: format!("IMAP OAuth Login failed: {}", e));
                 None
             }
         }
@@ -1064,7 +1103,7 @@ fn open_imap_session(
         match client.login(&account.email, &account.password) {
             Ok(s) => Some(s),
             Err((e, _)) => {
-                say!(format!("IMAP Login failed: {}", e));
+                say!(err: format!("IMAP Login failed: {}", e));
                 None
             }
         }
@@ -1090,22 +1129,33 @@ fn fetch_mailbox(
     id_offset: usize,
     verbose: bool,
 ) -> Option<Vec<Email>> {
+    // Same shape as open_imap_session's: stderr always, toast when
+    // `verbose`, `err:` = sticky red.
     macro_rules! say {
-        ($msg:expr) => {
+        (err: $msg:expr) => {{
+            let msg: String = $msg;
+            eprintln!("cce-mail: {}", msg);
             if verbose {
-                let _ = sender.send(AppMessage::Status($msg));
+                let _ = sender.send(AppMessage::StatusError(msg));
             }
-        };
+        }};
+        ($msg:expr) => {{
+            let msg: String = $msg;
+            eprintln!("cce-mail: {}", msg);
+            if verbose {
+                let _ = sender.send(AppMessage::Status(msg));
+            }
+        }};
     }
     if let Err(e) = session.select(mailbox) {
-        say!(format!("Failed to select {}: {}", mailbox, e));
+        say!(err: format!("Failed to select {}: {}", mailbox, e));
         return None;
     }
 
     let mut search_results: Vec<u32> = match session.search("ALL") {
         Ok(ids) => ids.into_iter().collect(),
         Err(e) => {
-            say!(format!("IMAP Search failed: {}", e));
+            say!(err: format!("IMAP Search failed: {}", e));
             return None;
         }
     };
@@ -1174,7 +1224,7 @@ fn fetch_mailbox(
             }
         }
         Err(e) => {
-            say!(format!("IMAP Fetch failed: {}", e));
+            say!(err: format!("IMAP Fetch failed: {}", e));
             return None;
         }
     }
@@ -1208,7 +1258,7 @@ fn fetch_mailbox(
                 }
             }
             Err(e) => {
-                say!(format!("IMAP part fetch failed: {}", e));
+                say!(err: format!("IMAP part fetch failed: {}", e));
             }
         }
     }
@@ -1229,7 +1279,7 @@ fn fetch_mailbox(
                 }
             }
             Err(e) => {
-                say!(format!("IMAP fallback fetch failed: {}", e));
+                say!(err: format!("IMAP fallback fetch failed: {}", e));
             }
         }
     }
@@ -1319,7 +1369,8 @@ fn delete_on_server(mut account: AccountInfo, uid: u32, sender: calloop::channel
             return;
         };
         if let Err(e) = session.select("INBOX") {
-            let _ = sender.send(AppMessage::Status(format!("Failed to select INBOX: {}", e)));
+            eprintln!("cce-mail: Failed to select INBOX: {}", e);
+            let _ = sender.send(AppMessage::StatusError(format!("Failed to select INBOX: {}", e)));
             let _ = session.logout();
             return;
         }
@@ -1330,7 +1381,8 @@ fn delete_on_server(mut account: AccountInfo, uid: u32, sender: calloop::channel
             }
         }
         if let Err(e) = session.uid_store(&uid_set, "+FLAGS (\\Deleted)") {
-            let _ = sender.send(AppMessage::Status(format!("Server delete failed: {}", e)));
+            eprintln!("cce-mail: Server delete failed: {}", e);
+            let _ = sender.send(AppMessage::StatusError(format!("Server delete failed: {}", e)));
             let _ = session.logout();
             return;
         }
@@ -1342,10 +1394,6 @@ fn delete_on_server(mut account: AccountInfo, uid: u32, sender: calloop::channel
     });
 }
 
-/// Push a message's read state to the server (INBOX, by UID). Fully silent:
-/// this fires on every message open, so no Connecting/success toasts, and a
-/// failed push is self-healing — the EmailsSynced merge keeps locally-read
-/// mail read regardless of the server flag until a later push converges.
 /// Write attachment bytes into ~/Downloads under a collision-safe name.
 /// The server-supplied filename is reduced to its final path component —
 /// a hostile "../.ssh/authorized_keys" must not escape the directory.
@@ -1419,6 +1467,11 @@ fn fetch_attachment(
     });
 }
 
+/// Push a message's read state to the server (INBOX, by UID). UI-silent
+/// (stderr still logs failures): this fires on every message open, so no
+/// Connecting/success toasts, and a failed push is self-healing — the
+/// EmailsSynced merge keeps locally-read mail read regardless of the
+/// server flag until a later push converges.
 fn set_seen_on_server(mut account: AccountInfo, uid: u32, seen: bool, sender: calloop::channel::Sender<AppMessage>) {
     std::thread::spawn(move || {
         if is_mock_account(&account) {
@@ -2010,14 +2063,19 @@ impl ClearEmailApp {
             });
         }
 
-        // 5. Status Banner Message
-        if let Some((ref msg, _)) = self.status_message {
+        // 5. Status Banner Message — green timed info, red sticky error
+        // (errors persist until clicked or replaced; see StatusToast).
+        if let Some(ref toast) = self.status_message {
+            let color = match toast {
+                StatusToast::Info { .. } => [0x3a, 0xff, 0x80],
+                StatusToast::Error { .. } => [0xff, 0x5c, 0x5c],
+            };
             labels.push(TextLabel {
-                text: msg.clone(),
+                text: toast.text().to_string(),
                 x: 200.0,
                 y: h_f32 - 25.0,
                 font_size: 11.0,
-                color: [0x3a, 0xff, 0x80],
+                color,
             });
         }
 
@@ -2339,7 +2397,7 @@ impl Application for ClearEmailApp {
                     || !mail.attachments.is_empty()
                 {
                     self.file_as_draft(&mail);
-                    self.status_message = Some(("Saved to Drafts".to_string(), 3.0));
+                    self.status_message = Some(StatusToast::info("Saved to Drafts", 3.0));
                 }
                 self.clear_compose();
                 self.compose_open = false;
@@ -2367,7 +2425,7 @@ impl Application for ClearEmailApp {
                     self.clear_compose();
                     self.compose_open = false;
                 } else {
-                    self.status_message = Some(("Recipient is required".to_string(), 4.0));
+                    self.status_message = Some(StatusToast::error("Recipient is required"));
                 }
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
@@ -2383,13 +2441,13 @@ impl Application for ClearEmailApp {
                 match target {
                     Some((folder, Some(uid), att)) => {
                         if let Some(acc) = self.accounts.get(self.selected_account_idx) {
-                            self.status_message = Some((format!("Fetching {}...", att.name), 4.0));
+                            self.status_message = Some(StatusToast::info(format!("Fetching {}...", att.name), 4.0));
                             fetch_attachment(acc.clone(), folder, uid, att, self.sender.clone());
                         }
                     }
                     Some((_, None, _)) => {
                         self.status_message =
-                            Some(("No server copy for this message".to_string(), 4.0));
+                            Some(StatusToast::error("No server copy for this message"));
                     }
                     None => {}
                 }
@@ -2404,7 +2462,7 @@ impl Application for ClearEmailApp {
                             .and_then(|n| n.to_str())
                             .unwrap_or("attachment")
                             .to_string();
-                        self.status_message = Some((format!("Saved {} — opening...", name), 4.0));
+                        self.status_message = Some(StatusToast::info(format!("Saved {} — opening...", name), 4.0));
                         // Route through the XDG default — which, since the
                         // Default Apps work, is a cce app for pdf/images.
                         let mut cmd = std::process::Command::new("xdg-open");
@@ -2412,7 +2470,7 @@ impl Application for ClearEmailApp {
                         let _ = cce_ui::process::spawn_detached(cmd);
                     }
                     Err(e) => {
-                        self.status_message = Some((format!("Attachment: {}", e), 6.0));
+                        self.status_message = Some(StatusToast::error(format!("Attachment: {}", e)));
                     }
                 }
                 *needs_rebuild = true;
@@ -2455,11 +2513,11 @@ impl Application for ClearEmailApp {
                             remote_attachments: Vec::new(),
                         });
                         self.save_emails();
-                        self.status_message = Some(("Email Sent Successfully".to_string(), 4.0));
+                        self.status_message = Some(StatusToast::info("Email Sent Successfully", 4.0));
                     }
                     Some(err) => {
                         self.file_as_draft(&mail);
-                        self.status_message = Some((format!("Send failed — saved to Drafts: {}", err), 6.0));
+                        self.status_message = Some(StatusToast::error(format!("Send failed — saved to Drafts: {}", err)));
                     }
                 }
                 *needs_rebuild = true;
@@ -2515,9 +2573,9 @@ impl Application for ClearEmailApp {
                     }
                     self.save_emails();
                     self.selected_email_id = None;
-                    self.status_message = Some((
-                        if permanently_deleted { "Email Deleted Permanently" } else { "Moved to Trash" }.to_string(),
-                        4.0
+                    self.status_message = Some(StatusToast::info(
+                        if permanently_deleted { "Email Deleted Permanently" } else { "Moved to Trash" },
+                        4.0,
                     ));
                 }
                 *needs_rebuild = true;
@@ -2562,7 +2620,7 @@ impl Application for ClearEmailApp {
                 let mut cmd = std::process::Command::new("cce-system-interface");
                 cmd.arg("accounts");
                 let _ = cce_ui::process::spawn_detached(cmd);
-                self.status_message = Some(("Opening System Settings...".to_string(), 4.0));
+                self.status_message = Some(StatusToast::info("Opening System Settings...", 4.0));
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -2573,7 +2631,12 @@ impl Application for ClearEmailApp {
                 *exit = true;
             }
             AppMessage::Status(msg) => {
-                self.status_message = Some((msg, 4.0));
+                self.status_message = Some(StatusToast::info(msg, 4.0));
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::StatusError(msg) => {
+                self.status_message = Some(StatusToast::error(msg));
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -2651,9 +2714,10 @@ impl Application for ClearEmailApp {
             self.needs_rebuild = true;
         }
 
-        if let Some((_, ref mut timer)) = self.status_message {
-            *timer -= dt;
-            if *timer <= 0.0 {
+        // Only info toasts expire; an error stays until clicked or replaced.
+        if let Some(StatusToast::Info { ref mut ttl, .. }) = self.status_message {
+            *ttl -= dt;
+            if *ttl <= 0.0 {
                 self.status_message = None;
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
@@ -3143,6 +3207,23 @@ impl Application for ClearEmailApp {
         let px = pos.x as f32;
         let py = pos.y as f32;
         let ev = cce_ui::widget::Event::MouseButton { button, state, x: px, y: py, local_x: px, local_y: py };
+
+        // A sticky error toast dismisses on a direct press (info toasts
+        // expire on their own). Bounds mirror the paint site — x=200,
+        // y=h-25, 11px — with a forgiving band; the toast draws over
+        // whatever is beneath, so consuming the press is right.
+        if button == MouseButton::Left && state == ElementState::Pressed {
+            if let Some(StatusToast::Error { ref text }) = self.status_message {
+                let tw = TextLabel::estimate_width(text, 11.0);
+                let ty = self.height as f32 - 25.0;
+                if px >= 196.0 && px <= 204.0 + tw && py >= ty - 6.0 && py <= ty + 16.0 {
+                    self.status_message = None;
+                    *needs_rebuild = true;
+                    self.needs_rebuild = true;
+                    return None;
+                }
+            }
+        }
 
         // Detail-pane body scrollbar drag — before the ui_context borrow (the
         // sb helpers take &mut self).
