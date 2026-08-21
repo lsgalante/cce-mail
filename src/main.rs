@@ -1883,7 +1883,7 @@ impl ClearEmailApp {
         // Widget text rides along with chrome in display_list's paint_root_into
         // walk — only app-composed labels are emitted here.
 
-        // 3. Email List Labels / Accounts list labels.
+        // 3. Email List Labels.
         // Skipped while a modal is up: text always renders above geometry, and these
         // hand-emitted labels carry no bounds, so they'd bleed straight through the
         // modal panel (the popover-occlusion clamp only knows registered popovers).
