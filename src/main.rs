@@ -5,7 +5,7 @@ use cce_ui::cosmic_text::FontSystem;
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, WidgetHost,
-    TextBox, Button, TextLabel, Key, MenuController, MenuBar
+    TextBox, Button, TextLabel, Key, Dropdown
 };
 use cce_ui::context::UiContext;
 use native_tls::TlsConnector;
@@ -130,14 +130,20 @@ impl EmailKeys {
 struct ClearEmailApp {
     keys: EmailKeys,
 
-    // Navigation / Sidebar
+    // Navigation / Sidebar — the whole bar is Dropdowns (MenuBar retired):
+    // two menu-button dropdowns (custom_display_text = fixed trigger label,
+    // rows are commands that re-fire on repeat) and two selection dropdowns.
     btn_compose: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    menubar: cce_ui::widget::Adapted<MenuBar>,
+    mail_menu: cce_ui::widget::Adapted<Dropdown>,
+    message_menu: cce_ui::widget::Adapted<Dropdown>,
+    /// Folder switcher: options[0] carries the live inbox unread count
+    /// ("Inbox (6)"), refreshed each rebuild, so rows and trigger agree.
+    folder_dropdown: cce_ui::widget::Adapted<Dropdown>,
     /// Account switcher beside the folder dropdown: options are the account
     /// emails plus a trailing "Manage Accounts…" pseudo-entry (management
     /// lives in cce-system-interface). Options refresh from accounts.json on
     /// every open — the job the retired Accounts page did on entry.
-    account_dropdown: cce_ui::widget::Adapted<cce_ui::widget::Dropdown>,
+    account_dropdown: cce_ui::widget::Adapted<Dropdown>,
 
     // Search and List View
     search_box: cce_ui::widget::Adapted<TextBox>,
@@ -1762,7 +1768,11 @@ impl ClearEmailApp {
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_compose.id(), self.btn_compose.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.menubar.id(), self.menubar.as_ptr_mut());
+        let (id, ptr) = (self.mail_menu.id(), self.mail_menu.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.message_menu.id(), self.message_menu.as_ptr_mut());
+        self.ui_context.register_widget(id, ptr);
+        let (id, ptr) = (self.folder_dropdown.id(), self.folder_dropdown.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.account_dropdown.id(), self.account_dropdown.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
@@ -2083,16 +2093,28 @@ impl Application for ClearEmailApp {
         cce_ui::scale::set_scale_factor(1.0);
         let btn_compose = Button::new(10.0, 15.0, 26.0, 26.0).with_label("+");
 
-        // Folder selection is the bar's right-aligned title dropdown (the
-        // designer's pane-switcher idiom); the account switcher is a real
-        // Dropdown beside it.
-        let menubar = MenuBar::new(0.0, 0.0, 800.0, MENUBAR_H)
-            .with_recess(true)
-            .with_title("Inbox")
-            .with_right_aligned_title(true)
-            .with_item("Mail", &["New Message", "Sync Now", "Quit"])
-            .with_item("Message", &["Reply", "Delete", "Mark Read/Unread"])
-            .with_context_options(vec!["Inbox".to_string(), "Sent".to_string(), "Drafts".to_string(), "Trash".to_string()], 0);
+        // The bar: four Dropdowns. Mail/Message are menu-button dropdowns
+        // (fixed trigger label, command rows that re-fire on repeat — the
+        // custom_display_text mode); folder + account are selection dropdowns.
+        // The recessed bar chrome itself is carved in display_list.
+        let bar_font = cce_ui::layout::parse_font_string(&cce_ui::layout::menubar_font()).0;
+        let mail_menu = Dropdown::new(
+            vec!["New Message".to_string(), "Sync Now".to_string(), "Quit".to_string()],
+            0,
+        )
+        .with_custom_display_text("Mail")
+        .with_font_family(&bar_font);
+        let message_menu = Dropdown::new(
+            vec!["Reply".to_string(), "Delete".to_string(), "Mark Read/Unread".to_string()],
+            0,
+        )
+        .with_custom_display_text("Message")
+        .with_font_family(&bar_font);
+        let folder_dropdown = Dropdown::new(
+            vec!["Inbox".to_string(), "Sent".to_string(), "Drafts".to_string(), "Trash".to_string()],
+            0,
+        )
+        .with_font_family(&bar_font);
 
         let mut search_box = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
         search_box.font_size = 11.0;
@@ -2112,11 +2134,11 @@ impl Application for ClearEmailApp {
             .or_else(|| accounts.iter().position(|a| a.is_default))
             .unwrap_or(0);
 
-        let account_dropdown = cce_ui::widget::Dropdown::new(
+        let account_dropdown = Dropdown::new(
             account_dropdown_options(&accounts),
             selected_account_idx,
         )
-        .with_font_family(&cce_ui::layout::parse_font_string(&cce_ui::layout::menubar_font()).0);
+        .with_font_family(&bar_font);
 
         let mut detail_body = TextBox::new(String::new()).with_multiline(true).with_draw_bg_border(false);
         detail_body.font_size = 12.0;
@@ -2179,7 +2201,9 @@ impl Application for ClearEmailApp {
             last_sync_start,
             keys: EmailKeys::load(),
             btn_compose,
-            menubar,
+            mail_menu,
+            message_menu,
+            folder_dropdown,
             account_dropdown,
             search_box,
             email_list,
@@ -2669,36 +2693,42 @@ impl Application for ClearEmailApp {
         let detail_panel_x = separator_x + 1.0;
 
         if self.needs_rebuild || size_changed {
-            // Sidebar buttons layout
-            self.menubar.set_rect(0.0, 0.0, w_f32, MENUBAR_H);
-            // An open menubar dropdown is a popover: registration feeds the
-            // dl-text occlusion clamp, and the render loop at the end of this
-            // function draws it on top of everything.
+            // Bar layout — every open dropdown is a popover: registration
+            // feeds the dl-text occlusion clamp, and the popover pass at the
+            // end of this function draws it on top of everything.
             self.ui_context.clear_popovers();
-            if self.menubar.popover_rect().is_some() {
-                self.ui_context.register_popover(&mut self.menubar);
+            if self.mail_menu.popover_rect().is_some() {
+                self.ui_context.register_popover(&mut self.mail_menu);
+            }
+            if self.message_menu.popover_rect().is_some() {
+                self.ui_context.register_popover(&mut self.message_menu);
+            }
+            if self.folder_dropdown.popover_rect().is_some() {
+                self.ui_context.register_popover(&mut self.folder_dropdown);
             }
             if self.account_dropdown.popover_rect().is_some() {
                 self.ui_context.register_popover(&mut self.account_dropdown);
             }
-            // Bar title = current folder (the context-dropdown trigger), with
-            // the inbox unread count folded in where the sidebar badge lived.
+            // Folder rows and trigger both carry the live inbox unread count
+            // (options[0]), where the old bar title folded the badge in.
             let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
-            self.menubar.title = match self.current_folder {
-                Folder::Inbox if inbox_unread > 0 => format!("Inbox ({})", inbox_unread),
-                Folder::Inbox => "Inbox".to_string(),
-                Folder::Sent => "Sent".to_string(),
-                Folder::Drafts => "Drafts".to_string(),
-                Folder::Trash => "Trash".to_string(),
+            self.folder_dropdown.options[0] = if inbox_unread > 0 {
+                format!("Inbox ({})", inbox_unread)
+            } else {
+                "Inbox".to_string()
             };
-            self.menubar.set_context_selected(match self.current_folder {
+            self.folder_dropdown.selected = match self.current_folder {
                 Folder::Inbox => 0,
                 Folder::Sent => 1,
                 Folder::Drafts => 2,
                 Folder::Trash => 3,
-            });
-            // Fixed offset from the right edge — anchoring to the folder title
-            // would make the switcher drift as the folder name changes length.
+            };
+            // Menus left; selectors right at fixed offsets from the edge —
+            // anchoring to the folder label would make the account switcher
+            // drift as the folder name changes length.
+            self.mail_menu.set_rect(8.0, 5.0, 80.0, 26.0);
+            self.message_menu.set_rect(96.0, 5.0, 112.0, 26.0);
+            self.folder_dropdown.set_rect(w_f32 - 142.0, 5.0, 134.0, 26.0);
             self.account_dropdown.set_rect(w_f32 - 360.0, 5.0, 210.0, 26.0);
 
             cce_ui::scale::set_scale_factor(scale as f32);
@@ -2841,16 +2871,30 @@ impl Application for ClearEmailApp {
         // hover/selected states) AND text in one pass. The legacy extra_quads bridge only
         // forwarded plain Prim::Quads, so every widget's rounded chrome was dropped.
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose, &mut *quads.pc);
+
+        // Bar chrome (was MenuBar's recessed paint): the bar is a plateau one
+        // step down from the plate, flush with its top-left, so its only wall
+        // is the bottom one facing the content — the other three sides are the
+        // plate's own rolled edge.
+        {
+            let depth = cce_ui::layout::bar_wall_width().min(MENUBAR_H * 0.6);
+            quads.pc.recess_edges(
+                cce_ui::scene::layout::Rect { x: 0.0, y: 0.0, width: w_f32, height: MENUBAR_H },
+                (0.0, 0.0, 0.0, 0.0),
+                depth,
+                (false, false, true, false),
+            );
+        }
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.mail_menu, &mut *quads.pc);
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.message_menu, &mut *quads.pc);
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.folder_dropdown, &mut *quads.pc);
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.account_dropdown, &mut *quads.pc);
-        // The menubar itself paints at the END of display_list — its dropdown
-        // must overlay every pane beneath.
 
         // 3. Email List Panel Separator
         quads.push((separator_x, MENUBAR_H, 1.0, h_f32 - MENUBAR_H, [0.18, 0.18, 0.22, 1.0]));
 
         // Search box / Add Account and List
         self.search_box.prepare_text(&mut self.font_system);
-        cce_ui::widget::WidgetHost::prepare_text(&mut self.menubar, &mut self.font_system);
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.search_box, &mut *quads.pc);
         {
             let mut list_quads = Vec::new();
@@ -2998,9 +3042,6 @@ impl Application for ClearEmailApp {
 
 
 
-        // Menubar last: its open dropdown must overlay every pane beneath.
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.menubar, &mut __pc);
-
         // Popover pass (the data-editor pattern): geometry and labels on top of
         // everything, exactly where they hit-test; labels carry bounds equal to
         // the overlay rect (the is-overlay-text convention).
@@ -3051,9 +3092,9 @@ impl Application for ClearEmailApp {
         let mv = cce_ui::widget::Event::PointerMove { x: px, y: py, local_x: px, local_y: py };
         let ctx = &mut self.ui_context;
 
-        if ctx.propagate_event(&mv, self.menubar.id()) {
-            changed = true;
-        }
+        if ctx.propagate_event(&mv, self.mail_menu.id()) { changed = true; }
+        if ctx.propagate_event(&mv, self.message_menu.id()) { changed = true; }
+        if ctx.propagate_event(&mv, self.folder_dropdown.id()) { changed = true; }
 
         if self.compose_open {
             if ctx.propagate_event(&mv, self.compose_to.id()) { changed = true; }
@@ -3144,9 +3185,9 @@ impl Application for ClearEmailApp {
 
         let ctx = &mut self.ui_context;
 
-        // Account dropdown first: it sits inside the bar band, and the menubar
-        // consumes any press within its rect — routed after, it would never
-        // see the click.
+        // Account dropdown (the bar dropdowns route before the pane content —
+        // an open menu overlays the panes, so a handled press must not fall
+        // through to what's beneath it).
         {
             let was_open = self.account_dropdown.open;
             if ctx.propagate_event(&ev, self.account_dropdown.id()) {
@@ -3199,26 +3240,41 @@ impl Application for ClearEmailApp {
             }
         }
 
-        // Menubar next — an open dropdown overlays the panes, so a handled
-        // press/release must not fall through to the content beneath it.
-        if ctx.propagate_event(&ev, self.menubar.id()) {
-            if let Some(idx) = self.menubar.take_context_change() {
-                msg_out = Some(AppMessage::SwitchFolder(match idx {
+        // The menu-button dropdowns — command rows; take_change re-fires on
+        // the same row (custom_display_text mode), so Sync Now works twice.
+        if ctx.propagate_event(&ev, self.mail_menu.id()) {
+            if self.mail_menu.take_change() {
+                msg_out = match self.mail_menu.selected {
+                    0 => Some(AppMessage::ComposeNew),
+                    1 => Some(AppMessage::SyncNow),
+                    _ => Some(AppMessage::Quit),
+                };
+            }
+            *needs_rebuild = true;
+            self.needs_rebuild = true;
+            return msg_out;
+        }
+        if ctx.propagate_event(&ev, self.message_menu.id()) {
+            if self.message_menu.take_change() {
+                msg_out = match self.message_menu.selected {
+                    0 => Some(AppMessage::Reply),
+                    1 => Some(AppMessage::DeleteSelected),
+                    _ => Some(AppMessage::ToggleUnread),
+                };
+            }
+            *needs_rebuild = true;
+            self.needs_rebuild = true;
+            return msg_out;
+        }
+        // Folder switcher.
+        if ctx.propagate_event(&ev, self.folder_dropdown.id()) {
+            if self.folder_dropdown.take_change() {
+                msg_out = Some(AppMessage::SwitchFolder(match self.folder_dropdown.selected {
                     0 => Folder::Inbox,
                     1 => Folder::Sent,
                     2 => Folder::Drafts,
                     _ => Folder::Trash,
                 }));
-            } else if let Some((menu_idx, item_idx)) = self.menubar.menu_click() {
-                msg_out = match (menu_idx, item_idx) {
-                    (0, 0) => Some(AppMessage::ComposeNew),
-                    (0, 1) => Some(AppMessage::SyncNow),
-                    (0, 2) => Some(AppMessage::Quit),
-                    (1, 0) => Some(AppMessage::Reply),
-                    (1, 1) => Some(AppMessage::DeleteSelected),
-                    (1, 2) => Some(AppMessage::ToggleUnread),
-                    _ => None,
-                };
             }
             *needs_rebuild = true;
             self.needs_rebuild = true;
