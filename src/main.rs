@@ -211,6 +211,11 @@ struct ClearEmailApp {
     detail_hovered: bool,
     body_sb_dragging: bool,
     body_sb_drag_offset: f32,
+    /// Width of the email-list band (the rows), user-draggable via the
+    /// list/detail separator. The stored preference survives narrow windows
+    /// un-clobbered — [`Self::split_geom`] clamps at use, not here.
+    list_w: f32,
+    split_dragging: bool,
     compose_open: bool,
     compose_title: String,
     /// When the most recent IMAP sync was spawned — folder switches re-sync
@@ -395,6 +400,25 @@ fn save_selected_account_email(email: &str) {
     let _ = std::fs::write(selected_account_path(), email);
 }
 
+/// Sidecar remembering the dragged list/detail split, same pattern as the
+/// account sidecar above (config.kdl stays the user's file).
+fn split_path() -> std::path::PathBuf {
+    cce_ui::config::cce_config_dir().join("cce-mail-split.txt")
+}
+
+fn load_list_w() -> Option<f32> {
+    std::fs::read_to_string(split_path())
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|w| (LIST_W_MIN..=4000.0).contains(w))
+}
+
+fn save_list_w(w: f32) {
+    let _ = std::fs::write(split_path(), format!("{:.0}", w));
+}
+
 fn get_account_emails_path(email: &str) -> std::path::PathBuf {
     let p = cce_ui::config::cce_config_dir();
     if !p.exists() {
@@ -430,6 +454,20 @@ fn save_emails_for_account(email: &str, emails: &[Email]) {
 /// text part come down the wire, so attachments never inflate a sync.
 /// Menubar height; all chrome below the bar offsets by this.
 const MENUBAR_H: f32 = 36.0;
+
+// List/detail split geometry. The list band starts at LIST_X; the separator
+// line sits LIST_SEP_GAP after the band and the detail pane LIST_DETAIL_GAP
+// after the separator. `list_w` (the band width) is the one draggable value —
+// everything else derives from it through `split_geom`.
+const LIST_X: f32 = 10.0;
+const LIST_SEP_GAP: f32 = 10.0;
+const LIST_DETAIL_GAP: f32 = 15.0;
+const LIST_W_DEFAULT: f32 = 300.0;
+const LIST_W_MIN: f32 = 180.0;
+/// The detail pane never gets squeezed below this by a drag or a narrow window.
+const DETAIL_W_MIN: f32 = 220.0;
+/// Half-width of the separator's grab band (±, matching ScrollRegion's slop).
+const SPLIT_GRAB_SLOP: f32 = 4.0;
 
 // Compose modal geometry. One source of truth: the background quads, the
 // input rects, the labels, the chip row and the outside-click test all
@@ -1868,6 +1906,18 @@ impl ClearEmailApp {
         }
     }
 
+    /// The list/detail split, clamped to the current window: (list band
+    /// width, separator x, detail pane x). The single source for paint,
+    /// layout, and every hit-test — the stored `list_w` preference is never
+    /// mutated by a window resize, only re-clamped here.
+    fn split_geom(&self) -> (f32, f32, f32) {
+        let max_w = (self.width as f32 - LIST_X - LIST_SEP_GAP - LIST_DETAIL_GAP - DETAIL_W_MIN)
+            .max(LIST_W_MIN);
+        let lw = self.list_w.clamp(LIST_W_MIN, max_w);
+        let sep = LIST_X + lw + LIST_SEP_GAP;
+        (lw, sep, sep + LIST_DETAIL_GAP)
+    }
+
     /// Detail-pane body scrollbar geometry, mirroring `ScrollRegion::scrollbar_geom`:
     /// (sb_x, track_y, sb_w, track_h, thumb_y, thumb_h). None when the body fits
     /// (no scrollbar drawn). The single source for display_list and the drag path.
@@ -1929,9 +1979,11 @@ impl ClearEmailApp {
         let w_f32 = self.width as f32;
         let h_f32 = self.height as f32;
 
-        let list_x = 10.0;
-        let detail_x = list_x + 325.0;
-        let separator_x = list_x + 310.0;
+        let list_x = LIST_X;
+        let (list_w, separator_x, detail_x) = self.split_geom();
+        // Row-label char budgets scale with the band; the bases are the
+        // hand-tuned counts at the 300px default.
+        let fit = |base: f32| (base * list_w / LIST_W_DEFAULT) as usize;
 
         // Widget text rides along with chrome in display_list's paint_root_into
         // walk — only app-composed labels are emitted here.
@@ -1974,7 +2026,7 @@ impl ClearEmailApp {
                         email.from.clone()
                     };
                     labels.push(TextLabel {
-                        text: ellipsize(&row_head, 21),
+                        text: ellipsize(&row_head, fit(21.0)),
                         x: list_x + 20.0,
                         y: draw_y + 6.0,
                         font_size: 11.0,
@@ -1985,7 +2037,7 @@ impl ClearEmailApp {
                     let date_w = TextLabel::estimate_width(&email.date, 9.0);
                     labels.push(TextLabel {
                         text: email.date.clone(),
-                        x: list_x + 300.0 - 14.0 - date_w,
+                        x: list_x + list_w - 14.0 - date_w,
                         y: draw_y + 7.0,
                         font_size: 9.0,
                         color: [0x70, 0x70, 0x75],
@@ -1993,7 +2045,7 @@ impl ClearEmailApp {
 
                     // Subject
                     labels.push(TextLabel {
-                        text: ellipsize(&email.subject, 29),
+                        text: ellipsize(&email.subject, fit(29.0)),
                         x: list_x + 20.0,
                         y: draw_y + 20.0,
                         font_size: 10.0,
@@ -2004,7 +2056,7 @@ impl ClearEmailApp {
                     // after a plain '\n' replace, and the renderer treats it as a
                     // line break, bleeding preview lines into the next row.
                     let snippet_raw = email.body.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let snippet = ellipsize(&snippet_raw, 37);
+                    let snippet = ellipsize(&snippet_raw, fit(37.0));
                     labels.push(TextLabel {
                         text: snippet,
                         x: list_x + 20.0,
@@ -2289,6 +2341,8 @@ impl Application for ClearEmailApp {
             detail_hovered: false,
             body_sb_dragging: false,
             body_sb_drag_offset: 0.0,
+            list_w: load_list_w().unwrap_or(LIST_W_DEFAULT),
+            split_dragging: false,
             compose_open,
             compose_title,
             status_message: None,
@@ -2751,9 +2805,8 @@ impl Application for ClearEmailApp {
             Folder::Trash => "trash",
         };
 
-        let list_x = 10.0;
-        let detail_x = list_x + 325.0;
-        let separator_x = list_x + 310.0;
+        let list_x = LIST_X;
+        let (list_w, separator_x, detail_x) = self.split_geom();
         let detail_panel_x = separator_x + 1.0;
 
         if self.needs_rebuild || size_changed {
@@ -2799,7 +2852,7 @@ impl Application for ClearEmailApp {
             self.btn_compose.set_rect(list_x, 15.0 + MENUBAR_H, 26.0, 26.0);
 
             // Search box and Scrolling list
-            self.search_box.set_rect(list_x + 36.0, 15.0 + MENUBAR_H, 264.0, 26.0);
+            self.search_box.set_rect(list_x + 36.0, 15.0 + MENUBAR_H, list_w - 36.0, 26.0);
 
             // Get filtered emails count for bounds setup
             let list_count = self.emails.iter()
@@ -2817,7 +2870,7 @@ impl Application for ClearEmailApp {
                 })
                 .count();
 
-            self.email_list.set_rect(list_x, 55.0 + MENUBAR_H, 300.0, h_f32 - 70.0 - MENUBAR_H);
+            self.email_list.set_rect(list_x, 55.0 + MENUBAR_H, list_w, h_f32 - 70.0 - MENUBAR_H);
             self.email_list.update_bounds(list_count, 55.0 + MENUBAR_H, h_f32 - 70.0 - MENUBAR_H);
 
             if self.email_buttons.len() != list_count {
@@ -2872,7 +2925,7 @@ impl Application for ClearEmailApp {
             for (idx, &(_email_id, is_selected)) in filtered_email_ids.iter().enumerate() {
                 self.email_buttons[idx].selected = is_selected;
                 if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                    self.email_buttons[idx].set_rect(list_x, draw_y, 300.0, 54.0);
+                    self.email_buttons[idx].set_rect(list_x, draw_y, list_w, 54.0);
                 } else {
                     self.email_buttons[idx].set_rect(-9999.0, -9999.0, 0.0, 0.0);
                 }
@@ -3152,7 +3205,23 @@ impl Application for ClearEmailApp {
             }
         }
 
+        // Active split drag: the separator follows the pointer, clamped so
+        // neither pane collapses. Clamp into the stored value (not just at
+        // paint) so the release persists what the user actually sees.
+        if !self.compose_open && self.split_dragging {
+            let max_w = (self.width as f32 - LIST_X - LIST_SEP_GAP - LIST_DETAIL_GAP - DETAIL_W_MIN)
+                .max(LIST_W_MIN);
+            let new_w = (px - LIST_X - LIST_SEP_GAP).clamp(LIST_W_MIN, max_w);
+            if (new_w - self.list_w).abs() > 0.5 {
+                self.list_w = new_w;
+                changed = true;
+            }
+        }
+
         // Routed dispatch (6bd shrink): one Event per widget root through the router.
+        // separator_x is read before ctx: split_geom(&self) cannot run while
+        // ui_context is mutably borrowed.
+        let separator_x = self.split_geom().1;
         let mv = cce_ui::widget::Event::PointerMove { x: px, y: py, local_x: px, local_y: py };
         let ctx = &mut self.ui_context;
 
@@ -3178,7 +3247,7 @@ impl Application for ClearEmailApp {
             if ctx.propagate_event(&mv, self.search_box.id()) { changed = true; }
             if self.email_list.cursor_moved(px, py) { changed = true; }
             // Hover scope for the detail-pane body scroll (wheel + keys).
-            self.detail_hovered = px > 10.0 + 310.0;
+            self.detail_hovered = px > separator_x;
 
             for btn in &mut self.email_buttons {
                 if btn.rect().0 > -9000.0 {
@@ -3233,17 +3302,26 @@ impl Application for ClearEmailApp {
                     // A fresh press always supersedes a stale drag — a lost
                     // release must not leave the thumb glued to the pointer.
                     self.body_sb_dragging = false;
+                    self.split_dragging = false;
+                    // Grab the list/detail separator (±slop, below the bar).
+                    let separator_x = self.split_geom().1;
+                    if (px - separator_x).abs() <= SPLIT_GRAB_SLOP && py > MENUBAR_H {
+                        self.split_dragging = true;
+                        *needs_rebuild = true;
+                        self.needs_rebuild = true;
+                        return None;
+                    }
                     if self.selected_email_id.is_some() && self.body_sb_press(px, py) {
                         changed = true;
                     }
                     // Server-attachment chips: hit-test against the same
                     // rects the paint pass laid out.
+                    let detail_x = self.split_geom().2;
                     if let Some(email) = self
                         .selected_email_id
                         .and_then(|id| self.emails.iter().find(|e| e.id == id))
                     {
                         if !email.remote_attachments.is_empty() {
-                            let detail_x = 10.0 + 325.0;
                             let hit = detail_chip_rects(&email.remote_attachments, detail_x)
                                 .iter()
                                 .position(|&(cx, cy, cw, ch)| {
@@ -3258,6 +3336,11 @@ impl Application for ClearEmailApp {
                 }
                 ElementState::Released => {
                     if std::mem::take(&mut self.body_sb_dragging) {
+                        changed = true;
+                    }
+                    if std::mem::take(&mut self.split_dragging) {
+                        // Persist the split where the drag left it.
+                        save_list_w(self.list_w);
                         changed = true;
                     }
                 }
@@ -3555,8 +3638,9 @@ impl Application for ClearEmailApp {
         let px = pos.x as f32;
         let py = pos.y as f32;
 
+        let separator_x = self.split_geom().1;
         if !self.compose_open {
-            if px >= 66.0 && px <= 366.0 {
+            if px < separator_x {
                 if self.email_list.wheel(delta, px, py) {
                     changed = true;
                 }
@@ -3565,7 +3649,6 @@ impl Application for ClearEmailApp {
 
         // Detail-pane body scroll.
         if !self.compose_open && self.selected_email_id.is_some() {
-            let separator_x = 10.0 + 310.0;
             if px > separator_x {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
