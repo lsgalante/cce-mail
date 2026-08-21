@@ -18,7 +18,6 @@ enum Folder {
     Sent,
     Drafts,
     Trash,
-    Accounts,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -134,7 +133,11 @@ struct ClearEmailApp {
     // Navigation / Sidebar
     btn_compose: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     menubar: cce_ui::widget::Adapted<MenuBar>,
-    btn_accounts: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    /// Account switcher beside the folder dropdown: options are the account
+    /// emails plus a trailing "Manage Accounts…" pseudo-entry (management
+    /// lives in cce-system-interface). Options refresh from accounts.json on
+    /// every open — the job the retired Accounts page did on entry.
+    account_dropdown: cce_ui::widget::Adapted<cce_ui::widget::Dropdown>,
 
     // Search and List View
     search_box: cce_ui::widget::Adapted<TextBox>,
@@ -159,10 +162,9 @@ struct ClearEmailApp {
     btn_compose_cancel: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     btn_compose_attach: cce_ui::widget::Adapted<cce_ui::widget::Button>,
 
-    // Accounts (view/switch only — management lives in cce-system-interface)
+    // Accounts (switch via the bar dropdown — management lives in cce-system-interface)
     accounts: Vec<AccountInfo>,
     selected_account_idx: usize,
-    btn_manage_accounts: cce_ui::widget::Adapted<cce_ui::widget::Button>,
 
     // Application state
     emails: Vec<Email>,
@@ -209,6 +211,19 @@ fn get_accounts_path() -> std::path::PathBuf {
         }
     }
     p.join("accounts.json")
+}
+
+/// The bar account-switcher's option list: one row per account email, plus the
+/// trailing management pseudo-entry (index == accounts.len()), which opens
+/// cce-system-interface instead of switching.
+const MANAGE_ACCOUNTS_OPTION: &str = "Manage Accounts…";
+
+fn account_dropdown_options(accounts: &[AccountInfo]) -> Vec<String> {
+    accounts
+        .iter()
+        .map(|a| a.email.clone())
+        .chain(std::iter::once(MANAGE_ACCOUNTS_OPTION.to_string()))
+        .collect()
 }
 
 fn load_accounts() -> Vec<AccountInfo> {
@@ -1749,7 +1764,7 @@ impl ClearEmailApp {
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.menubar.id(), self.menubar.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_accounts.id(), self.btn_accounts.as_ptr_mut());
+        let (id, ptr) = (self.account_dropdown.id(), self.account_dropdown.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_compose_send.id(), self.btn_compose_send.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
@@ -1762,8 +1777,6 @@ impl ClearEmailApp {
         let (id, ptr) = (self.btn_delete.id(), self.btn_delete.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_unread.id(), self.btn_unread.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_manage_accounts.id(), self.btn_manage_accounts.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         for btn in self.email_buttons.iter_mut() {
             let (id, ptr) = (btn.id(), btn.as_ptr_mut());
@@ -1866,33 +1879,12 @@ impl ClearEmailApp {
         // modal panel (the popover-occlusion clamp only knows registered popovers).
         let modal_open = self.compose_open;
         if modal_open {
-        } else if self.current_folder == Folder::Accounts {
-            for (idx, acc) in self.accounts.iter().enumerate() {
-                if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                    labels.push(TextLabel {
-                        text: acc.email.clone(),
-                        x: list_x + 20.0,
-                        y: draw_y + 12.0,
-                        font_size: 11.0,
-                        color: [0xff, 0xff, 0xff],
-                    });
-
-                    labels.push(TextLabel {
-                        text: if acc.is_default { "Default Account".to_string() } else { "Secondary Account".to_string() },
-                        x: list_x + 20.0,
-                        y: draw_y + 28.0,
-                        font_size: 9.0,
-                        color: if acc.is_default { [0x3a, 0xff, 0x80] } else { [0x70, 0x70, 0x75] },
-                    });
-                }
-            }
         } else {
             let current_folder_str = match self.current_folder {
                 Folder::Inbox => "inbox",
                 Folder::Sent => "sent",
                 Folder::Drafts => "drafts",
                 Folder::Trash => "trash",
-                _ => "inbox",
             };
             let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
             let search_lower = search_text.to_lowercase();
@@ -1963,36 +1955,6 @@ impl ClearEmailApp {
 
         // 4. Detail View Content (same modal gate as the list labels above)
         if modal_open {
-        } else if self.current_folder == Folder::Accounts {
-            if self.selected_account_idx < self.accounts.len() {
-                let acc = &self.accounts[self.selected_account_idx];
-
-                // Subject Header (Account email)
-                labels.push(TextLabel {
-                    text: acc.email.clone(),
-                    x: detail_x,
-                    y: 60.0 + MENUBAR_H,
-                    font_size: 15.0,
-                    color: [0xff, 0xff, 0xff],
-                });
-
-                // Settings details
-                labels.push(TextLabel { text: format!("Incoming Server (IMAP): {}", acc.imap), x: detail_x, y: 95.0 + MENUBAR_H, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
-                labels.push(TextLabel { text: format!("Outgoing Server (SMTP): {}", acc.smtp), x: detail_x, y: 120.0 + MENUBAR_H, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
-                let auth_text = if acc.is_oauth {
-                    "Authentication:          OAuth2 (Google)"
-                } else {
-                    "Authentication:          SSL/TLS, Normal Password"
-                };
-                labels.push(TextLabel { text: auth_text.to_string(), x: detail_x, y: 145.0 + MENUBAR_H, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-                labels.push(TextLabel {
-                    text: format!("Default Account:         {}", if acc.is_default { "Yes" } else { "No" }),
-                    x: detail_x,
-                    y: 170.0 + MENUBAR_H,
-                    font_size: 11.0,
-                    color: if acc.is_default { [0x3a, 0xff, 0x80] } else { [0x83, 0x83, 0x8a] },
-                });
-            }
         } else if let Some(selected_id) = self.selected_email_id {
             if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
                 // Subject Header
@@ -2122,7 +2084,8 @@ impl Application for ClearEmailApp {
         let btn_compose = Button::new(10.0, 15.0, 26.0, 26.0).with_label("+");
 
         // Folder selection is the bar's right-aligned title dropdown (the
-        // designer's pane-switcher idiom); Accounts is a plain button beside it.
+        // designer's pane-switcher idiom); the account switcher is a real
+        // Dropdown beside it.
         let menubar = MenuBar::new(0.0, 0.0, 800.0, MENUBAR_H)
             .with_recess(true)
             .with_title("Inbox")
@@ -2130,8 +2093,6 @@ impl Application for ClearEmailApp {
             .with_item("Mail", &["New Message", "Sync Now", "Quit"])
             .with_item("Message", &["Reply", "Delete", "Mark Read/Unread"])
             .with_context_options(vec!["Inbox".to_string(), "Sent".to_string(), "Drafts".to_string(), "Trash".to_string()], 0);
-
-        let btn_accounts = Button::new(0.0, 5.0, 90.0, 26.0).with_label("Accounts");
 
         let mut search_box = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
         search_box.font_size = 11.0;
@@ -2151,7 +2112,11 @@ impl Application for ClearEmailApp {
             .or_else(|| accounts.iter().position(|a| a.is_default))
             .unwrap_or(0);
 
-        let btn_manage_accounts = Button::new(66.0, 15.0, 300.0, 26.0).with_label("Manage Accounts...");
+        let account_dropdown = cce_ui::widget::Dropdown::new(
+            account_dropdown_options(&accounts),
+            selected_account_idx,
+        )
+        .with_font_family(&cce_ui::layout::parse_font_string(&cce_ui::layout::menubar_font()).0);
 
         let mut detail_body = TextBox::new(String::new()).with_multiline(true).with_draw_bg_border(false);
         detail_body.font_size = 12.0;
@@ -2215,7 +2180,7 @@ impl Application for ClearEmailApp {
             keys: EmailKeys::load(),
             btn_compose,
             menubar,
-            btn_accounts,
+            account_dropdown,
             search_box,
             email_list,
             email_buttons: Vec::new(),
@@ -2234,7 +2199,6 @@ impl Application for ClearEmailApp {
             btn_compose_attach,
             accounts,
             selected_account_idx,
-            btn_manage_accounts,
             emails,
             current_folder: Folder::Inbox,
             selected_email_id: None,
@@ -2274,37 +2238,8 @@ impl Application for ClearEmailApp {
                 self.selected_email_id = None;
                 self.email_list.set_scroll_y(0.0);
                 self.body_scroll = 0.0;
-                if f == Folder::Accounts {
-                    // Accounts are managed by cce-system-interface — re-read the
-                    // shared accounts.json on every entry so its changes appear
-                    // without an app restart. Keep the selection by email; if
-                    // that account is gone, fall to the default.
-                    let prev_email = self
-                        .accounts
-                        .get(self.selected_account_idx)
-                        .map(|a| a.email.clone());
-                    self.accounts = load_accounts();
-                    let new_idx = prev_email
-                        .as_deref()
-                        .and_then(|e| self.accounts.iter().position(|a| a.email == e))
-                        .or_else(|| self.accounts.iter().position(|a| a.is_default))
-                        .unwrap_or(0);
-                    let changed_account =
-                        self.accounts.get(new_idx).map(|a| a.email.as_str()) != prev_email.as_deref();
-                    self.selected_account_idx = new_idx;
-                    if changed_account {
-                        if let Some(email) = self.accounts.get(new_idx).map(|a| a.email.clone()) {
-                            self.emails = load_emails_for_account(&email);
-                            save_selected_account_email(&email);
-                            self.start_sync(true);
-                        } else {
-                            self.emails = Vec::new();
-                        }
-                    }
-                } else {
-                    // Mail folders refresh from the server on entry (throttled).
-                    self.start_sync(false);
-                }
+                // Folders refresh from the server on entry (throttled).
+                self.start_sync(false);
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -2585,6 +2520,7 @@ impl Application for ClearEmailApp {
             }
             AppMessage::SelectAccount(idx) => {
                 self.selected_account_idx = idx;
+                self.account_dropdown.selected = idx.min(self.accounts.len().saturating_sub(1));
                 if let Some(email) = self.accounts.get(idx).map(|a| a.email.clone()) {
                     self.emails = load_emails_for_account(&email);
                     save_selected_account_email(&email);
@@ -2725,7 +2661,6 @@ impl Application for ClearEmailApp {
             Folder::Sent => "sent",
             Folder::Drafts => "drafts",
             Folder::Trash => "trash",
-            Folder::Accounts => "accounts",
         };
 
         let list_x = 10.0;
@@ -2743,6 +2678,9 @@ impl Application for ClearEmailApp {
             if self.menubar.popover_rect().is_some() {
                 self.ui_context.register_popover(&mut self.menubar);
             }
+            if self.account_dropdown.popover_rect().is_some() {
+                self.ui_context.register_popover(&mut self.account_dropdown);
+            }
             // Bar title = current folder (the context-dropdown trigger), with
             // the inbox unread count folded in where the sidebar badge lived.
             let inbox_unread = self.emails.iter().filter(|e| e.folder == "inbox" && !e.read).count();
@@ -2752,47 +2690,38 @@ impl Application for ClearEmailApp {
                 Folder::Sent => "Sent".to_string(),
                 Folder::Drafts => "Drafts".to_string(),
                 Folder::Trash => "Trash".to_string(),
-                Folder::Accounts => "Accounts".to_string(),
             };
-            if let Some(ci) = match self.current_folder {
-                Folder::Inbox => Some(0),
-                Folder::Sent => Some(1),
-                Folder::Drafts => Some(2),
-                Folder::Trash => Some(3),
-                Folder::Accounts => None,
-            } {
-                self.menubar.set_context_selected(ci);
-            }
-            // Fixed offset from the right edge — anchoring to the title would
-            // make the button drift as the folder name changes length.
-            self.btn_accounts.set_rect(w_f32 - 250.0, 5.0, 90.0, 26.0);
+            self.menubar.set_context_selected(match self.current_folder {
+                Folder::Inbox => 0,
+                Folder::Sent => 1,
+                Folder::Drafts => 2,
+                Folder::Trash => 3,
+            });
+            // Fixed offset from the right edge — anchoring to the folder title
+            // would make the switcher drift as the folder name changes length.
+            self.account_dropdown.set_rect(w_f32 - 360.0, 5.0, 210.0, 26.0);
 
             cce_ui::scale::set_scale_factor(scale as f32);
             self.btn_compose.set_rect(list_x, 15.0 + MENUBAR_H, 26.0, 26.0);
 
-            // Search box / Add Account and Scrolling list
-            let list_count = if self.current_folder == Folder::Accounts {
-                self.btn_manage_accounts.set_rect(list_x + 36.0, 15.0 + MENUBAR_H, 264.0, 26.0);
-                self.accounts.len()
-            } else {
-                self.search_box.set_rect(list_x + 36.0, 15.0 + MENUBAR_H, 264.0, 26.0);
-                
-                // Get filtered emails count for bounds setup
-                self.emails.iter()
-                    .filter(|e| e.folder == current_folder_str)
-                    .filter(|e| {
-                        let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
-                        let search_lower = search_text.to_lowercase();
-                        if search_lower.is_empty() {
-                            true
-                        } else {
-                            e.from.to_lowercase().contains(&search_lower) ||
-                            e.subject.to_lowercase().contains(&search_lower) ||
-                            e.body.to_lowercase().contains(&search_lower)
-                        }
-                    })
-                    .count()
-            };
+            // Search box and Scrolling list
+            self.search_box.set_rect(list_x + 36.0, 15.0 + MENUBAR_H, 264.0, 26.0);
+
+            // Get filtered emails count for bounds setup
+            let list_count = self.emails.iter()
+                .filter(|e| e.folder == current_folder_str)
+                .filter(|e| {
+                    let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
+                    let search_lower = search_text.to_lowercase();
+                    if search_lower.is_empty() {
+                        true
+                    } else {
+                        e.from.to_lowercase().contains(&search_lower) ||
+                        e.subject.to_lowercase().contains(&search_lower) ||
+                        e.body.to_lowercase().contains(&search_lower)
+                    }
+                })
+                .count();
 
             self.email_list.set_rect(list_x, 55.0 + MENUBAR_H, 300.0, h_f32 - 70.0 - MENUBAR_H);
             self.email_list.update_bounds(list_count, 55.0 + MENUBAR_H, h_f32 - 70.0 - MENUBAR_H);
@@ -2828,9 +2757,7 @@ impl Application for ClearEmailApp {
             };
 
             // Get filtered email IDs and selection states
-            let filtered_email_ids: Vec<(usize, bool)> = if self.current_folder == Folder::Accounts {
-                Vec::new()
-            } else {
+            let filtered_email_ids: Vec<(usize, bool)> = {
                 let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
                 let search_lower = search_text.to_lowercase();
                 self.emails.iter()
@@ -2848,37 +2775,25 @@ impl Application for ClearEmailApp {
                     .collect()
             };
 
-            if self.current_folder == Folder::Accounts {
-                for idx in 0..self.accounts.len() {
-                    self.email_buttons[idx].selected = idx == self.selected_account_idx;
-                    if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                        self.email_buttons[idx].set_rect(list_x, draw_y, 300.0, 54.0);
-                    } else {
-                        self.email_buttons[idx].set_rect(-9999.0, -9999.0, 0.0, 0.0);
-                    }
+            for (idx, &(_email_id, is_selected)) in filtered_email_ids.iter().enumerate() {
+                self.email_buttons[idx].selected = is_selected;
+                if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
+                    self.email_buttons[idx].set_rect(list_x, draw_y, 300.0, 54.0);
+                } else {
+                    self.email_buttons[idx].set_rect(-9999.0, -9999.0, 0.0, 0.0);
                 }
+            }
 
-            } else {
-                for (idx, &(_email_id, is_selected)) in filtered_email_ids.iter().enumerate() {
-                    self.email_buttons[idx].selected = is_selected;
-                    if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                        self.email_buttons[idx].set_rect(list_x, draw_y, 300.0, 54.0);
-                    } else {
-                        self.email_buttons[idx].set_rect(-9999.0, -9999.0, 0.0, 0.0);
-                    }
-                }
+            // Detail View
+            if let Some((read, body)) = selected_email_state {
+                self.btn_reply.set_rect(detail_x, 8.0 + MENUBAR_H, 70.0, 26.0);
+                self.btn_delete.set_rect(detail_x + 80.0, 8.0 + MENUBAR_H, 80.0, 26.0);
+                self.btn_unread.set_rect(detail_x + 170.0, 8.0 + MENUBAR_H, 110.0, 26.0);
+                self.btn_unread.set_label(if read { "Mark Unread" } else { "Mark Read" });
 
-                // Detail View
-                if let Some((read, body)) = selected_email_state {
-                    self.btn_reply.set_rect(detail_x, 8.0 + MENUBAR_H, 70.0, 26.0);
-                    self.btn_delete.set_rect(detail_x + 80.0, 8.0 + MENUBAR_H, 80.0, 26.0);
-                    self.btn_unread.set_rect(detail_x + 170.0, 8.0 + MENUBAR_H, 110.0, 26.0);
-                    self.btn_unread.set_label(if read { "Mark Unread" } else { "Mark Read" });
-
-                    let detail_w = (w_f32 - (detail_x + 15.0)).max(100.0);
-                    self.detail_body.set_rect(detail_x, 170.0 + MENUBAR_H, detail_w, (h_f32 - 190.0 - MENUBAR_H).max(100.0));
-                    self.detail_body.text = body;
-                }
+                let detail_w = (w_f32 - (detail_x + 15.0)).max(100.0);
+                self.detail_body.set_rect(detail_x, 170.0 + MENUBAR_H, detail_w, (h_f32 - 190.0 - MENUBAR_H).max(100.0));
+                self.detail_body.text = body;
             }
 
             // Compose inputs layout
@@ -2902,9 +2817,7 @@ impl Application for ClearEmailApp {
         }
 
         // Now compute `filtered` only for rendering (immutable borrow of self)
-        let filtered: Vec<&Email> = if self.current_folder == Folder::Accounts {
-            Vec::new()
-        } else {
+        let filtered: Vec<&Email> = {
             let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
             let search_lower = search_text.to_lowercase();
             self.emails.iter()
@@ -2928,7 +2841,7 @@ impl Application for ClearEmailApp {
         // hover/selected states) AND text in one pass. The legacy extra_quads bridge only
         // forwarded plain Prim::Quads, so every widget's rounded chrome was dropped.
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose, &mut *quads.pc);
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_accounts, &mut *quads.pc);
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.account_dropdown, &mut *quads.pc);
         // The menubar itself paints at the END of display_list — its dropdown
         // must overlay every pane beneath.
 
@@ -2936,13 +2849,9 @@ impl Application for ClearEmailApp {
         quads.push((separator_x, MENUBAR_H, 1.0, h_f32 - MENUBAR_H, [0.18, 0.18, 0.22, 1.0]));
 
         // Search box / Add Account and List
-        if self.current_folder == Folder::Accounts {
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_manage_accounts, &mut *quads.pc);
-        } else {
-            self.search_box.prepare_text(&mut self.font_system);
-            cce_ui::widget::WidgetHost::prepare_text(&mut self.menubar, &mut self.font_system);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.search_box, &mut *quads.pc);
-        }
+        self.search_box.prepare_text(&mut self.font_system);
+        cce_ui::widget::WidgetHost::prepare_text(&mut self.menubar, &mut self.font_system);
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.search_box, &mut *quads.pc);
         {
             let mut list_quads = Vec::new();
             self.email_list.push_quads(&mut list_quads);
@@ -2950,17 +2859,12 @@ impl Application for ClearEmailApp {
         }
 
         // Visible List Item Buttons
-        let list_len = if self.current_folder == Folder::Accounts {
-            self.accounts.len()
-        } else {
-            filtered.len()
-        };
-        for idx in 0..list_len {
+        for idx in 0..filtered.len() {
             if self.email_list.get_item_draw_y(idx, 0.0).is_some() {
                 cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.email_buttons[idx], &mut *quads.pc);
 
-                // Blue dot/unread indicator for this row (emails only)
-                if self.current_folder != Folder::Accounts && !filtered[idx].read {
+                // Blue dot/unread indicator for this row
+                if !filtered[idx].read {
                     if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
                         quads.push((list_x + 8.0, draw_y + 12.0, 6.0, 6.0, [0.20, 0.45, 0.85, 1.0]));
                     }
@@ -2976,14 +2880,7 @@ impl Application for ClearEmailApp {
         }
 
         // 4. Detail View Area
-        if self.current_folder == Folder::Accounts {
-            if self.selected_account_idx < self.accounts.len() {
-                // Top action toolbar background
-                quads.push((detail_panel_x, MENUBAR_H, w_f32 - detail_panel_x, 42.0, [0.08, 0.08, 0.12, 1.0]));
-                quads.push((detail_panel_x, MENUBAR_H + 42.0, w_f32 - detail_panel_x, 1.0, [0.18, 0.18, 0.22, 1.0]));
-
-            }
-        } else if let Some(selected_id) = self.selected_email_id {
+        if let Some(selected_id) = self.selected_email_id {
             if self.emails.iter().any(|e| e.id == selected_id) {
                 // Top action toolbar background
                 quads.push((detail_panel_x, MENUBAR_H, w_f32 - detail_panel_x, 42.0, [0.08, 0.08, 0.12, 1.0]));
@@ -3170,14 +3067,10 @@ impl Application for ClearEmailApp {
         } else {
             // Sidebar buttons
             if ctx.propagate_event(&mv, self.btn_compose.id()) { changed = true; }
-            if ctx.propagate_event(&mv, self.btn_accounts.id()) { changed = true; }
+            if ctx.propagate_event(&mv, self.account_dropdown.id()) { changed = true; }
 
-            // Search / Add account and lists
-            if self.current_folder == Folder::Accounts {
-                if ctx.propagate_event(&mv, self.btn_manage_accounts.id()) { changed = true; }
-            } else {
-                if ctx.propagate_event(&mv, self.search_box.id()) { changed = true; }
-            }
+            // Search and lists
+            if ctx.propagate_event(&mv, self.search_box.id()) { changed = true; }
             if self.email_list.cursor_moved(px, py) { changed = true; }
             // Hover scope for the detail-pane body scroll (wheel + keys).
             self.detail_hovered = px > 10.0 + 310.0;
@@ -3189,7 +3082,7 @@ impl Application for ClearEmailApp {
             }
 
             // Detail view buttons
-            if self.current_folder != Folder::Accounts && self.selected_email_id.is_some() {
+            if self.selected_email_id.is_some() {
                 if ctx.propagate_event(&mv, self.btn_reply.id()) { changed = true; }
                 if ctx.propagate_event(&mv, self.btn_delete.id()) { changed = true; }
                 if ctx.propagate_event(&mv, self.btn_unread.id()) { changed = true; }
@@ -3212,10 +3105,7 @@ impl Application for ClearEmailApp {
 
         // Detail-pane body scrollbar drag — before the ui_context borrow (the
         // sb helpers take &mut self).
-        if !self.compose_open
-            && button == MouseButton::Left
-            && self.current_folder != Folder::Accounts
-        {
+        if !self.compose_open && button == MouseButton::Left {
             match state {
                 ElementState::Pressed => {
                     // A fresh press always supersedes a stale drag — a lost
@@ -3254,18 +3144,59 @@ impl Application for ClearEmailApp {
 
         let ctx = &mut self.ui_context;
 
-        // Accounts button first: it sits inside the bar band, and the menubar
+        // Account dropdown first: it sits inside the bar band, and the menubar
         // consumes any press within its rect — routed after, it would never
         // see the click.
-        if ctx.propagate_event(&ev, self.btn_accounts.id()) {
-            if state == ElementState::Released && self.btn_accounts.take_click() {
+        {
+            let was_open = self.account_dropdown.open;
+            if ctx.propagate_event(&ev, self.account_dropdown.id()) {
+                if !was_open && self.account_dropdown.open {
+                    // Freshly opened: re-read the shared accounts.json so
+                    // cce-system-interface edits appear without a restart (the
+                    // job the retired Accounts page did on entry). Keep the
+                    // selection by email; if that account is gone, fall to the
+                    // default. Field-level accesses only — `ctx` still borrows
+                    // self.ui_context.
+                    let prev_email = self
+                        .accounts
+                        .get(self.selected_account_idx)
+                        .map(|a| a.email.clone());
+                    self.accounts = load_accounts();
+                    let new_idx = prev_email
+                        .as_deref()
+                        .and_then(|e| self.accounts.iter().position(|a| a.email == e))
+                        .or_else(|| self.accounts.iter().position(|a| a.is_default))
+                        .unwrap_or(0);
+                    let changed_account =
+                        self.accounts.get(new_idx).map(|a| a.email.as_str()) != prev_email.as_deref();
+                    self.account_dropdown.options = account_dropdown_options(&self.accounts);
+                    self.account_dropdown.selected = new_idx;
+                    if changed_account {
+                        // The account under the selection vanished — switch to
+                        // what the trigger now shows.
+                        *needs_rebuild = true;
+                        self.needs_rebuild = true;
+                        return Some(AppMessage::SelectAccount(new_idx));
+                    }
+                }
+                let mut msg_out = None;
+                if self.account_dropdown.take_change() {
+                    let idx = self.account_dropdown.selected;
+                    if idx < self.accounts.len() {
+                        if idx != self.selected_account_idx {
+                            msg_out = Some(AppMessage::SelectAccount(idx));
+                        }
+                    } else {
+                        // The trailing "Manage Accounts…" pseudo-entry: not an
+                        // account — restore the trigger to the active one.
+                        self.account_dropdown.selected = self.selected_account_idx;
+                        msg_out = Some(AppMessage::ManageAccounts);
+                    }
+                }
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
-                return Some(AppMessage::SwitchFolder(Folder::Accounts));
+                return msg_out;
             }
-            *needs_rebuild = true;
-            self.needs_rebuild = true;
-            return None;
         }
 
         // Menubar next — an open dropdown overlays the panes, so a handled
@@ -3373,26 +3304,17 @@ impl Application for ClearEmailApp {
                 }
             }
 
-            if self.current_folder == Folder::Accounts {
-                if ctx.propagate_event(&ev, self.btn_manage_accounts.id()) {
-                    changed = true;
-                    if state == ElementState::Released && self.btn_manage_accounts.take_click() {
-                        msg_out = Some(AppMessage::ManageAccounts);
-                    }
+            // Search input
+            if ctx.propagate_event(&ev, self.search_box.id()) {
+                changed = true;
+                if state == ElementState::Pressed { ctx.set_focused(&mut self.search_box); }
+                if self.search_box.take_change() {
+                    msg_out = Some(AppMessage::SearchChanged);
                 }
-            } else {
-                // Search input
-                if ctx.propagate_event(&ev, self.search_box.id()) {
-                    changed = true;
-                    if state == ElementState::Pressed { ctx.set_focused(&mut self.search_box); }
-                    if self.search_box.take_change() {
-                        msg_out = Some(AppMessage::SearchChanged);
-                    }
-                } else if state == ElementState::Pressed && button == MouseButton::Left {
-                    ctx.clear_focus();
-                    self.search_box.unfocus();
-                    changed = true;
-                }
+            } else if state == ElementState::Pressed && button == MouseButton::Left {
+                ctx.clear_focus();
+                self.search_box.unfocus();
+                changed = true;
             }
 
             // The scrollbar strip sits inside the row rects (rows span x 10..310, the strip
@@ -3416,20 +3338,6 @@ impl Application for ClearEmailApp {
 
             if scrollbar_took_press {
                 // fall through to the rest of the handler, but not to the rows
-            } else if self.current_folder == Folder::Accounts {
-                for (idx, _) in self.accounts.iter().enumerate() {
-                    if idx < self.email_buttons.len() {
-                        let btn = &mut self.email_buttons[idx];
-                        if btn.rect().0 > -9000.0 {
-                            if ctx.propagate_event(&ev, btn.id()) {
-                                changed = true;
-                                if state == ElementState::Released && btn.take_click() {
-                                    msg_out = Some(AppMessage::SelectAccount(idx));
-                                }
-                            }
-                        }
-                    }
-                }
             } else {
                 // Mirrors the paint pass's folder filter — this decides which
                 // email a row click lands on. No wildcard: a new folder
@@ -3440,7 +3348,6 @@ impl Application for ClearEmailApp {
                     Folder::Sent => "sent",
                     Folder::Drafts => "drafts",
                     Folder::Trash => "trash",
-                    Folder::Accounts => "accounts",
                 };
                 let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
                 let search_lower = search_text.to_lowercase();
@@ -3473,7 +3380,7 @@ impl Application for ClearEmailApp {
             }
 
             // Detail View action buttons
-            if self.current_folder != Folder::Accounts && self.selected_email_id.is_some() {
+            if self.selected_email_id.is_some() {
                 if ctx.propagate_event(&ev, self.btn_reply.id()) {
                     changed = true;
                     if state == ElementState::Released && self.btn_reply.take_click() {
@@ -3520,10 +3427,7 @@ impl Application for ClearEmailApp {
         }
 
         // Detail-pane body scroll.
-        if !self.compose_open
-            && self.current_folder != Folder::Accounts
-            && self.selected_email_id.is_some()
-        {
+        if !self.compose_open && self.selected_email_id.is_some() {
             let separator_x = 10.0 + 310.0;
             if px > separator_x {
                 let dy = match delta {
@@ -3577,7 +3481,7 @@ impl Application for ClearEmailApp {
                     msg_out = Some(AppMessage::ComposeNew);
                     handled = true;
                 } else if cce_ui::widget::match_key_shortcut(event, &self.keys.open_search) {
-                    if self.current_folder != Folder::Accounts {
+                    {
                         ctx.set_focused(&mut self.search_box);
                         self.search_box.focus();
                         handled = true;
@@ -3589,7 +3493,6 @@ impl Application for ClearEmailApp {
             if !handled
                 && self.detail_hovered
                 && self.selected_email_id.is_some()
-                && self.current_folder != Folder::Accounts
                 && !self.search_box.editing
                 && event.state == ElementState::Pressed
             {
@@ -3618,7 +3521,7 @@ impl Application for ClearEmailApp {
                 handled = true;
             }
 
-            if !handled && self.current_folder != Folder::Accounts && self.search_box.editing {
+            if !handled && self.search_box.editing {
                 if ctx.propagate_event(&kev, self.search_box.id()) {
                     handled = true;
                     if self.search_box.take_change() {
@@ -3629,7 +3532,7 @@ impl Application for ClearEmailApp {
 
             // Escape unfocuses search
             if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(cce_ui::widget::NamedKey::Escape) {
-                if self.current_folder != Folder::Accounts && self.search_box.editing {
+                if self.search_box.editing {
                     ctx.clear_focus();
                     self.search_box.unfocus();
                     handled = true;
