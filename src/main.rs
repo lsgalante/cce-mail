@@ -2,7 +2,7 @@ mod scroll_region;
 use scroll_region::ScrollRegion;
 use wayland_client::QueueHandle;
 use cce_ui::cosmic_text::FontSystem;
-use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
+use cce_ui::engine::{Application, CursorIcon, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, WidgetHost,
     TextBox, Button, TextLabel, Key, Dropdown
@@ -3187,6 +3187,19 @@ impl Application for ClearEmailApp {
 
         self.emit_text_prims(&mut __pc);
         Some(__pc.finish())
+    }
+
+    fn cursor_icon(&self, x: f32, y: f32) -> Option<CursorIcon> {
+        // Resize arrows over the split separator's grab band, and for the
+        // whole drag — mid-drag the pointer legally outruns the clamped
+        // line, and the cursor must not flicker back to the arrow there.
+        if !self.compose_open
+            && (self.split_dragging
+                || ((x - self.split_geom().1).abs() <= SPLIT_GRAB_SLOP && y > MENUBAR_H))
+        {
+            return Some(CursorIcon::EwResize);
+        }
+        None
     }
 
     fn display_list_text(&self) -> bool {
