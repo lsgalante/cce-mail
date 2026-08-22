@@ -110,7 +110,7 @@ enum AppMessage {
     /// A failure a user must not miss: shown as a sticky red toast (no
     /// timer) where [`AppMessage::Status`] is a green 4-second one.
     StatusError(String),
-    EmailsSynced(String, Vec<Email>),
+    EmailsSynced(String, Vec<FolderSync>),
     UpdateAccountTokens(String, Option<String>, Option<u64>),
 }
 
@@ -232,6 +232,10 @@ struct ClearEmailApp {
     /// that as the "already said this" flag made every retry look like the
     /// first and logged the same line every few seconds.
     secret_missing_reported: bool,
+    /// Set while a mailbox still has history to download: `tick` runs the next
+    /// backfill pass at this instant. Cleared once the server holds nothing
+    /// the cache is missing.
+    backfill_at: Option<std::time::Instant>,
     status_message: Option<StatusToast>,
     sender: calloop::channel::Sender<AppMessage>,
 
@@ -572,6 +576,20 @@ fn detail_chip_rects(atts: &[RemoteAttachment], detail_x: f32) -> Vec<(f32, f32,
 }
 
 const FETCH_COUNT: usize = 50;
+
+/// Ceiling on how much one sync pass downloads. A mailbox with years of
+/// history backfills across passes instead of stalling the first one, and
+/// each pass is committed to disk, so progress survives a restart.
+const MAX_FETCH_PER_SYNC: usize = 500;
+
+/// How many already-cached messages get their flags refreshed per pass, so
+/// mail read on another client stops showing unread here. Newest-first; the
+/// whole mailbox would be a needless round trip on every sync.
+const FLAG_REFRESH_WINDOW: usize = 200;
+
+/// Gap between backfill passes while history is still coming down. Short
+/// enough to feel continuous, long enough not to hammer the server.
+const BACKFILL_DELAY_SECS: u64 = 3;
 
 /// Byte cap on a fetched text part (pre-decode); the display model caps at
 /// 1200 chars, so 64 KiB of qp/base64 is plenty.
@@ -1191,25 +1209,197 @@ fn open_imap_session(
 
 /// Namespaces sent-folder ids away from inbox sequence numbers (both are
 /// fetch-time seq numbers; ids must stay unique across the merged list).
-const SENT_ID_OFFSET: usize = 1_000_000;
 
-/// Fetch the newest [`FETCH_COUNT`] messages of one mailbox with the two-pass
-/// BODYSTRUCTURE strategy (pass 1 headers/flags/structure, pass 2 text parts
-/// grouped by section, capped full-message fallback). Returns None when the
-/// mailbox can't be selected or a whole-mailbox step fails; per-message body
-/// fetch failures degrade to empty bodies. `verbose` gates the Status toasts
-/// (the sent fetch rides quietly behind the inbox one).
-fn fetch_mailbox(
+/// One mailbox's outcome for a single sync pass.
+///
+/// `server_uids` is the whole mailbox, not just what was fetched: the merge
+/// needs it to notice messages deleted from another client. Without it a
+/// local cache that only ever grows would keep showing mail that no longer
+/// exists.
+#[derive(Debug, Clone)]
+struct FolderSync {
+    folder: String,
+    /// Newly downloaded messages. `id` is left 0 — identity is assigned by
+    /// the merge, which is the only place that can see the whole cache.
+    fetched: Vec<Email>,
+    server_uids: Vec<u32>,
+    /// Of the recent window, the uids the server marks \Seen. Read state set
+    /// on another client reaches already-cached mail through this.
+    seen_uids: Vec<u32>,
+    /// Still missing after this pass — drives the backfill continuation.
+    remaining: usize,
+}
+
+/// Download one batch of messages by UID, with the two-pass BODYSTRUCTURE
+/// strategy (pass 1 headers/flags/structure, pass 2 text parts grouped by
+/// section, capped full-message fallback). Keyed on UID throughout: sequence
+/// numbers shift whenever anything is expunged, so they cannot identify a
+/// message across syncs.
+fn fetch_uid_batch(
+    session: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>,
+    account_email: &str,
+    folder_tag: &str,
+    uids: &[u32],
+    say_err: &dyn Fn(String),
+) -> Vec<Email> {
+    if uids.is_empty() {
+        return Vec::new();
+    }
+    let uid_set = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+
+    struct Pending {
+        uid: u32,
+        read: bool,
+        from: String,
+        to: String,
+        subject: String,
+        date: String,
+        part: Option<TextPartSpec>,
+        body: String,
+        remote: Vec<RemoteAttachment>,
+    }
+    let parser = mail_parser::MessageParser::default();
+    let mut pending: Vec<Pending> = Vec::new();
+
+    // Pass 1: flags + headers + BODYSTRUCTURE — no body bytes yet, so
+    // attachments never ride along. PEEK semantics don't matter here
+    // (headers/structure don't set \Seen), but flags come from the server.
+    match session.uid_fetch(&uid_set, "(UID FLAGS RFC822.HEADER BODYSTRUCTURE)") {
+        Ok(fetches) => {
+            for fetch in fetches.iter() {
+                let Some(uid) = fetch.uid else { continue };
+                let read = fetch
+                    .flags()
+                    .iter()
+                    .any(|f| matches!(f, imap::types::Flag::Seen));
+                let (from, to, subject, date) = match fetch.header().and_then(|h| parser.parse(h)) {
+                    Some(msg) => (
+                        format_from(&msg),
+                        format_to(&msg, account_email),
+                        msg.subject().unwrap_or("(No Subject)").to_string(),
+                        format_date(msg.date()),
+                    ),
+                    None => (
+                        "Unknown".to_string(),
+                        account_email.to_string(),
+                        "(No Subject)".to_string(),
+                        "Unknown".to_string(),
+                    ),
+                };
+                pending.push(Pending {
+                    uid,
+                    read,
+                    from,
+                    to,
+                    subject,
+                    date,
+                    part: fetch.bodystructure().and_then(find_text_part),
+                    body: String::new(),
+                    remote: fetch.bodystructure().map(find_attachment_parts).unwrap_or_default(),
+                });
+            }
+        }
+        Err(e) => {
+            say_err(format!("IMAP Fetch failed: {}", e));
+            return Vec::new();
+        }
+    }
+
+    // Pass 2: fetch just the chosen text part, grouped by section path so a
+    // typical batch needs only 1-2 more round trips; capped so a giant text
+    // part can't stall the sync either.
+    let mut groups: std::collections::HashMap<Vec<u32>, Vec<u32>> = std::collections::HashMap::new();
+    for p in &pending {
+        if let Some(spec) = &p.part {
+            groups.entry(spec.path.clone()).or_default().push(p.uid);
+        }
+    }
+    for (path, group_uids) in groups {
+        let set = group_uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let section = section_str(&path);
+        let query = format!("(UID BODY.PEEK[{}]<0.{}>)", section, PART_FETCH_CAP);
+        let section_path = imap_proto::types::SectionPath::Part(path, None);
+        match session.uid_fetch(&set, &query) {
+            Ok(fetches) => {
+                for fetch in fetches.iter() {
+                    let Some(uid) = fetch.uid else { continue };
+                    let Some(bytes) = fetch.section(&section_path) else { continue };
+                    if let Some(p) = pending.iter_mut().find(|p| p.uid == uid) {
+                        if let Some(spec) = &p.part {
+                            p.body = parser
+                                .parse(&spec.synthesize(bytes))
+                                .map(|m| extract_body(&m))
+                                .unwrap_or_default();
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                say_err(format!("IMAP part fetch failed: {}", e));
+            }
+        }
+    }
+
+    // Fallback: no usable text part in the structure (or the walk failed) —
+    // one capped full-message fetch for those stragglers.
+    let no_part: Vec<u32> = pending.iter().filter(|p| p.part.is_none()).map(|p| p.uid).collect();
+    if !no_part.is_empty() {
+        let set = no_part.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let query = format!("(UID BODY.PEEK[]<0.{}>)", PART_FETCH_CAP * 4);
+        match session.uid_fetch(&set, &query) {
+            Ok(fetches) => {
+                for fetch in fetches.iter() {
+                    let Some(uid) = fetch.uid else { continue };
+                    let Some(raw) = fetch.body() else { continue };
+                    if let Some(p) = pending.iter_mut().find(|p| p.uid == uid) {
+                        p.body = parser.parse(raw).map(|m| extract_body(&m)).unwrap_or_default();
+                    }
+                }
+            }
+            Err(e) => {
+                say_err(format!("IMAP fallback fetch failed: {}", e));
+            }
+        }
+    }
+
+    pending
+        .into_iter()
+        .map(|p| Email {
+            id: 0, // assigned by the merge
+            uid: Some(p.uid),
+            from: p.from,
+            to: p.to,
+            subject: p.subject,
+            body: p.body,
+            date: p.date,
+            read: p.read,
+            folder: folder_tag.to_string(),
+            cc: String::new(),
+            bcc: String::new(),
+            attachments: Vec::new(),
+            remote_attachments: p.remote,
+        })
+        .collect()
+}
+
+/// Sync one mailbox incrementally: download only what the cache is missing,
+/// newest first, and report what the server holds so the merge can drop mail
+/// deleted elsewhere.
+///
+/// This used to refetch the newest [`FETCH_COUNT`] every time and the merge
+/// replaced the folder wholesale, which pinned the cache at 50 messages
+/// however often it ran. Now a pass takes up to [`MAX_FETCH_PER_SYNC`] of the
+/// missing ones and reports the rest as `remaining`, so history backfills
+/// across passes instead of never arriving.
+fn sync_folder(
     session: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>,
     sender: &calloop::channel::Sender<AppMessage>,
     account_email: &str,
     mailbox: &str,
     folder_tag: &str,
-    id_offset: usize,
+    known: &std::collections::HashSet<u32>,
     verbose: bool,
-) -> Option<Vec<Email>> {
-    // Same shape as open_imap_session's: stderr always, toast when
-    // `verbose`, `err:` = sticky red.
+) -> Option<FolderSync> {
     macro_rules! say {
         (err: $msg:expr) => {{
             let msg: String = $msg;
@@ -1231,162 +1421,182 @@ fn fetch_mailbox(
         return None;
     }
 
-    let mut search_results: Vec<u32> = match session.search("ALL") {
-        Ok(ids) => ids.into_iter().collect(),
+    // UID SEARCH, not SEARCH: sequence numbers are meaningless across syncs.
+    let mut server_uids: Vec<u32> = match session.uid_search("ALL") {
+        Ok(uids) => uids.into_iter().collect(),
         Err(e) => {
             say!(err: format!("IMAP Search failed: {}", e));
             return None;
         }
     };
-    search_results.sort();
+    server_uids.sort_unstable();
 
-    let total = search_results.len();
-    if total == 0 {
-        return Some(Vec::new());
-    }
+    let missing: Vec<u32> = server_uids.iter().copied().filter(|u| !known.contains(u)).collect();
+    let take = missing.len().min(MAX_FETCH_PER_SYNC);
+    let batch_uids = &missing[missing.len() - take..]; // newest first come first
+    let remaining = missing.len() - take;
 
-    // Pass 1: flags + headers + BODYSTRUCTURE — no body bytes yet, so
-    // attachments never ride along. PEEK semantics don't matter here
-    // (headers/structure don't set \Seen), but flags come from the server.
-    let start_idx = total.saturating_sub(FETCH_COUNT);
-    let range = &search_results[start_idx..total];
-    let query_seq = range.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-    say!(format!("Fetching {} messages...", range.len()));
-
-    struct Pending {
-        seq: u32,
-        uid: Option<u32>,
-        read: bool,
-        from: String,
-        to: String,
-        subject: String,
-        date: String,
-        part: Option<TextPartSpec>,
-        body: String,
-        remote: Vec<RemoteAttachment>,
-    }
-    let parser = mail_parser::MessageParser::default();
-    let mut pending: Vec<Pending> = Vec::new();
-    match session.fetch(&query_seq, "(UID FLAGS RFC822.HEADER BODYSTRUCTURE)") {
-        Ok(fetches) => {
-            for fetch in fetches.iter() {
-                let read = fetch
-                    .flags()
-                    .iter()
-                    .any(|f| matches!(f, imap::types::Flag::Seen));
-                let (from, to, subject, date) = match fetch.header().and_then(|h| parser.parse(h)) {
-                    Some(msg) => (
-                        format_from(&msg),
-                        format_to(&msg, account_email),
-                        msg.subject().unwrap_or("(No Subject)").to_string(),
-                        format_date(msg.date()),
-                    ),
-                    None => (
-                        "Unknown".to_string(),
-                        account_email.to_string(),
-                        "(No Subject)".to_string(),
-                        "Unknown".to_string(),
-                    ),
-                };
-                pending.push(Pending {
-                    seq: fetch.message,
-                    uid: fetch.uid,
-                    read,
-                    from,
-                    to,
-                    subject,
-                    date,
-                    part: fetch.bodystructure().and_then(find_text_part),
-                    body: String::new(),
-                    remote: fetch.bodystructure().map(find_attachment_parts).unwrap_or_default(),
-                });
-            }
-        }
-        Err(e) => {
-            say!(err: format!("IMAP Fetch failed: {}", e));
-            return None;
+    if take > 0 {
+        if remaining > 0 {
+            say!(format!("Fetching {} messages ({} older still to come)...", take, remaining));
+        } else {
+            say!(format!("Fetching {} messages...", take));
         }
     }
 
-    // Pass 2: fetch just the chosen text part, grouped by section path so a
-    // typical mailbox needs only 1-2 more round trips; capped so a giant
-    // text part can't stall the sync either.
-    let mut groups: std::collections::HashMap<Vec<u32>, Vec<u32>> = std::collections::HashMap::new();
-    for p in &pending {
-        if let Some(spec) = &p.part {
-            groups.entry(spec.path.clone()).or_default().push(p.seq);
+    let say_err = |m: String| {
+        eprintln!("cce-mail: {}", m);
+        if verbose {
+            let _ = sender.send(AppMessage::StatusError(m));
         }
+    };
+
+    let mut fetched = Vec::new();
+    for chunk in batch_uids.chunks(FETCH_COUNT) {
+        // Newest chunk first, so a long backfill still surfaces recent mail
+        // early. Each chunk is a separate round trip but one session.
+        let mut ordered: Vec<u32> = chunk.to_vec();
+        ordered.sort_unstable_by(|a, b| b.cmp(a));
+        fetched.extend(fetch_uid_batch(session, account_email, folder_tag, &ordered, &say_err));
     }
-    for (path, seqs) in groups {
-        let seq_set = seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
-        let section = section_str(&path);
-        let query = format!("BODY.PEEK[{}]<0.{}>", section, PART_FETCH_CAP);
-        let section_path = imap_proto::types::SectionPath::Part(path, None);
-        match session.fetch(&seq_set, &query) {
+
+    // Flags for the recent window of already-cached mail, so a message read
+    // on another client stops showing as unread here. Cheap: no bodies.
+    let mut seen_uids = Vec::new();
+    let recent_known: Vec<u32> = {
+        let mut v: Vec<u32> = server_uids.iter().copied().filter(|u| known.contains(u)).collect();
+        let keep = v.len().min(FLAG_REFRESH_WINDOW);
+        v.split_off(v.len() - keep)
+    };
+    if !recent_known.is_empty() {
+        let set = recent_known.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        match session.uid_fetch(&set, "(UID FLAGS)") {
             Ok(fetches) => {
                 for fetch in fetches.iter() {
-                    let Some(bytes) = fetch.section(&section_path) else { continue };
-                    if let Some(p) = pending.iter_mut().find(|p| p.seq == fetch.message) {
-                        if let Some(spec) = &p.part {
-                            p.body = parser
-                                .parse(&spec.synthesize(bytes))
-                                .map(|m| extract_body(&m))
-                                .unwrap_or_default();
+                    if let Some(uid) = fetch.uid {
+                        if fetch.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)) {
+                            seen_uids.push(uid);
                         }
                     }
                 }
             }
             Err(e) => {
-                say!(err: format!("IMAP part fetch failed: {}", e));
+                // Not fatal: read state simply stays as cached this pass.
+                eprintln!("cce-mail: IMAP flag refresh failed: {}", e);
             }
         }
     }
 
-    // Fallback: no usable text part in the structure (or the walk failed) —
-    // one capped full-message fetch for those stragglers.
-    let no_part: Vec<u32> = pending.iter().filter(|p| p.part.is_none()).map(|p| p.seq).collect();
-    if !no_part.is_empty() {
-        let seq_set = no_part.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
-        let query = format!("BODY.PEEK[]<0.{}>", PART_FETCH_CAP * 4);
-        match session.fetch(&seq_set, &query) {
-            Ok(fetches) => {
-                for fetch in fetches.iter() {
-                    let Some(raw) = fetch.body() else { continue };
-                    if let Some(p) = pending.iter_mut().find(|p| p.seq == fetch.message) {
-                        p.body = parser.parse(raw).map(|m| extract_body(&m)).unwrap_or_default();
-                    }
-                }
-            }
-            Err(e) => {
-                say!(err: format!("IMAP fallback fetch failed: {}", e));
-            }
-        }
-    }
-
-    let mut fetched: Vec<Email> = pending
-        .into_iter()
-        .map(|p| Email {
-            id: p.seq as usize + id_offset,
-            uid: p.uid,
-            from: p.from,
-            to: p.to,
-            subject: p.subject,
-            body: p.body,
-            date: p.date,
-            read: p.read,
-            folder: folder_tag.to_string(),
-            cc: String::new(),
-            bcc: String::new(),
-            attachments: Vec::new(),
-            remote_attachments: p.remote,
-        })
-        .collect();
-
-    fetched.reverse(); // Newest first
-    Some(fetched)
+    Some(FolderSync {
+        folder: folder_tag.to_string(),
+        fetched,
+        server_uids,
+        seen_uids,
+        remaining,
+    })
 }
 
-fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessage>) {
+/// Fold one sync pass into the cached mail.
+///
+/// Additive by design: the previous merge replaced each server-backed folder
+/// wholesale, so the cache could never hold more than one pass fetched and
+/// syncing twice threw away what the first pass downloaded. Here prior mail
+/// survives, and identity is `(folder, uid)` — never `id`, which is local, and
+/// never the IMAP sequence number, which shifts on any expunge.
+///
+/// Only folders present in `folders` are reconciled: a pass that could not
+/// select Sent must not be read as "the server has no sent mail".
+fn merge_sync(prior: Vec<Email>, folders: &[FolderSync]) -> Vec<Email> {
+    use std::collections::HashSet;
+
+    let mut out = prior;
+
+    for f in folders {
+        let server: HashSet<u32> = f.server_uids.iter().copied().collect();
+        let seen: HashSet<u32> = f.seen_uids.iter().copied().collect();
+
+        // Deleted from another client. Scoped to this folder and to mail that
+        // came from the server: locally-created rows (uid None) and anything
+        // the user moved elsewhere (trash, drafts) are not this pass's business.
+        out.retain(|e| {
+            e.folder != f.folder || e.uid.is_none_or(|u| server.contains(&u))
+        });
+
+        // Read elsewhere. Local "read" still wins over server "unread": the
+        // seen-push is best-effort, so an in-flight or failed push must not
+        // flip a message the user has already opened back to unread.
+        for e in out.iter_mut() {
+            if e.folder == f.folder && e.uid.is_some_and(|u| seen.contains(&u)) {
+                e.read = true;
+            }
+        }
+
+        let mut next_id = out.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        for mut fresh in f.fetched.iter().cloned() {
+            let Some(uid) = fresh.uid else { continue };
+            match out
+                .iter_mut()
+                .find(|e| e.folder == f.folder && e.uid == Some(uid))
+            {
+                // Already held: refresh the content but keep the local identity
+                // and a local read that the server has not caught up with.
+                Some(existing) => {
+                    let was_read = existing.read;
+                    fresh.id = existing.id;
+                    fresh.read = fresh.read || was_read;
+                    *existing = fresh;
+                }
+                None => {
+                    fresh.id = next_id;
+                    next_id += 1;
+                    out.push(fresh);
+                }
+            }
+        }
+
+        // A locally-appended sent copy (uid None) is dropped once the server
+        // fetch carries the same message — Gmail auto-files SMTP sends into
+        // Sent Mail, so both would otherwise show.
+        if f.folder == "sent" {
+            let fetched_subjects: HashSet<&str> =
+                f.fetched.iter().map(|e| e.subject.as_str()).collect();
+            out.retain(|e| {
+                !(e.folder == "sent"
+                    && e.uid.is_none()
+                    && fetched_subjects.contains(e.subject.as_str()))
+            });
+        }
+    }
+
+    // Newest first, which is the order every list pass paints in. Server mail
+    // orders by uid (monotonic per mailbox); locally-created mail has no uid
+    // and belongs at the top, being the most recent thing the user did.
+    out.sort_by_key(|e| std::cmp::Reverse(e.uid.unwrap_or(u32::MAX)));
+
+    // Identity must be unique or selection and the per-message actions act on
+    // the wrong row. The pre-uid scheme derived `id` from the IMAP sequence
+    // number, so a message moved to trash kept an id that a later arrival was
+    // handed again — caches written by it carry real collisions. Re-key the
+    // later duplicate; the first in display order keeps its id, so whatever
+    // the user currently has selected stays put.
+    let mut used: HashSet<usize> = HashSet::new();
+    let mut next_free = out.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+    for e in out.iter_mut() {
+        if e.id == 0 || !used.insert(e.id) {
+            e.id = next_free;
+            next_free += 1;
+            used.insert(e.id);
+        }
+    }
+
+    out
+}
+
+fn sync_imap(
+    mut account: AccountInfo,
+    known: std::collections::HashMap<String, std::collections::HashSet<u32>>,
+    sender: calloop::channel::Sender<AppMessage>,
+) {
     std::thread::spawn(move || {
         if is_mock_account(&account) {
             return;
@@ -1397,37 +1607,41 @@ fn sync_imap(mut account: AccountInfo, sender: calloop::channel::Sender<AppMessa
 
         let _ = sender.send(AppMessage::Status("Syncing Inbox...".to_string()));
 
-        let Some(mut fetched) = fetch_mailbox(
+        let empty = std::collections::HashSet::new();
+        let mut folders = Vec::new();
+
+        let Some(inbox) = sync_folder(
             &mut session,
             &sender,
             &account.email,
             "INBOX",
             "inbox",
-            0,
+            known.get("inbox").unwrap_or(&empty),
             true,
         ) else {
             let _ = session.logout();
             return;
         };
+        folders.push(inbox);
 
         // Sent rides along quietly: Gmail's name first, the conventional one
         // second; a server with neither just syncs the inbox.
         for mailbox in ["[Gmail]/Sent Mail", "Sent"] {
-            if let Some(sent) = fetch_mailbox(
+            if let Some(sent) = sync_folder(
                 &mut session,
                 &sender,
                 &account.email,
                 mailbox,
                 "sent",
-                SENT_ID_OFFSET,
+                known.get("sent").unwrap_or(&empty),
                 false,
             ) {
-                fetched.extend(sent);
+                folders.push(sent);
                 break;
             }
         }
 
-        let _ = sender.send(AppMessage::EmailsSynced(account.email.clone(), fetched));
+        let _ = sender.send(AppMessage::EmailsSynced(account.email.clone(), folders));
         let _ = sender.send(AppMessage::Status("Sync Complete".to_string()));
         let _ = session.logout();
     });
@@ -1989,8 +2203,22 @@ impl ClearEmailApp {
 
         self.secret_retry_at = None;
         self.secret_missing_reported = false;
+
+        // What the cache already holds, per server-backed folder. The worker
+        // fetches only what is missing from this, which is what turns a sync
+        // from "refetch the newest 50" into "download what I do not have".
+        let mut known: std::collections::HashMap<String, std::collections::HashSet<u32>> =
+            std::collections::HashMap::new();
+        for e in &self.emails {
+            if let Some(uid) = e.uid {
+                if e.folder == "inbox" || e.folder == "sent" {
+                    known.entry(e.folder.clone()).or_default().insert(uid);
+                }
+            }
+        }
+
         let account = self.accounts[self.selected_account_idx].clone();
-        sync_imap(account, self.sender.clone());
+        sync_imap(account, known, self.sender.clone());
         self.last_sync_start = Some(std::time::Instant::now());
     }
 
@@ -2521,6 +2749,7 @@ impl Application for ClearEmailApp {
             last_sync_start: None,
             secret_retry_at: None,
             secret_missing_reported: false,
+            backfill_at: None,
             keys: EmailKeys::load(),
             mail_menu,
             folder_dropdown,
@@ -2910,57 +3139,40 @@ impl Application for ClearEmailApp {
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
-            AppMessage::EmailsSynced(email, list) => {
-                // Determine if we should update memory state (only if active account is still this one)
-                if let Some(acc) = self.accounts.get(self.selected_account_idx) {
-                    // Read state is pushed to the server best-effort (silent
-                    // set_seen_on_server), so read-in-app still wins over the
-                    // server flag here — it covers in-flight or failed pushes
-                    // (server-seen still wins over unseen).
-                    let keep_local_read = |prior: &[Email], fetched: Vec<Email>| -> Vec<Email> {
-                        fetched
-                            .into_iter()
-                            .map(|mut e| {
-                                if prior.iter().any(|p| p.id == e.id && p.folder == "inbox" && p.read) {
-                                    e.read = true;
-                                }
-                                e
-                            })
-                            .collect()
-                    };
-                    // Locally-kept mail alongside a fresh fetch: everything
-                    // except the server-backed folders — prior inbox rows are
-                    // replaced wholesale, prior server-fetched sent (uid set)
-                    // likewise, and a locally-appended sent copy (uid None)
-                    // is dropped once the server fetch carries the same
-                    // message (Gmail auto-saves SMTP sends to Sent Mail).
-                    let local_keep = |prior: &[Email], fetched: &[Email]| -> Vec<Email> {
-                        prior
-                            .iter()
-                            .filter(|e| e.folder != "inbox")
-                            .filter(|e| !(e.folder == "sent" && e.uid.is_some()))
-                            .filter(|e| {
-                                !(e.folder == "sent"
-                                    && fetched.iter().any(|f| {
-                                        f.folder == "sent" && f.subject == e.subject
-                                    }))
-                            })
-                            .cloned()
-                            .collect()
-                    };
-                    if acc.email == email {
-                        let mut merged = keep_local_read(&self.emails, list.clone());
-                        merged.extend(local_keep(&self.emails, &list));
-                        self.emails = merged;
-                        save_emails_for_account(&email, &self.emails);
-                    } else {
-                        // Just write cache to disk
-                        let acc_emails = load_emails_for_account(&email);
-                        let mut merged = keep_local_read(&acc_emails, list.clone());
-                        merged.extend(local_keep(&acc_emails, &list));
-                        save_emails_for_account(&email, &merged);
-                    }
+            AppMessage::EmailsSynced(email, folders) => {
+                let remaining: usize = folders.iter().map(|f| f.remaining).sum();
+                let fetched: usize = folders.iter().map(|f| f.fetched.len()).sum();
+                let active = self
+                    .accounts
+                    .get(self.selected_account_idx)
+                    .map(|a| a.email.clone());
+
+                if active.as_deref() == Some(email.as_str()) {
+                    let prior = std::mem::take(&mut self.emails);
+                    self.emails = merge_sync(prior, &folders);
+                    save_emails_for_account(&email, &self.emails);
+                } else if active.is_some() {
+                    // A background account: fold into its cache on disk only.
+                    let prior = load_emails_for_account(&email);
+                    save_emails_for_account(&email, &merge_sync(prior, &folders));
                 }
+
+                // Keep pulling while history is still coming down. Each pass
+                // is already saved, so this can stop at any point without
+                // losing what arrived.
+                if remaining > 0 {
+                    self.backfill_at = Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs(BACKFILL_DELAY_SECS),
+                    );
+                    self.status_message = Some(StatusToast::info(
+                        format!("Fetched {} — {} older messages still to come...", fetched, remaining),
+                        4.0,
+                    ));
+                } else {
+                    self.backfill_at = None;
+                }
+
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -2992,6 +3204,13 @@ impl Application for ClearEmailApp {
         // successful one repaints when its results arrive.
         if self.secret_retry_at.is_some_and(|t| std::time::Instant::now() >= t) {
             self.secret_retry_at = None;
+            self.start_sync(true);
+        }
+
+        // Next backfill pass. Same reasoning on the redraw: the pass repaints
+        // when its results land, so nothing is requested here.
+        if self.backfill_at.is_some_and(|t| std::time::Instant::now() >= t) {
+            self.backfill_at = None;
             self.start_sync(true);
         }
 
@@ -4480,5 +4699,161 @@ mod tests {
             .parse(&raw[..])
             .expect("synthetic message parses");
         assert_eq!(extract_body(&msg), "Grüße aus München!");
+    }
+
+    // ---- incremental sync merge -------------------------------------------
+
+    fn msg(id: usize, uid: Option<u32>, folder: &str, subject: &str, read: bool) -> Email {
+        Email {
+            id,
+            uid,
+            from: "someone@example.org".to_string(),
+            to: "me@example.org".to_string(),
+            subject: subject.to_string(),
+            body: String::new(),
+            date: "today".to_string(),
+            read,
+            folder: folder.to_string(),
+            cc: String::new(),
+            bcc: String::new(),
+            attachments: Vec::new(),
+            remote_attachments: Vec::new(),
+        }
+    }
+
+    fn folder_sync(folder: &str, fetched: Vec<Email>, server: Vec<u32>) -> FolderSync {
+        FolderSync {
+            folder: folder.to_string(),
+            fetched,
+            server_uids: server,
+            seen_uids: Vec::new(),
+            remaining: 0,
+        }
+    }
+
+    #[test]
+    fn merge_keeps_history_and_adds_the_new() {
+        // The whole point: a later pass must not discard what an earlier one
+        // downloaded. This is what pinned the cache at FETCH_COUNT before.
+        let prior = vec![msg(1, Some(100), "inbox", "old", true)];
+        let f = folder_sync(
+            "inbox",
+            vec![msg(0, Some(101), "inbox", "new", false)],
+            vec![100, 101],
+        );
+        let out = merge_sync(prior, &[f]);
+        assert_eq!(out.len(), 2, "prior mail must survive the merge");
+        assert!(out.iter().any(|e| e.subject == "old"));
+        assert!(out.iter().any(|e| e.subject == "new"));
+    }
+
+    #[test]
+    fn merge_assigns_fresh_ids_without_collision() {
+        let prior = vec![msg(7, Some(100), "inbox", "old", true)];
+        let f = folder_sync(
+            "inbox",
+            vec![
+                msg(0, Some(101), "inbox", "a", false),
+                msg(0, Some(102), "inbox", "b", false),
+            ],
+            vec![100, 101, 102],
+        );
+        let out = merge_sync(prior, &[f]);
+        let mut ids: Vec<usize> = out.iter().map(|e| e.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), out.len(), "ids must stay unique across the cache");
+        assert!(ids.iter().all(|&i| i != 0), "every message gets a real id");
+    }
+
+    #[test]
+    fn merge_drops_mail_deleted_on_the_server() {
+        let prior = vec![
+            msg(1, Some(100), "inbox", "gone", true),
+            msg(2, Some(101), "inbox", "kept", true),
+        ];
+        let f = folder_sync("inbox", vec![], vec![101]);
+        let out = merge_sync(prior, &[f]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].subject, "kept");
+    }
+
+    #[test]
+    fn merge_leaves_other_folders_alone() {
+        // An inbox pass says nothing about drafts, trash, or a sent mailbox
+        // that could not be selected.
+        let prior = vec![
+            msg(1, None, "drafts", "draft", true),
+            msg(2, Some(50), "trash", "trashed", true),
+            msg(3, Some(60), "sent", "sent mail", true),
+        ];
+        let f = folder_sync("inbox", vec![], vec![]);
+        let out = merge_sync(prior, &[f]);
+        assert_eq!(out.len(), 3, "only the synced folder is reconciled");
+    }
+
+    #[test]
+    fn merge_keeps_local_read_over_server_unread() {
+        // The seen-push is best-effort; a message the user opened here must
+        // not flip back to unread because the server has not caught up.
+        let prior = vec![msg(1, Some(100), "inbox", "read here", true)];
+        let f = folder_sync(
+            "inbox",
+            vec![msg(0, Some(100), "inbox", "read here", false)],
+            vec![100],
+        );
+        let out = merge_sync(prior, &[f]);
+        assert_eq!(out.len(), 1, "a refetched message is updated, not duplicated");
+        assert!(out[0].read, "local read state wins");
+        assert_eq!(out[0].id, 1, "identity survives a refetch");
+    }
+
+    #[test]
+    fn merge_adopts_server_seen_for_cached_mail() {
+        let prior = vec![msg(1, Some(100), "inbox", "read elsewhere", false)];
+        let mut f = folder_sync("inbox", vec![], vec![100]);
+        f.seen_uids = vec![100];
+        let out = merge_sync(prior, &[f]);
+        assert!(out[0].read, "read on another client shows as read here");
+    }
+
+    #[test]
+    fn merge_drops_the_local_sent_copy_once_the_server_has_it() {
+        let prior = vec![msg(1, None, "sent", "hello", true)];
+        let f = folder_sync(
+            "sent",
+            vec![msg(0, Some(9), "sent", "hello", true)],
+            vec![9],
+        );
+        let out = merge_sync(prior, &[f]);
+        assert_eq!(out.len(), 1, "the same message must not show twice");
+        assert_eq!(out[0].uid, Some(9));
+    }
+
+    #[test]
+    fn merge_rekeys_ids_that_collide() {
+        // Caches written by the pre-uid scheme really do contain these: a
+        // trashed message keeps the id a later arrival is handed again.
+        let prior = vec![
+            msg(5, Some(200), "inbox", "arrived later", true),
+            msg(5, Some(90), "trash", "trashed earlier", true),
+        ];
+        let out = merge_sync(prior, &[]);
+        assert_eq!(out.len(), 2);
+        assert_ne!(out[0].id, out[1].id, "colliding ids must be re-keyed");
+        assert_eq!(out[0].id, 5, "the first in display order keeps its id");
+    }
+
+    #[test]
+    fn merge_orders_newest_first_with_local_mail_on_top() {
+        let prior = vec![
+            msg(1, Some(10), "inbox", "older", true),
+            msg(2, Some(30), "inbox", "newer", true),
+            msg(3, None, "drafts", "just written", true),
+        ];
+        let out = merge_sync(prior, &[]);
+        assert_eq!(out[0].subject, "just written");
+        assert_eq!(out[1].subject, "newer");
+        assert_eq!(out[2].subject, "older");
     }
 }
