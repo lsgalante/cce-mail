@@ -212,6 +212,9 @@ struct ClearEmailApp {
     /// un-clobbered — [`Self::split_geom`] clamps at use, not here.
     list_w: f32,
     split_dragging: bool,
+    /// Message per row of the open card context menu, built beside its
+    /// labels — index 0 is the inert subject header, hence Option.
+    context_menu_actions: Vec<Option<AppMessage>>,
     compose_open: bool,
     compose_title: String,
     /// When the most recent IMAP sync was spawned — folder switches re-sync
@@ -1959,10 +1962,10 @@ impl ClearEmailApp {
             bx > -9000.0 && px >= bx && px <= bx + bw && py >= by && py <= by + bh
         });
         let Some(idx) = hit else { return false };
-        let Some((id, read, subject)) = self
+        let Some((id, read, subject, is_draft)) = self
             .filtered_emails()
             .get(idx)
-            .map(|e| (e.id, e.read, e.subject.clone()))
+            .map(|e| (e.id, e.read, e.subject.clone(), e.folder == "drafts"))
         else {
             return false;
         };
@@ -1974,13 +1977,30 @@ impl ClearEmailApp {
         self.selected_email_id = Some(id);
         self.body_scroll = 0.0;
 
-        // Row 0 is the subject header (header_count = 1) — dimmed and inert.
-        let options = vec![
-            ellipsize(&subject, 28),
-            "Reply".to_string(),
-            "Delete".to_string(),
-            if read { "Mark Unread" } else { "Mark Read" }.to_string(),
-        ];
+        // Row 0 is the subject header (header_count = 1) — dimmed and inert,
+        // hence the leading None. A draft is not a message that arrived:
+        // there is nobody to reply to and no read state, so it gets Edit —
+        // which is SelectEmail, the same path a left-click takes to resume it
+        // in the compose dialog.
+        let (labels, actions): (Vec<&str>, Vec<Option<AppMessage>>) = if is_draft {
+            (
+                vec!["Edit", "Delete"],
+                vec![Some(AppMessage::SelectEmail(id)), Some(AppMessage::DeleteSelected)],
+            )
+        } else {
+            (
+                vec!["Reply", "Delete", if read { "Mark Unread" } else { "Mark Read" }],
+                vec![
+                    Some(AppMessage::Reply),
+                    Some(AppMessage::DeleteSelected),
+                    Some(AppMessage::ToggleUnread),
+                ],
+            )
+        };
+        let mut options = vec![ellipsize(&subject, 28)];
+        options.extend(labels.into_iter().map(str::to_string));
+        self.context_menu_actions = std::iter::once(None).chain(actions).collect();
+
         let target = self.email_buttons[idx].id();
         cce_ui::widget::context_menu::show(px, py, options.clone(), 1, target);
 
@@ -1999,10 +2019,12 @@ impl ClearEmailApp {
     }
 
     /// A press while a card menu is open: an item fires its action, anything
-    /// else only dismisses. The toolkit's own `context_menu::mouse_input` is
-    /// deliberately NOT used — it dispatches labels through a fixed map into
-    /// the target widget, where "Delete" means DeleteKey, not this app's
-    /// message.
+    /// else only dismisses. The row's message comes from the parallel
+    /// `context_menu_actions` built with the labels, so the two menu shapes
+    /// (mail vs draft) can't drift out of step with a positional map. The
+    /// toolkit's own `context_menu::mouse_input` is deliberately NOT used —
+    /// it dispatches labels through a fixed map into the target widget,
+    /// where "Delete" means DeleteKey, not this app's message.
     fn context_menu_press(&mut self, px: f32, py: f32) -> Option<AppMessage> {
         let mx = cce_ui::widget::context_menu::x();
         let my = cce_ui::widget::context_menu::y();
@@ -2010,14 +2032,11 @@ impl ClearEmailApp {
         let mh = cce_ui::widget::context_menu::h();
         let mut msg = None;
         if px >= mx && px <= mx + mw && py >= my && py <= my + mh {
-            msg = match ((py - my) / CONTEXT_ROW_H) as usize {
-                1 => Some(AppMessage::Reply),
-                2 => Some(AppMessage::DeleteSelected),
-                3 => Some(AppMessage::ToggleUnread),
-                _ => None,
-            };
+            let row = ((py - my) / CONTEXT_ROW_H) as usize;
+            msg = self.context_menu_actions.get(row).cloned().flatten();
         }
         cce_ui::widget::context_menu::hide();
+        self.context_menu_actions.clear();
         msg
     }
 
@@ -2441,6 +2460,7 @@ impl Application for ClearEmailApp {
             body_sb_drag_offset: 0.0,
             list_w: load_list_w().unwrap_or(LIST_W_DEFAULT),
             split_dragging: false,
+            context_menu_actions: Vec::new(),
             compose_open,
             compose_title,
             status_message: None,
