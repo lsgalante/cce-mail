@@ -176,10 +176,7 @@ struct ClearEmailApp {
     email_list: ScrollRegion,
     email_buttons: Vec<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
 
-    // Details View
-    btn_reply: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    btn_delete: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    btn_unread: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    // Details View (Reply/Delete/Mark Read/Unread live in the Message menu)
     detail_body: cce_ui::widget::Adapted<TextBox>,
 
     // Compose Dialog
@@ -469,6 +466,19 @@ const DETAIL_W_MIN: f32 = 220.0;
 /// Half-width of the separator's grab band (±, matching ScrollRegion's slop).
 const SPLIT_GRAB_SLOP: f32 = 4.0;
 
+// Detail-pane vertical layout, every offset measured from MENUBAR_H. These
+// were literals scattered across paint, layout, the scrollbar geometry and
+// three input handlers; the 170/190 pair in particular had to move in
+// lockstep or the scrollbar detached from the text it scrolls, so the body
+// pair lives behind `detail_body_geom` as one source.
+const DETAIL_SUBJECT_Y: f32 = 18.0;
+const DETAIL_FROM_Y: f32 = 43.0;
+const DETAIL_TO_Y: f32 = 63.0;
+const DETAIL_DATE_Y: f32 = 83.0;
+const DETAIL_CHIPS_Y: f32 = 98.0;
+const DETAIL_BODY_Y: f32 = 128.0;
+const DETAIL_BODY_BOTTOM_PAD: f32 = 20.0;
+
 // Compose modal geometry. One source of truth: the background quads, the
 // input rects, the labels, the chip row and the outside-click test all
 // derive from these — the old duplicated 500.0/420.0 literals meant growing
@@ -521,7 +531,7 @@ fn detail_chip_label(att: &RemoteAttachment) -> String {
 fn detail_chip_rects(atts: &[RemoteAttachment], detail_x: f32) -> Vec<(f32, f32, f32, f32)> {
     let mut rects = Vec::with_capacity(atts.len());
     let mut x = detail_x;
-    let y = 140.0 + MENUBAR_H;
+    let y = DETAIL_CHIPS_Y + MENUBAR_H;
     for att in atts {
         let w = detail_chip_label(att).chars().count() as f32 * 6.0 + 16.0;
         rects.push((x, y, w, 22.0));
@@ -1873,12 +1883,6 @@ impl ClearEmailApp {
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_compose_attach.id(), self.btn_compose_attach.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_reply.id(), self.btn_reply.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_delete.id(), self.btn_delete.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_unread.id(), self.btn_unread.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
         for btn in self.email_buttons.iter_mut() {
             let (id, ptr) = (btn.id(), btn.as_ptr_mut());
             self.ui_context.register_widget(id, ptr);
@@ -1918,13 +1922,20 @@ impl ClearEmailApp {
         (lw, sep, sep + LIST_DETAIL_GAP)
     }
 
+    /// The detail-pane body box: (top y, height). Paint, layout, the
+    /// scrollbar and the scroll clamps all derive from this one pair.
+    fn detail_body_geom(&self) -> (f32, f32) {
+        let top = DETAIL_BODY_Y + MENUBAR_H;
+        let h = (self.height as f32 - top - DETAIL_BODY_BOTTOM_PAD).max(100.0);
+        (top, h)
+    }
+
     /// Detail-pane body scrollbar geometry, mirroring `ScrollRegion::scrollbar_geom`:
     /// (sb_x, track_y, sb_w, track_h, thumb_y, thumb_h). None when the body fits
     /// (no scrollbar drawn). The single source for display_list and the drag path.
     fn body_scrollbar_geom(&self) -> Option<(f32, f32, f32, f32, f32, f32)> {
         let w = self.width as f32;
-        let h = self.height as f32;
-        let body_h = (h - 190.0 - MENUBAR_H).max(100.0);
+        let (body_y, body_h) = self.detail_body_geom();
         let max_scroll = (self.body_content_h - body_h).max(0.0);
         if max_scroll <= 0.0 {
             return None;
@@ -1932,8 +1943,8 @@ impl ClearEmailApp {
         let sb_w = cce_ui::layout::scrollbar_width();
         let sb_x = w - sb_w - 4.0;
         let thumb_h = (body_h * body_h / self.body_content_h).clamp(20.0, body_h);
-        let thumb_y = 170.0 + MENUBAR_H + (self.body_scroll / max_scroll) * (body_h - thumb_h);
-        Some((sb_x, 170.0 + MENUBAR_H, sb_w, body_h, thumb_y, thumb_h))
+        let thumb_y = body_y + (self.body_scroll / max_scroll) * (body_h - thumb_h);
+        Some((sb_x, body_y, sb_w, body_h, thumb_y, thumb_h))
     }
 
     /// Left press on the scrollbar strip (±4px slop like ScrollRegion): grab the
@@ -1960,7 +1971,7 @@ impl ClearEmailApp {
         let Some((_, track_y, _, track_h, _, thumb_h)) = self.body_scrollbar_geom() else {
             return false;
         };
-        let body_h = (self.height as f32 - 190.0 - MENUBAR_H).max(100.0);
+        let (_, body_h) = self.detail_body_geom();
         let max_scroll = (self.body_content_h - body_h).max(0.0);
         let target = py - self.body_sb_drag_offset;
         let ratio = if track_h - thumb_h > 0.0 {
@@ -2076,15 +2087,15 @@ impl ClearEmailApp {
                 labels.push(TextLabel {
                     text: email.subject.clone(),
                     x: detail_x,
-                    y: 60.0 + MENUBAR_H,
+                    y: DETAIL_SUBJECT_Y + MENUBAR_H,
                     font_size: 15.0,
                     color: [0xff, 0xff, 0xff],
                 });
 
                 // Metadata
-                labels.push(TextLabel { text: format!("From: {}", email.from), x: detail_x, y: 85.0 + MENUBAR_H, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
-                labels.push(TextLabel { text: format!("To:   {}", email.to), x: detail_x, y: 105.0 + MENUBAR_H, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-                labels.push(TextLabel { text: format!("Date: {}", email.date), x: detail_x, y: 125.0 + MENUBAR_H, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                labels.push(TextLabel { text: format!("From: {}", email.from), x: detail_x, y: DETAIL_FROM_Y + MENUBAR_H, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
+                labels.push(TextLabel { text: format!("To:   {}", email.to), x: detail_x, y: DETAIL_TO_Y + MENUBAR_H, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                labels.push(TextLabel { text: format!("Date: {}", email.date), x: detail_x, y: DETAIL_DATE_Y + MENUBAR_H, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
 
                 // Server-attachment chip labels (quads paint in display_list;
                 // both sides lay out via detail_chip_rects).
@@ -2231,10 +2242,6 @@ impl Application for ClearEmailApp {
 
         let email_list = ScrollRegion::new(54.0, 4.0);
 
-        let btn_reply = Button::new(391.0, 8.0, 70.0, 26.0).with_label("Reply");
-        let btn_delete = Button::new_reset(471.0, 8.0, 80.0, 26.0).with_label("Delete");
-        let btn_unread = Button::new(561.0, 8.0, 110.0, 26.0).with_label("Mark Unread");
-
         let accounts = load_accounts();
         // Last-used account wins (sidecar file), else the configured default:
         // the on-start sync below should hit the account the user actually
@@ -2318,9 +2325,6 @@ impl Application for ClearEmailApp {
             search_box,
             email_list,
             email_buttons: Vec::new(),
-            btn_reply,
-            btn_delete,
-            btn_unread,
             detail_body,
             compose_to,
             compose_cc,
@@ -2807,7 +2811,6 @@ impl Application for ClearEmailApp {
 
         let list_x = LIST_X;
         let (list_w, separator_x, detail_x) = self.split_geom();
-        let detail_panel_x = separator_x + 1.0;
 
         if self.needs_rebuild || size_changed {
             // Bar layout — every open dropdown is a popover: registration
@@ -2898,7 +2901,7 @@ impl Application for ClearEmailApp {
 
             // Get selected email state to avoid borrowing self while mutating
             let selected_email_state = if let Some(selected_id) = self.selected_email_id {
-                self.emails.iter().find(|e| e.id == selected_id).map(|e| (e.read, e.body.clone()))
+                self.emails.iter().find(|e| e.id == selected_id).map(|e| e.body.clone())
             } else {
                 None
             };
@@ -2932,14 +2935,10 @@ impl Application for ClearEmailApp {
             }
 
             // Detail View
-            if let Some((read, body)) = selected_email_state {
-                self.btn_reply.set_rect(detail_x, 8.0 + MENUBAR_H, 70.0, 26.0);
-                self.btn_delete.set_rect(detail_x + 80.0, 8.0 + MENUBAR_H, 80.0, 26.0);
-                self.btn_unread.set_rect(detail_x + 170.0, 8.0 + MENUBAR_H, 110.0, 26.0);
-                self.btn_unread.set_label(if read { "Mark Unread" } else { "Mark Read" });
-
+            if let Some(body) = selected_email_state {
                 let detail_w = (w_f32 - (detail_x + 15.0)).max(100.0);
-                self.detail_body.set_rect(detail_x, 170.0 + MENUBAR_H, detail_w, (h_f32 - 190.0 - MENUBAR_H).max(100.0));
+                let (body_y, body_h) = self.detail_body_geom();
+                self.detail_body.set_rect(detail_x, body_y, detail_w, body_h);
                 self.detail_body.text = body;
             }
 
@@ -3043,18 +3042,13 @@ impl Application for ClearEmailApp {
         // 4. Detail View Area
         if let Some(selected_id) = self.selected_email_id {
             if self.emails.iter().any(|e| e.id == selected_id) {
-                // Top action toolbar background
-                quads.push((detail_panel_x, MENUBAR_H, w_f32 - detail_panel_x, 42.0, [0.08, 0.08, 0.12, 1.0]));
-                quads.push((detail_panel_x, MENUBAR_H + 42.0, w_f32 - detail_panel_x, 1.0, [0.18, 0.18, 0.22, 1.0]));
-
-                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_reply, &mut *quads.pc);
-                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_delete, &mut *quads.pc);
-                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_unread, &mut *quads.pc);
-
                 // Body as one boxed text prim: word-wrapped at the pane width and
                 // clipped to the pane (the TextBox walk drew each logical line as a
                 // single run, so long paragraphs truncated at the pane edge). Skipped
                 // while a modal is up — boxed text still renders above the panel.
+                // Body geometry is read before the email/font_system borrows —
+                // detail_body_geom takes &self whole.
+                let (body_y, body_h) = self.detail_body_geom();
                 if !self.compose_open {
                     if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
                         // Server-attachment chips in the header band (labels
@@ -3068,7 +3062,6 @@ impl Application for ClearEmailApp {
                         }
 
                         let body_w = (w_f32 - (detail_x + 15.0)).max(100.0);
-                        let body_h = (h_f32 - 190.0 - MENUBAR_H).max(100.0);
                         let line_h = 12.0 * 1.4; // get_text_buffer_laid_out's placed-text metric
 
                         // Measure with the exact shaping the renderer will use, so the
@@ -3100,11 +3093,11 @@ impl Application for ClearEmailApp {
                         quads.pc.text_boxed(
                             email.body.clone(),
                             detail_x,
-                            170.0 + MENUBAR_H - self.body_scroll,
+                            body_y - self.body_scroll,
                             12.0,
                             [0xc8, 0xc8, 0xd0],
                             Some("sans-serif".to_string()),
-                            Some([detail_x, 170.0 + MENUBAR_H, detail_x + body_w, 170.0 + MENUBAR_H + body_h]),
+                            Some([detail_x, body_y, detail_x + body_w, body_y + body_h]),
                             cce_ui::scene::paint::TextAttrs::default(),
                             cce_ui::scene::paint::TextLayout {
                                 wrap_width: Some(body_w),
@@ -3268,13 +3261,7 @@ impl Application for ClearEmailApp {
                 }
             }
 
-            // Detail view buttons
-            if self.selected_email_id.is_some() {
-                if ctx.propagate_event(&mv, self.btn_reply.id()) { changed = true; }
-                if ctx.propagate_event(&mv, self.btn_delete.id()) { changed = true; }
-                if ctx.propagate_event(&mv, self.btn_unread.id()) { changed = true; }
-                // detail_body: read-only boxed-text pane, no event routing
-            }
+            // Detail pane: no hover routing — no widgets there any more.
         }
 
         if changed {
@@ -3612,30 +3599,10 @@ impl Application for ClearEmailApp {
                 }
             }
 
-            // Detail View action buttons
-            if self.selected_email_id.is_some() {
-                if ctx.propagate_event(&ev, self.btn_reply.id()) {
-                    changed = true;
-                    if state == ElementState::Released && self.btn_reply.take_click() {
-                        msg_out = Some(AppMessage::Reply);
-                    }
-                }
-                if ctx.propagate_event(&ev, self.btn_delete.id()) {
-                    changed = true;
-                    if state == ElementState::Released && self.btn_delete.take_click() {
-                        msg_out = Some(AppMessage::DeleteSelected);
-                    }
-                }
-                if ctx.propagate_event(&ev, self.btn_unread.id()) {
-                    changed = true;
-                    if state == ElementState::Released && self.btn_unread.take_click() {
-                        msg_out = Some(AppMessage::ToggleUnread);
-                    }
-                }
-                // detail_body deliberately gets no events: the pane is a read-only
-                // boxed-text render now, and focusing the TextBox only let you
-                // invisibly edit the display copy.
-            }
+            // The detail pane takes no events at all now: Reply/Delete/Mark
+            // Read/Unread moved to the Message menu, and detail_body is a
+            // read-only boxed-text render — focusing the TextBox only let you
+            // invisibly edit the display copy.
         }
 
         if changed {
@@ -3667,7 +3634,7 @@ impl Application for ClearEmailApp {
                     MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
                     MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
                 };
-                let body_h = (self.height as f32 - 190.0 - MENUBAR_H).max(100.0);
+                let (_, body_h) = self.detail_body_geom();
                 let max = (self.body_content_h - body_h).max(0.0);
                 let old = self.body_scroll;
                 self.body_scroll = (self.body_scroll + dy).clamp(0.0, max);
@@ -3687,6 +3654,8 @@ impl Application for ClearEmailApp {
         let mut handled = false;
         let mut msg_out = None;
         let kev = cce_ui::widget::Event::KeyInput(event.clone());
+        // Read before ctx: detail_body_geom takes &self whole.
+        let (_, body_h) = self.detail_body_geom();
         let ctx = &mut self.ui_context;
 
         if self.compose_open {
@@ -3729,7 +3698,6 @@ impl Application for ClearEmailApp {
                 && !self.search_box.editing
                 && event.state == ElementState::Pressed
             {
-                let body_h = (self.height as f32 - 190.0 - MENUBAR_H).max(100.0);
                 let max = (self.body_content_h - body_h).max(0.0);
                 let old = self.body_scroll;
                 match &event.logical_key {
