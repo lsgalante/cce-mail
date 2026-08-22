@@ -15,9 +15,55 @@ use lettre::{Message, SmtpTransport, Transport};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Folder {
     Inbox,
+    /// Gmail's All Mail — the full archive, including messages that are also
+    /// in Inbox or Sent. IMAP gives each mailbox its own uid space, so an
+    /// archived copy is a distinct row from the Inbox one; that mirrors
+    /// Gmail's own labels-as-mailboxes model.
+    Archive,
     Sent,
     Drafts,
     Trash,
+}
+
+impl Folder {
+    /// Switcher order. The dropdown's labels AND the index it reports both
+    /// derive from this, so a new folder cannot leave them disagreeing —
+    /// which, with a positional index map, silently routes to the wrong one.
+    const ALL: [Folder; 5] = [
+        Folder::Inbox,
+        Folder::Archive,
+        Folder::Sent,
+        Folder::Drafts,
+        Folder::Trash,
+    ];
+
+    /// The tag stored on `Email::folder`. This mapping used to be written out
+    /// at four separate call sites.
+    fn tag(self) -> &'static str {
+        match self {
+            Folder::Inbox => "inbox",
+            Folder::Archive => "archive",
+            Folder::Sent => "sent",
+            Folder::Drafts => "drafts",
+            Folder::Trash => "trash",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Folder::Inbox => "Inbox",
+            Folder::Archive => "All Mail",
+            Folder::Sent => "Sent",
+            Folder::Drafts => "Drafts",
+            Folder::Trash => "Trash",
+        }
+    }
+
+    /// Folders the server owns, and therefore the ones a sync reconciles.
+    /// Drafts and Trash are local-only here.
+    fn is_server_backed(self) -> bool {
+        matches!(self, Folder::Inbox | Folder::Archive | Folder::Sent)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -77,6 +123,12 @@ struct Email {
     /// the fetch-time sequence number, which shifts after any expunge.
     #[serde(default)]
     uid: Option<u32>,
+    /// For mail moved to the local Trash, the server folder it came from.
+    /// Without it the next sync sees the uid missing from that folder, calls
+    /// it new, and downloads the message straight back — deleted mail
+    /// reappearing while a copy also sits in Trash.
+    #[serde(default)]
+    origin_folder: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1367,6 +1419,7 @@ fn fetch_uid_batch(
         .map(|p| Email {
             id: 0, // assigned by the merge
             uid: Some(p.uid),
+            origin_folder: None,
             from: p.from,
             to: p.to,
             subject: p.subject,
@@ -1506,6 +1559,48 @@ fn sync_folder(
 ///
 /// Only folders present in `folders` are reconciled: a pass that could not
 /// select Sent must not be read as "the server has no sent mail".
+/// The mailbox names a folder tag maps to, in the order to try them: Gmail's
+/// name first, the conventional one second. Shared by the sync and the
+/// attachment fetch so both address the same uid space.
+/// What the cache already holds per server-backed folder, which is what a
+/// sync fetches the complement of.
+///
+/// Trashed mail counts under the folder it came from: the server still has
+/// it (deletion only propagates for INBOX), so leaving it out would make the
+/// next pass treat it as new and download it straight back.
+fn known_uids(
+    emails: &[Email],
+) -> std::collections::HashMap<String, std::collections::HashSet<u32>> {
+    let mut known: std::collections::HashMap<String, std::collections::HashSet<u32>> =
+        std::collections::HashMap::new();
+    for e in emails {
+        let Some(uid) = e.uid else { continue };
+        let tag = if e.folder == "trash" {
+            match &e.origin_folder {
+                Some(o) => o.as_str(),
+                None => continue,
+            }
+        } else {
+            e.folder.as_str()
+        };
+        if Folder::ALL
+            .iter()
+            .any(|f| f.is_server_backed() && f.tag() == tag)
+        {
+            known.entry(tag.to_string()).or_default().insert(uid);
+        }
+    }
+    known
+}
+
+fn mailbox_candidates(folder_tag: &str) -> &'static [&'static str] {
+    match folder_tag {
+        "sent" => &["[Gmail]/Sent Mail", "Sent"],
+        "archive" => &["[Gmail]/All Mail", "Archive", "Archives"],
+        _ => &["INBOX"],
+    }
+}
+
 fn merge_sync(prior: Vec<Email>, folders: &[FolderSync]) -> Vec<Email> {
     use std::collections::HashSet;
 
@@ -1624,20 +1719,25 @@ fn sync_imap(
         };
         folders.push(inbox);
 
-        // Sent rides along quietly: Gmail's name first, the conventional one
-        // second; a server with neither just syncs the inbox.
-        for mailbox in ["[Gmail]/Sent Mail", "Sent"] {
-            if let Some(sent) = sync_folder(
-                &mut session,
-                &sender,
-                &account.email,
-                mailbox,
-                "sent",
-                known.get("sent").unwrap_or(&empty),
-                false,
-            ) {
-                folders.push(sent);
-                break;
+        // Sent and the archive ride along quietly behind the inbox: Gmail's
+        // names first, conventional ones second, and a server offering
+        // neither simply syncs what it does have. A mailbox that cannot be
+        // selected reports nothing, which the merge reads as "no news about
+        // that folder" rather than "that folder is empty".
+        for folder in [Folder::Sent, Folder::Archive] {
+            for mailbox in mailbox_candidates(folder.tag()) {
+                if let Some(synced) = sync_folder(
+                    &mut session,
+                    &sender,
+                    &account.email,
+                    mailbox,
+                    folder.tag(),
+                    known.get(folder.tag()).unwrap_or(&empty),
+                    false,
+                ) {
+                    folders.push(synced);
+                    break;
+                }
             }
         }
 
@@ -1737,10 +1837,11 @@ fn fetch_attachment(
             report(&sender, Err("IMAP connection failed".to_string()));
             return;
         };
-        // Same mailbox names the sync uses; sent-folder mail lives under
-        // Gmail's name first, the conventional one second.
-        let mailboxes: &[&str] =
-            if folder == "sent" { &["[Gmail]/Sent Mail", "Sent"] } else { &["INBOX"] };
+        // The same mailbox the sync pulled this message from. A uid only
+        // means anything inside its own mailbox: opening an attachment on an
+        // archived message after selecting INBOX would address whatever
+        // happened to hold that uid there, which is a different message.
+        let mailboxes: &[&str] = mailbox_candidates(&folder);
         if !mailboxes.iter().any(|mb| session.select(mb).is_ok()) {
             report(&sender, Err("Cannot select mailbox".to_string()));
             let _ = session.logout();
@@ -1975,6 +2076,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             read: false,
             folder: "inbox".to_string(),
             uid: None,
+            origin_folder: None,
             cc: String::new(),
             bcc: String::new(),
             attachments: Vec::new(),
@@ -1990,6 +2092,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             read: false,
             folder: "inbox".to_string(),
             uid: None,
+            origin_folder: None,
             cc: String::new(),
             bcc: String::new(),
             attachments: Vec::new(),
@@ -2005,6 +2108,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             read: true,
             folder: "inbox".to_string(),
             uid: None,
+            origin_folder: None,
             cc: String::new(),
             bcc: String::new(),
             attachments: Vec::new(),
@@ -2020,6 +2124,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             read: true,
             folder: "sent".to_string(),
             uid: None,
+            origin_folder: None,
             cc: String::new(),
             bcc: String::new(),
             attachments: Vec::new(),
@@ -2084,6 +2189,7 @@ impl ClearEmailApp {
             read: true,
             folder: "drafts".to_string(),
             uid: None,
+            origin_folder: None,
             cc: mail.cc.clone(),
             bcc: mail.bcc.clone(),
             attachments: mail.attachments.clone(),
@@ -2207,15 +2313,8 @@ impl ClearEmailApp {
         // What the cache already holds, per server-backed folder. The worker
         // fetches only what is missing from this, which is what turns a sync
         // from "refetch the newest 50" into "download what I do not have".
-        let mut known: std::collections::HashMap<String, std::collections::HashSet<u32>> =
-            std::collections::HashMap::new();
-        for e in &self.emails {
-            if let Some(uid) = e.uid {
-                if e.folder == "inbox" || e.folder == "sent" {
-                    known.entry(e.folder.clone()).or_default().insert(uid);
-                }
-            }
-        }
+        let known: std::collections::HashMap<String, std::collections::HashSet<u32>>;
+        known = known_uids(&self.emails);
 
         let account = self.accounts[self.selected_account_idx].clone();
         sync_imap(account, known, self.sender.clone());
@@ -2252,12 +2351,7 @@ impl ClearEmailApp {
     /// filter plus the search box. A row index means nothing without this:
     /// it is what maps the card under the pointer to its message.
     fn filtered_emails(&self) -> Vec<&Email> {
-        let current_folder_str = match self.current_folder {
-            Folder::Inbox => "inbox",
-            Folder::Sent => "sent",
-            Folder::Drafts => "drafts",
-            Folder::Trash => "trash",
-        };
+        let current_folder_str = self.current_folder.tag();
         let search_text = if self.search_box.editing {
             &self.search_box.edit_buffer
         } else {
@@ -2446,12 +2540,7 @@ impl ClearEmailApp {
         let modal_open = self.compose_open;
         if modal_open {
         } else {
-            let current_folder_str = match self.current_folder {
-                Folder::Inbox => "inbox",
-                Folder::Sent => "sent",
-                Folder::Drafts => "drafts",
-                Folder::Trash => "trash",
-            };
+            let current_folder_str = self.current_folder.tag();
             let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
             let search_lower = search_text.to_lowercase();
             let filtered: Vec<&Email> = self.emails.iter()
@@ -2667,7 +2756,7 @@ impl Application for ClearEmailApp {
         .with_custom_display_text("Mail")
         .with_font_family(&bar_font);
         let folder_dropdown = Dropdown::new(
-            vec!["Inbox".to_string(), "Sent".to_string(), "Drafts".to_string(), "Trash".to_string()],
+            Folder::ALL.iter().map(|f| f.label().to_string()).collect(),
             0,
         )
         .with_font_family(&bar_font);
@@ -2994,6 +3083,7 @@ impl Application for ClearEmailApp {
                             read: true,
                             folder: "sent".to_string(),
                             uid: None,
+                            origin_folder: None,
                             cc: mail.cc,
                             // A sent copy records who was bcc'd nowhere; the
                             // attachment paths shrink to names for display.
@@ -3058,6 +3148,16 @@ impl Application for ClearEmailApp {
                         } else {
                             if email.folder == "inbox" {
                                 server_uid = email.uid;
+                            }
+                            // Remember where it came from. Deletion only
+                            // reaches the server for INBOX (expunging from
+                            // All Mail would be a permanent delete, not a
+                            // label removal), so for every other folder the
+                            // message is still there — and without this the
+                            // next sync would see the uid missing from that
+                            // folder, call it new, and download it back.
+                            if email.uid.is_some() {
+                                email.origin_folder = Some(email.folder.clone());
                             }
                             email.folder = "trash".to_string();
                         }
@@ -3244,12 +3344,7 @@ impl Application for ClearEmailApp {
         let w_f32 = self.width as f32;
         let h_f32 = self.height as f32;
 
-        let current_folder_str = match self.current_folder {
-            Folder::Inbox => "inbox",
-            Folder::Sent => "sent",
-            Folder::Drafts => "drafts",
-            Folder::Trash => "trash",
-        };
+        let current_folder_str = self.current_folder.tag();
 
         let list_x = LIST_X;
         let (list_w, separator_x, detail_x) = self.split_geom();
@@ -3276,12 +3371,10 @@ impl Application for ClearEmailApp {
             } else {
                 "Inbox".to_string()
             };
-            self.folder_dropdown.selected = match self.current_folder {
-                Folder::Inbox => 0,
-                Folder::Sent => 1,
-                Folder::Drafts => 2,
-                Folder::Trash => 3,
-            };
+            self.folder_dropdown.selected = Folder::ALL
+                .iter()
+                .position(|f| *f == self.current_folder)
+                .unwrap_or(0);
             // Menus left; selectors right at fixed offsets from the edge —
             // anchoring to the folder label would make the account switcher
             // drift as the folder name changes length.
@@ -3933,12 +4026,12 @@ impl Application for ClearEmailApp {
         // Folder switcher.
         if ctx.propagate_event(&ev, self.folder_dropdown.id()) {
             if self.folder_dropdown.take_change() {
-                msg_out = Some(AppMessage::SwitchFolder(match self.folder_dropdown.selected {
-                    0 => Folder::Inbox,
-                    1 => Folder::Sent,
-                    2 => Folder::Drafts,
-                    _ => Folder::Trash,
-                }));
+                msg_out = Some(AppMessage::SwitchFolder(
+                    Folder::ALL
+                        .get(self.folder_dropdown.selected)
+                        .copied()
+                        .unwrap_or(Folder::Inbox),
+                ));
             }
             *needs_rebuild = true;
             self.needs_rebuild = true;
@@ -4061,12 +4154,7 @@ impl Application for ClearEmailApp {
                 // email a row click lands on. No wildcard: a new folder
                 // absorbed into "inbox" here routes clicks to the wrong list
                 // (Drafts was, briefly).
-                let current_folder_str = match self.current_folder {
-                    Folder::Inbox => "inbox",
-                    Folder::Sent => "sent",
-                    Folder::Drafts => "drafts",
-                    Folder::Trash => "trash",
-                };
+                let current_folder_str = self.current_folder.tag();
                 let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
                 let search_lower = search_text.to_lowercase();
                 let filtered: Vec<&Email> = self.emails.iter()
@@ -4718,6 +4806,7 @@ mod tests {
             bcc: String::new(),
             attachments: Vec::new(),
             remote_attachments: Vec::new(),
+            origin_folder: None,
         }
     }
 
@@ -4828,6 +4917,45 @@ mod tests {
         let out = merge_sync(prior, &[f]);
         assert_eq!(out.len(), 1, "the same message must not show twice");
         assert_eq!(out[0].uid, Some(9));
+    }
+
+    #[test]
+    fn known_uids_counts_trash_under_where_it_came_from() {
+        // Otherwise the next pass calls a deleted message new and downloads
+        // it back, leaving a copy in Trash and a copy in the folder.
+        let mut trashed = msg(1, Some(77), "trash", "deleted from All Mail", true);
+        trashed.origin_folder = Some("archive".to_string());
+        let live = msg(2, Some(78), "archive", "still there", true);
+        let known = known_uids(&[trashed, live]);
+        let archive = known.get("archive").expect("archive tracked");
+        assert!(archive.contains(&77), "a trashed message stays known");
+        assert!(archive.contains(&78));
+    }
+
+    #[test]
+    fn known_uids_ignores_local_only_mail() {
+        let draft = msg(1, None, "drafts", "draft", true);
+        let local_sent = msg(2, None, "sent", "unsent copy", true);
+        assert!(known_uids(&[draft, local_sent]).is_empty());
+    }
+
+    #[test]
+    fn mailbox_candidates_keep_uid_spaces_apart() {
+        // An archive uid addressed against INBOX names a different message.
+        assert_eq!(mailbox_candidates("archive")[0], "[Gmail]/All Mail");
+        assert_eq!(mailbox_candidates("sent")[0], "[Gmail]/Sent Mail");
+        assert_eq!(mailbox_candidates("inbox"), &["INBOX"]);
+    }
+
+    #[test]
+    fn folder_labels_and_order_stay_in_step() {
+        // The switcher builds labels and reads its index from this one list.
+        assert_eq!(Folder::ALL.len(), 5);
+        assert_eq!(Folder::ALL[0], Folder::Inbox);
+        assert_eq!(Folder::Archive.tag(), "archive");
+        assert_eq!(Folder::Archive.label(), "All Mail");
+        assert!(Folder::Archive.is_server_backed());
+        assert!(!Folder::Trash.is_server_backed());
     }
 
     #[test]
