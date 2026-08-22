@@ -3865,8 +3865,28 @@ impl Application for ClearEmailApp {
                 handled = true;
             }
         } else {
+            // Escape closes the search band and drops the query with it, so
+            // the list is unfiltered again — leaving a hidden filter behind
+            // would look like mail had gone missing.
+            //
+            // This runs BEFORE the box is offered the key: TextBox consumes
+            // Escape itself (clearing and unfocusing), which marked the event
+            // handled and left the band standing open forever.
+            if self.search_open
+                && event.state == ElementState::Pressed
+                && event.logical_key == Key::Named(cce_ui::widget::NamedKey::Escape)
+            {
+                ctx.clear_focus();
+                self.search_box.unfocus();
+                self.search_box.text.clear();
+                self.search_box.edit_buffer.clear();
+                self.search_open = false;
+                msg_out = Some(AppMessage::SearchChanged);
+                handled = true;
+            }
+
             // General keyboard shortcuts (input.kdl `cce-mail` domain)
-            if event.state == ElementState::Pressed {
+            if !handled && event.state == ElementState::Pressed {
                 if cce_ui::widget::match_key_shortcut(event, &self.keys.compose) {
                     msg_out = Some(AppMessage::ComposeNew);
                     handled = true;
@@ -3923,20 +3943,6 @@ impl Application for ClearEmailApp {
                 }
             }
 
-            // Escape closes the search band and drops the query with it, so
-            // the list is unfiltered again — leaving a hidden filter behind
-            // would look like mail had gone missing.
-            if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(cce_ui::widget::NamedKey::Escape) {
-                if self.search_open {
-                    ctx.clear_focus();
-                    self.search_box.unfocus();
-                    self.search_box.text.clear();
-                    self.search_box.edit_buffer.clear();
-                    self.search_open = false;
-                    msg_out = Some(AppMessage::SearchChanged);
-                    handled = true;
-                }
-            }
         }
 
         if handled {
