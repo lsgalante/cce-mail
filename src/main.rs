@@ -148,7 +148,7 @@ impl EmailKeys {
     fn load() -> Self {
         Self {
             compose: cce_ui::input::app_chord("compose", "ctrl+n"),
-            open_search: cce_ui::input::app_chord("open_search", "ctrl+f"),
+            open_search: cce_ui::input::app_chord("open_search", "/"),
         }
     }
 }
@@ -159,7 +159,6 @@ struct ClearEmailApp {
     // Navigation / Sidebar — the whole bar is Dropdowns (MenuBar retired):
     // two menu-button dropdowns (custom_display_text = fixed trigger label,
     // rows are commands that re-fire on repeat) and two selection dropdowns.
-    btn_compose: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     mail_menu: cce_ui::widget::Adapted<Dropdown>,
     /// Folder switcher: options[0] carries the live inbox unread count
     /// ("Inbox (6)"), refreshed each rebuild, so rows and trigger agree.
@@ -215,6 +214,9 @@ struct ClearEmailApp {
     /// Message per row of the open card context menu, built beside its
     /// labels — index 0 is the inert subject header, hence Option.
     context_menu_actions: Vec<Option<AppMessage>>,
+    /// Whether the search band is revealed. Closed is the resting state:
+    /// the box is laid out, painted and routed only while this is set.
+    search_open: bool,
     compose_open: bool,
     compose_title: String,
     /// When the most recent IMAP sync was spawned — folder switches re-sync
@@ -471,6 +473,14 @@ const SPLIT_GRAB_SLOP: f32 = 4.0;
 /// Row pitch of the toolkit context menu — its own layout constant
 /// (`ContextMenuState`), mirrored here because hit-testing is done app-side.
 const CONTEXT_ROW_H: f32 = 24.0;
+
+// The search band. It is not permanent chrome: the `open_search` chord
+// ("/" by default) reveals and focuses it, and closing hands its strip back
+// to the list, so `list_geom` is the single source for where the rows start.
+const SEARCH_ROW_Y: f32 = 15.0;
+const SEARCH_ROW_H: f32 = 26.0;
+const LIST_TOP_WITH_SEARCH: f32 = 55.0;
+const LIST_BOTTOM_PAD: f32 = 15.0;
 
 // Detail-pane vertical layout, every offset measured from MENUBAR_H. These
 // were literals scattered across paint, layout, the scrollbar geometry and
@@ -1873,8 +1883,6 @@ impl ClearEmailApp {
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.compose_body.id(), self.compose_body.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_compose.id(), self.btn_compose.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.mail_menu.id(), self.mail_menu.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.folder_dropdown.id(), self.folder_dropdown.as_ptr_mut());
@@ -1924,6 +1932,14 @@ impl ClearEmailApp {
         let lw = self.list_w.clamp(LIST_W_MIN, max_w);
         let sep = LIST_X + lw + LIST_SEP_GAP;
         (lw, sep, sep + LIST_DETAIL_GAP)
+    }
+
+    /// The email list's band: (top y, height). The search row above it only
+    /// exists while the band is open, and the list takes that strip back when
+    /// it closes — so nothing hardcodes the top.
+    fn list_geom(&self) -> (f32, f32) {
+        let top = if self.search_open { LIST_TOP_WITH_SEARCH } else { SEARCH_ROW_Y } + MENUBAR_H;
+        (top, (self.height as f32 - top - LIST_BOTTOM_PAD).max(50.0))
     }
 
     /// The rows the list is currently showing, in paint order — the folder
@@ -2330,7 +2346,6 @@ impl Application for ClearEmailApp {
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
         cce_ui::scale::set_scale_factor(1.0);
-        let btn_compose = Button::new(10.0, 15.0, 26.0, 26.0).with_label("+");
 
         // The bar: three Dropdowns. Mail is a menu-button dropdown (fixed
         // trigger label, command rows that re-fire on repeat — the
@@ -2351,7 +2366,10 @@ impl Application for ClearEmailApp {
         )
         .with_font_family(&bar_font);
 
-        let mut search_box = TextBox::new(String::new()).with_multiline(false).with_draw_bg_border(true);
+        let mut search_box = TextBox::new(String::new())
+            .with_multiline(false)
+            .with_draw_bg_border(true)
+            .with_placeholder("Search mail — sender, subject or body");
         search_box.font_size = 11.0;
 
         let email_list = ScrollRegion::new(54.0, 4.0);
@@ -2431,7 +2449,6 @@ impl Application for ClearEmailApp {
         Self {
             last_sync_start,
             keys: EmailKeys::load(),
-            btn_compose,
             mail_menu,
             folder_dropdown,
             account_dropdown,
@@ -2461,6 +2478,7 @@ impl Application for ClearEmailApp {
             list_w: load_list_w().unwrap_or(LIST_W_DEFAULT),
             split_dragging: false,
             context_menu_actions: Vec::new(),
+            search_open: false,
             compose_open,
             compose_title,
             status_message: None,
@@ -2962,10 +2980,15 @@ impl Application for ClearEmailApp {
             self.account_dropdown.set_rect(w_f32 - 360.0, 5.0, 210.0, 26.0);
 
             cce_ui::scale::set_scale_factor(scale as f32);
-            self.btn_compose.set_rect(list_x, 15.0 + MENUBAR_H, 26.0, 26.0);
 
-            // Search box and Scrolling list
-            self.search_box.set_rect(list_x + 36.0, 15.0 + MENUBAR_H, list_w - 36.0, 26.0);
+            // The search box spans the band when open, and parks off-screen
+            // when closed so a stale rect can't be hit by anything that still
+            // routes to it.
+            if self.search_open {
+                self.search_box.set_rect(list_x, SEARCH_ROW_Y + MENUBAR_H, list_w, SEARCH_ROW_H);
+            } else {
+                self.search_box.set_rect(-9999.0, -9999.0, 0.0, 0.0);
+            }
 
             // Get filtered emails count for bounds setup
             let list_count = self.emails.iter()
@@ -2983,8 +3006,9 @@ impl Application for ClearEmailApp {
                 })
                 .count();
 
-            self.email_list.set_rect(list_x, 55.0 + MENUBAR_H, list_w, h_f32 - 70.0 - MENUBAR_H);
-            self.email_list.update_bounds(list_count, 55.0 + MENUBAR_H, h_f32 - 70.0 - MENUBAR_H);
+            let (list_top, list_h) = self.list_geom();
+            self.email_list.set_rect(list_x, list_top, list_w, list_h);
+            self.email_list.update_bounds(list_count, list_top, list_h);
 
             if self.email_buttons.len() != list_count {
                 // Widget ids are globally monotonic and never reused, so the fresh buttons
@@ -3093,11 +3117,6 @@ impl Application for ClearEmailApp {
         // 1. General window background (deep slate blue)
         quads.push((0.0, 0.0, w_f32, h_f32, [0.05, 0.05, 0.07, 1.0]));
 
-        // Compose Button and Folders Graphics — full paint walk: chrome (rounded rects,
-        // hover/selected states) AND text in one pass. The legacy extra_quads bridge only
-        // forwarded plain Prim::Quads, so every widget's rounded chrome was dropped.
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose, &mut *quads.pc);
-
         // Bar chrome (was MenuBar's recessed paint): the bar is a plateau one
         // step down from the plate, flush with its top-left, so its only wall
         // is the bottom one facing the content — the other three sides are the
@@ -3118,9 +3137,11 @@ impl Application for ClearEmailApp {
         // 3. Email List Panel Separator
         quads.push((separator_x, MENUBAR_H, 1.0, h_f32 - MENUBAR_H, [0.18, 0.18, 0.22, 1.0]));
 
-        // Search box / Add Account and List
-        self.search_box.prepare_text(&mut self.font_system);
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.search_box, &mut *quads.pc);
+        // Search band (only while open) and the list
+        if self.search_open {
+            self.search_box.prepare_text(&mut self.font_system);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.search_box, &mut *quads.pc);
+        }
         {
             let mut list_quads = Vec::new();
             self.email_list.push_quads(&mut list_quads);
@@ -3398,12 +3419,10 @@ impl Application for ClearEmailApp {
             if ctx.propagate_event(&mv, self.btn_compose_cancel.id()) { changed = true; }
             if ctx.propagate_event(&mv, self.btn_compose_attach.id()) { changed = true; }
         } else {
-            // Sidebar buttons
-            if ctx.propagate_event(&mv, self.btn_compose.id()) { changed = true; }
             if ctx.propagate_event(&mv, self.account_dropdown.id()) { changed = true; }
 
             // Search and lists
-            if ctx.propagate_event(&mv, self.search_box.id()) { changed = true; }
+            if self.search_open && ctx.propagate_event(&mv, self.search_box.id()) { changed = true; }
             if self.email_list.cursor_moved(px, py) { changed = true; }
             // Hover scope for the detail-pane body scroll (wheel + keys).
             self.detail_hovered = px > separator_x;
@@ -3687,16 +3706,8 @@ impl Application for ClearEmailApp {
                 }
             }
         } else {
-            // Sidebar buttons
-            if ctx.propagate_event(&ev, self.btn_compose.id()) {
-                changed = true;
-                if state == ElementState::Released && self.btn_compose.take_click() {
-                    msg_out = Some(AppMessage::ComposeNew);
-                }
-            }
-
-            // Search input
-            if ctx.propagate_event(&ev, self.search_box.id()) {
+            // Search input — only reachable while the band is open.
+            if self.search_open && ctx.propagate_event(&ev, self.search_box.id()) {
                 changed = true;
                 if state == ElementState::Pressed { ctx.set_focused(&mut self.search_box); }
                 if self.search_box.take_change() {
@@ -3705,6 +3716,12 @@ impl Application for ClearEmailApp {
             } else if state == ElementState::Pressed && button == MouseButton::Left {
                 ctx.clear_focus();
                 self.search_box.unfocus();
+                // Clicking away from an EMPTY search collapses the band —
+                // an unfocused box with no query is dead chrome. One holding
+                // a query stays: it is the visible reason the list is short.
+                if self.search_open && self.search_box.text.is_empty() && self.search_box.edit_buffer.is_empty() {
+                    self.search_open = false;
+                }
                 changed = true;
             }
 
@@ -3853,12 +3870,16 @@ impl Application for ClearEmailApp {
                 if cce_ui::widget::match_key_shortcut(event, &self.keys.compose) {
                     msg_out = Some(AppMessage::ComposeNew);
                     handled = true;
-                } else if cce_ui::widget::match_key_shortcut(event, &self.keys.open_search) {
-                    {
-                        ctx.set_focused(&mut self.search_box);
-                        self.search_box.focus();
-                        handled = true;
-                    }
+                } else if !self.search_box.editing
+                    && cce_ui::widget::match_key_shortcut(event, &self.keys.open_search)
+                {
+                    // The !editing guard is load-bearing now the chord is a
+                    // bare "/": without it, typing a slash into the open box
+                    // would re-match here and never reach the text.
+                    self.search_open = true;
+                    ctx.set_focused(&mut self.search_box);
+                    self.search_box.focus();
+                    handled = true;
                 }
             }
 
@@ -3902,11 +3923,17 @@ impl Application for ClearEmailApp {
                 }
             }
 
-            // Escape unfocuses search
+            // Escape closes the search band and drops the query with it, so
+            // the list is unfiltered again — leaving a hidden filter behind
+            // would look like mail had gone missing.
             if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(cce_ui::widget::NamedKey::Escape) {
-                if self.search_box.editing {
+                if self.search_open {
                     ctx.clear_focus();
                     self.search_box.unfocus();
+                    self.search_box.text.clear();
+                    self.search_box.edit_buffer.clear();
+                    self.search_open = false;
+                    msg_out = Some(AppMessage::SearchChanged);
                     handled = true;
                 }
             }
