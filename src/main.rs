@@ -2347,6 +2347,60 @@ impl ClearEmailApp {
         (top, (self.height as f32 - top - LIST_BOTTOM_PAD).max(50.0))
     }
 
+    /// Move the selection `delta` rows through the list as it is displayed,
+    /// scrolling to keep the new row on screen. Returns the message to
+    /// dispatch, if any.
+    ///
+    /// A draft is selected in place rather than through SelectEmail, which
+    /// resumes it in the compose dialog — arrowing down a Drafts folder must
+    /// not fling a dialog open on every keypress.
+    fn move_selection(&mut self, delta: isize) -> Option<AppMessage> {
+        let rows: Vec<(usize, bool)> = self
+            .filtered_emails()
+            .iter()
+            .map(|e| (e.id, e.folder == "drafts"))
+            .collect();
+        if rows.is_empty() {
+            return None;
+        }
+
+        let current = self
+            .selected_email_id
+            .and_then(|id| rows.iter().position(|(rid, _)| *rid == id));
+        let next = match current {
+            Some(i) => (i as isize + delta).clamp(0, rows.len() as isize - 1) as usize,
+            // Nothing selected yet: Down lands on the newest, Up on the oldest.
+            None if delta > 0 => 0,
+            None => rows.len() - 1,
+        };
+        let (id, is_draft) = rows[next];
+        self.scroll_row_into_view(next);
+
+        if is_draft {
+            self.selected_email_id = Some(id);
+            self.body_scroll = 0.0;
+            None
+        } else {
+            Some(AppMessage::SelectEmail(id))
+        }
+    }
+
+    /// Scroll the list the least amount that puts row `idx` fully on screen.
+    fn scroll_row_into_view(&mut self, idx: usize) {
+        let (_, height) = self.list_geom();
+        // Row pitch is the region's own row height plus its gap, so this
+        // cannot drift from where the rows are actually painted.
+        let pitch = self.email_list.item_height + self.email_list.item_gap;
+        let row_top = idx as f32 * pitch;
+        let row_bottom = row_top + self.email_list.item_height;
+        let view = self.email_list.scroll_y;
+        if row_top < view {
+            self.email_list.set_scroll_y(row_top);
+        } else if row_bottom > view + height {
+            self.email_list.set_scroll_y(row_bottom - height);
+        }
+    }
+
     /// The rows the list is currently showing, in paint order — the folder
     /// filter plus the search box. A row index means nothing without this:
     /// it is what maps the card under the pointer to its message.
@@ -3140,6 +3194,10 @@ impl Application for ClearEmailApp {
             }
             AppMessage::DeleteSelected => {
                 if let Some(id) = self.selected_email_id {
+                    // Where it sits in the visible list, read before the
+                    // delete changes what that list contains.
+                    let deleted_row =
+                        self.filtered_emails().iter().position(|e| e.id == id);
                     let mut permanently_deleted = false;
                     let mut server_uid = None;
                     if let Some(email) = self.emails.iter_mut().find(|e| e.id == id) {
@@ -3171,7 +3229,25 @@ impl Application for ClearEmailApp {
                         self.emails.retain(|e| e.id != id);
                     }
                     self.save_emails();
-                    self.selected_email_id = None;
+
+                    // Land on whatever slid into the deleted row's place, so a
+                    // run of deletions needs no reaching for the mouse. Set
+                    // directly rather than through SelectEmail: that marks a
+                    // message read, and deleting past unread mail should not
+                    // quietly mark it read — nor resume the next draft.
+                    let rows: Vec<usize> =
+                        self.filtered_emails().iter().map(|e| e.id).collect();
+                    self.selected_email_id = match deleted_row {
+                        Some(i) => rows.get(i).or_else(|| rows.last()).copied(),
+                        None => None,
+                    };
+                    self.body_scroll = 0.0;
+                    if let Some(next_id) = self.selected_email_id {
+                        if let Some(i) = rows.iter().position(|id| *id == next_id) {
+                            self.scroll_row_into_view(i);
+                        }
+                    }
+
                     self.status_message = Some(StatusToast::info(
                         if permanently_deleted { "Email Deleted Permanently" } else { "Moved to Trash" },
                         4.0,
@@ -4242,6 +4318,42 @@ impl Application for ClearEmailApp {
         let kev = cce_ui::widget::Event::KeyInput(event.clone());
         // Read before ctx: detail_body_geom takes &self whole.
         let (_, body_h) = self.detail_body_geom();
+
+        // Arrow keys move the selection and Delete removes it. Handled up
+        // here, ahead of the ui_context borrow and everything routed through
+        // it: the list would otherwise eat Up/Down to scroll itself, and
+        // hover-scoping the arrows to whichever pane the pointer happens to
+        // rest over makes "the arrows do nothing" a matter of where the mouse
+        // is. move_selection takes &mut self, so it cannot run while ctx is
+        // borrowed anyway.
+        if !self.compose_open
+            && !self.search_box.editing
+            && event.state == ElementState::Pressed
+        {
+            match &event.logical_key {
+                Key::Named(cce_ui::widget::NamedKey::ArrowDown) => {
+                    msg_out = self.move_selection(1);
+                    handled = true;
+                }
+                Key::Named(cce_ui::widget::NamedKey::ArrowUp) => {
+                    msg_out = self.move_selection(-1);
+                    handled = true;
+                }
+                Key::Named(cce_ui::widget::NamedKey::Delete) => {
+                    if self.selected_email_id.is_some() {
+                        msg_out = Some(AppMessage::DeleteSelected);
+                        handled = true;
+                    }
+                }
+                _ => {}
+            }
+            if handled {
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+                return msg_out;
+            }
+        }
+
         let ctx = &mut self.ui_context;
 
         if self.compose_open {
@@ -4311,8 +4423,8 @@ impl Application for ClearEmailApp {
                 let max = (self.body_content_h - body_h).max(0.0);
                 let old = self.body_scroll;
                 match &event.logical_key {
-                    Key::Named(cce_ui::widget::NamedKey::ArrowDown) => self.body_scroll = (self.body_scroll + 24.0).min(max),
-                    Key::Named(cce_ui::widget::NamedKey::ArrowUp) => self.body_scroll = (self.body_scroll - 24.0).max(0.0),
+                    // Up/Down belong to the selection; the body still has
+                    // Page keys, Home/End, the wheel and its scrollbar.
                     Key::Named(cce_ui::widget::NamedKey::PageDown) => self.body_scroll = (self.body_scroll + body_h).min(max),
                     Key::Named(cce_ui::widget::NamedKey::PageUp) => self.body_scroll = (self.body_scroll - body_h).max(0.0),
                     Key::Named(cce_ui::widget::NamedKey::Home) => self.body_scroll = 0.0,
