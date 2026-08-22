@@ -161,7 +161,6 @@ struct ClearEmailApp {
     // rows are commands that re-fire on repeat) and two selection dropdowns.
     btn_compose: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     mail_menu: cce_ui::widget::Adapted<Dropdown>,
-    message_menu: cce_ui::widget::Adapted<Dropdown>,
     /// Folder switcher: options[0] carries the live inbox unread count
     /// ("Inbox (6)"), refreshed each rebuild, so rows and trigger agree.
     folder_dropdown: cce_ui::widget::Adapted<Dropdown>,
@@ -465,6 +464,10 @@ const LIST_W_MIN: f32 = 180.0;
 const DETAIL_W_MIN: f32 = 220.0;
 /// Half-width of the separator's grab band (±, matching ScrollRegion's slop).
 const SPLIT_GRAB_SLOP: f32 = 4.0;
+
+/// Row pitch of the toolkit context menu — its own layout constant
+/// (`ContextMenuState`), mirrored here because hit-testing is done app-side.
+const CONTEXT_ROW_H: f32 = 24.0;
 
 // Detail-pane vertical layout, every offset measured from MENUBAR_H. These
 // were literals scattered across paint, layout, the scrollbar geometry and
@@ -1871,8 +1874,6 @@ impl ClearEmailApp {
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.mail_menu.id(), self.mail_menu.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.message_menu.id(), self.message_menu.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.folder_dropdown.id(), self.folder_dropdown.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.account_dropdown.id(), self.account_dropdown.as_ptr_mut());
@@ -1920,6 +1921,104 @@ impl ClearEmailApp {
         let lw = self.list_w.clamp(LIST_W_MIN, max_w);
         let sep = LIST_X + lw + LIST_SEP_GAP;
         (lw, sep, sep + LIST_DETAIL_GAP)
+    }
+
+    /// The rows the list is currently showing, in paint order — the folder
+    /// filter plus the search box. A row index means nothing without this:
+    /// it is what maps the card under the pointer to its message.
+    fn filtered_emails(&self) -> Vec<&Email> {
+        let current_folder_str = match self.current_folder {
+            Folder::Inbox => "inbox",
+            Folder::Sent => "sent",
+            Folder::Drafts => "drafts",
+            Folder::Trash => "trash",
+        };
+        let search_text = if self.search_box.editing {
+            &self.search_box.edit_buffer
+        } else {
+            &self.search_box.text
+        };
+        let search_lower = search_text.to_lowercase();
+        self.emails
+            .iter()
+            .filter(|e| e.folder == current_folder_str)
+            .filter(|e| {
+                search_lower.is_empty()
+                    || e.from.to_lowercase().contains(&search_lower)
+                    || e.subject.to_lowercase().contains(&search_lower)
+                    || e.body.to_lowercase().contains(&search_lower)
+            })
+            .collect()
+    }
+
+    /// Right-press on a message card: open its context menu at the pointer.
+    /// Returns false when the press missed every card.
+    fn open_card_context_menu(&mut self, px: f32, py: f32) -> bool {
+        let hit = self.email_buttons.iter().position(|b| {
+            let (bx, by, bw, bh) = b.rect();
+            bx > -9000.0 && px >= bx && px <= bx + bw && py >= by && py <= by + bh
+        });
+        let Some(idx) = hit else { return false };
+        let Some((id, read, subject)) = self
+            .filtered_emails()
+            .get(idx)
+            .map(|e| (e.id, e.read, e.subject.clone()))
+        else {
+            return false;
+        };
+
+        // Select the card the menu acts on, but NOT through SelectEmail:
+        // that marks the message read and pushes the flag to the server, and
+        // sends a draft into the compose dialog — all wrong when the next
+        // click might be "Mark Unread".
+        self.selected_email_id = Some(id);
+        self.body_scroll = 0.0;
+
+        // Row 0 is the subject header (header_count = 1) — dimmed and inert.
+        let options = vec![
+            ellipsize(&subject, 28),
+            "Reply".to_string(),
+            "Delete".to_string(),
+            if read { "Mark Unread" } else { "Mark Read" }.to_string(),
+        ];
+        let target = self.email_buttons[idx].id();
+        cce_ui::widget::context_menu::show(px, py, options.clone(), 1, target);
+
+        // Re-show clamped rather than duplicating the toolkit's sizing rule:
+        // `show` is what computes w/h, and this app publishes no overflow
+        // margin, so a menu opened near the right or bottom rim has to be
+        // pulled back inside the window.
+        let mw = cce_ui::widget::context_menu::w();
+        let mh = cce_ui::widget::context_menu::h();
+        let cx = (px).min(self.width as f32 - mw - 2.0).max(0.0);
+        let cy = (py).min(self.height as f32 - mh - 2.0).max(0.0);
+        if (cx - px).abs() > 0.5 || (cy - py).abs() > 0.5 {
+            cce_ui::widget::context_menu::show(cx, cy, options, 1, target);
+        }
+        true
+    }
+
+    /// A press while a card menu is open: an item fires its action, anything
+    /// else only dismisses. The toolkit's own `context_menu::mouse_input` is
+    /// deliberately NOT used — it dispatches labels through a fixed map into
+    /// the target widget, where "Delete" means DeleteKey, not this app's
+    /// message.
+    fn context_menu_press(&mut self, px: f32, py: f32) -> Option<AppMessage> {
+        let mx = cce_ui::widget::context_menu::x();
+        let my = cce_ui::widget::context_menu::y();
+        let mw = cce_ui::widget::context_menu::w();
+        let mh = cce_ui::widget::context_menu::h();
+        let mut msg = None;
+        if px >= mx && px <= mx + mw && py >= my && py <= my + mh {
+            msg = match ((py - my) / CONTEXT_ROW_H) as usize {
+                1 => Some(AppMessage::Reply),
+                2 => Some(AppMessage::DeleteSelected),
+                3 => Some(AppMessage::ToggleUnread),
+                _ => None,
+            };
+        }
+        cce_ui::widget::context_menu::hide();
+        msg
     }
 
     /// The detail-pane body box: (top y, height). Paint, layout, the
@@ -2214,9 +2313,11 @@ impl Application for ClearEmailApp {
         cce_ui::scale::set_scale_factor(1.0);
         let btn_compose = Button::new(10.0, 15.0, 26.0, 26.0).with_label("+");
 
-        // The bar: four Dropdowns. Mail/Message are menu-button dropdowns
-        // (fixed trigger label, command rows that re-fire on repeat — the
+        // The bar: three Dropdowns. Mail is a menu-button dropdown (fixed
+        // trigger label, command rows that re-fire on repeat — the
         // custom_display_text mode); folder + account are selection dropdowns.
+        // Per-message actions are not here: they live on each card's
+        // right-click context menu, where the target is unambiguous.
         // The recessed bar chrome itself is carved in display_list.
         let bar_font = cce_ui::layout::parse_font_string(&cce_ui::layout::menubar_font()).0;
         let mail_menu = Dropdown::new(
@@ -2224,12 +2325,6 @@ impl Application for ClearEmailApp {
             0,
         )
         .with_custom_display_text("Mail")
-        .with_font_family(&bar_font);
-        let message_menu = Dropdown::new(
-            vec!["Reply".to_string(), "Delete".to_string(), "Mark Read/Unread".to_string()],
-            0,
-        )
-        .with_custom_display_text("Message")
         .with_font_family(&bar_font);
         let folder_dropdown = Dropdown::new(
             vec!["Inbox".to_string(), "Sent".to_string(), "Drafts".to_string(), "Trash".to_string()],
@@ -2319,7 +2414,6 @@ impl Application for ClearEmailApp {
             keys: EmailKeys::load(),
             btn_compose,
             mail_menu,
-            message_menu,
             folder_dropdown,
             account_dropdown,
             search_box,
@@ -2820,9 +2914,6 @@ impl Application for ClearEmailApp {
             if self.mail_menu.popover_rect().is_some() {
                 self.ui_context.register_popover(&mut self.mail_menu);
             }
-            if self.message_menu.popover_rect().is_some() {
-                self.ui_context.register_popover(&mut self.message_menu);
-            }
             if self.folder_dropdown.popover_rect().is_some() {
                 self.ui_context.register_popover(&mut self.folder_dropdown);
             }
@@ -2847,7 +2938,6 @@ impl Application for ClearEmailApp {
             // anchoring to the folder label would make the account switcher
             // drift as the folder name changes length.
             self.mail_menu.set_rect(8.0, 5.0, 80.0, 26.0);
-            self.message_menu.set_rect(96.0, 5.0, 112.0, 26.0);
             self.folder_dropdown.set_rect(w_f32 - 142.0, 5.0, 134.0, 26.0);
             self.account_dropdown.set_rect(w_f32 - 360.0, 5.0, 210.0, 26.0);
 
@@ -3002,7 +3092,6 @@ impl Application for ClearEmailApp {
             );
         }
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.mail_menu, &mut *quads.pc);
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.message_menu, &mut *quads.pc);
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.folder_dropdown, &mut *quads.pc);
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.account_dropdown, &mut *quads.pc);
 
@@ -3179,6 +3268,40 @@ impl Application for ClearEmailApp {
         }
 
         self.emit_text_prims(&mut __pc);
+
+        // The card context menu draws last, over everything. Its labels carry
+        // bounds EXACTLY equal to the menu rect: the engine's popover
+        // occlusion clamp exempts only an exact match, and pushes this same
+        // rect as an overlay so the row text underneath is clamped away.
+        if cce_ui::widget::context_menu::is_visible() {
+            let (mx, my) = (
+                cce_ui::widget::context_menu::x(),
+                cce_ui::widget::context_menu::y(),
+            );
+            let (mw, mh) = (
+                cce_ui::widget::context_menu::w(),
+                cce_ui::widget::context_menu::h(),
+            );
+            let menu_bounds = Some([mx, my, mx + mw, my + mh]);
+            for (qx, qy, qw, qh, qc) in cce_ui::widget::context_menu::extra_quads() {
+                __pc.quad(
+                    cce_ui::scene::layout::Rect { x: qx, y: qy, width: qw, height: qh },
+                    qc,
+                );
+            }
+            for label in cce_ui::widget::context_menu::text_labels() {
+                __pc.text_with(
+                    label.text.clone(),
+                    label.x,
+                    label.y,
+                    label.font_size,
+                    label.color,
+                    None,
+                    menu_bounds,
+                );
+            }
+        }
+
         Some(__pc.finish())
     }
 
@@ -3187,6 +3310,7 @@ impl Application for ClearEmailApp {
         // whole drag — mid-drag the pointer legally outruns the clamped
         // line, and the cursor must not flicker back to the arrow there.
         if !self.compose_open
+            && !cce_ui::widget::context_menu::is_visible()
             && (self.split_dragging
                 || ((x - self.split_geom().1).abs() <= SPLIT_GRAB_SLOP && y > MENUBAR_H))
         {
@@ -3203,6 +3327,16 @@ impl Application for ClearEmailApp {
         let mut changed = false;
         let px = pos.x as f32;
         let py = pos.y as f32;
+
+        // An open card menu owns the pointer: it takes the hover highlight,
+        // and nothing beneath it re-hovers under the covered rows.
+        if cce_ui::widget::context_menu::is_visible() {
+            if cce_ui::widget::context_menu::cursor_moved(px, py) {
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            return;
+        }
         // Active scrollbar-thumb drag tracks the pointer — before the
         // ui_context borrow (the sb helper takes &mut self).
         if !self.compose_open && self.body_sb_dragging {
@@ -3232,7 +3366,6 @@ impl Application for ClearEmailApp {
         let ctx = &mut self.ui_context;
 
         if ctx.propagate_event(&mv, self.mail_menu.id()) { changed = true; }
-        if ctx.propagate_event(&mv, self.message_menu.id()) { changed = true; }
         if ctx.propagate_event(&mv, self.folder_dropdown.id()) { changed = true; }
 
         if self.compose_open {
@@ -3276,6 +3409,36 @@ impl Application for ClearEmailApp {
         let px = pos.x as f32;
         let py = pos.y as f32;
         let ev = cce_ui::widget::Event::MouseButton { button, state, x: px, y: py, local_x: px, local_y: py };
+
+        // An open card menu swallows the press before any widget routing.
+        if cce_ui::widget::context_menu::is_visible() {
+            if state != ElementState::Pressed {
+                return None;
+            }
+            let msg = self.context_menu_press(px, py);
+            *needs_rebuild = true;
+            self.needs_rebuild = true;
+            if msg.is_some() {
+                return msg;
+            }
+            // A right-press elsewhere goes on to open another card's menu.
+            if button != MouseButton::Right {
+                return None;
+            }
+        }
+
+        // Right-press on a message card opens that card's context menu.
+        if button == MouseButton::Right && state == ElementState::Pressed && !self.compose_open {
+            // Both the engine's outside-press sweep and Dropdown's own event
+            // arm match Left only, so without this a right press strands an
+            // open bar menu hanging over the list.
+            self.ui_context.close_popovers_missed_by_press(px, py);
+            if self.open_card_context_menu(px, py) {
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+                return None;
+            }
+        }
 
         // A sticky error toast dismisses on a direct press (info toasts
         // expire on their own). Bounds mirror the paint site — x=200,
@@ -3412,18 +3575,6 @@ impl Application for ClearEmailApp {
                     0 => Some(AppMessage::ComposeNew),
                     1 => Some(AppMessage::SyncNow),
                     _ => Some(AppMessage::Quit),
-                };
-            }
-            *needs_rebuild = true;
-            self.needs_rebuild = true;
-            return msg_out;
-        }
-        if ctx.propagate_event(&ev, self.message_menu.id()) {
-            if self.message_menu.take_change() {
-                msg_out = match self.message_menu.selected {
-                    0 => Some(AppMessage::Reply),
-                    1 => Some(AppMessage::DeleteSelected),
-                    _ => Some(AppMessage::ToggleUnread),
                 };
             }
             *needs_rebuild = true;
