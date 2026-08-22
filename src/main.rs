@@ -1753,7 +1753,21 @@ fn sync_imap(
 /// STORE+expunge below is what actually removes it from INBOX either way.
 /// UIDPLUS uid_expunge targets just our message; plain EXPUNGE fallback also
 /// flushes any other \Deleted-flagged mail, which matches client convention.
-fn delete_on_server(mut account: AccountInfo, uid: u32, sender: calloop::channel::Sender<AppMessage>) {
+/// Remove a message from `folder_tag`'s mailbox on the server.
+///
+/// `permanent` decides whether the safety net runs. Normally the message is
+/// copied into the server's own Trash first, so expunging it here only drops
+/// it from this mailbox and it stays recoverable for as long as the provider
+/// keeps its Trash. A permanent delete skips that copy, which for
+/// `[Gmail]/All Mail` means the message is gone from the account outright —
+/// All Mail is the last label holding it.
+fn delete_on_server(
+    mut account: AccountInfo,
+    folder_tag: String,
+    uid: u32,
+    permanent: bool,
+    sender: calloop::channel::Sender<AppMessage>,
+) {
     std::thread::spawn(move || {
         if is_mock_account(&account) {
             return;
@@ -1761,16 +1775,22 @@ fn delete_on_server(mut account: AccountInfo, uid: u32, sender: calloop::channel
         let Some(mut session) = open_imap_session(&mut account, &sender, true) else {
             return;
         };
-        if let Err(e) = session.select("INBOX") {
-            eprintln!("cce-mail: Failed to select INBOX: {}", e);
-            let _ = sender.send(AppMessage::StatusError(format!("Failed to select INBOX: {}", e)));
+        // The uid only means anything inside its own mailbox, so this must be
+        // the one the message was synced from.
+        let candidates = mailbox_candidates(&folder_tag);
+        if !candidates.iter().any(|mb| session.select(mb).is_ok()) {
+            let msg = format!("Failed to select {}", candidates[0]);
+            eprintln!("cce-mail: {}", msg);
+            let _ = sender.send(AppMessage::StatusError(msg));
             let _ = session.logout();
             return;
         }
         let uid_set = uid.to_string();
-        for trash in ["[Gmail]/Trash", "Trash"] {
-            if session.uid_copy(&uid_set, trash).is_ok() {
-                break;
+        if !permanent {
+            for trash in ["[Gmail]/Trash", "Trash"] {
+                if session.uid_copy(&uid_set, trash).is_ok() {
+                    break;
+                }
             }
         }
         if let Err(e) = session.uid_store(&uid_set, "+FLAGS (\\Deleted)") {
@@ -1782,7 +1802,9 @@ fn delete_on_server(mut account: AccountInfo, uid: u32, sender: calloop::channel
         if session.uid_expunge(&uid_set).is_err() {
             let _ = session.expunge();
         }
-        let _ = sender.send(AppMessage::Status("Deleted on server".to_string()));
+        let _ = sender.send(AppMessage::Status(
+            if permanent { "Deleted permanently on server" } else { "Deleted on server" }.to_string(),
+        ));
         let _ = session.logout();
     });
 }
@@ -2432,10 +2454,10 @@ impl ClearEmailApp {
             bx > -9000.0 && px >= bx && px <= bx + bw && py >= by && py <= by + bh
         });
         let Some(idx) = hit else { return false };
-        let Some((id, read, subject, is_draft)) = self
+        let Some((id, read, subject, folder)) = self
             .filtered_emails()
             .get(idx)
-            .map(|e| (e.id, e.read, e.subject.clone(), e.folder == "drafts"))
+            .map(|e| (e.id, e.read, e.subject.clone(), e.folder.clone()))
         else {
             return false;
         };
@@ -2452,14 +2474,20 @@ impl ClearEmailApp {
         // there is nobody to reply to and no read state, so it gets Edit —
         // which is SelectEmail, the same path a left-click takes to resume it
         // in the compose dialog.
-        let (labels, actions): (Vec<&str>, Vec<Option<AppMessage>>) = if is_draft {
+        // A delete that cannot be undone should say so where it is invoked.
+        let delete_label = if folder == "trash" || folder == "archive" {
+            "Delete Forever"
+        } else {
+            "Delete"
+        };
+        let (labels, actions): (Vec<&str>, Vec<Option<AppMessage>>) = if folder == "drafts" {
             (
-                vec!["Edit", "Delete"],
+                vec!["Edit", delete_label],
                 vec![Some(AppMessage::SelectEmail(id)), Some(AppMessage::DeleteSelected)],
             )
         } else {
             (
-                vec!["Reply", "Delete", if read { "Mark Unread" } else { "Mark Read" }],
+                vec!["Reply", delete_label, if read { "Mark Unread" } else { "Mark Read" }],
                 vec![
                     Some(AppMessage::Reply),
                     Some(AppMessage::DeleteSelected),
@@ -3199,13 +3227,30 @@ impl Application for ClearEmailApp {
                     let deleted_row =
                         self.filtered_emails().iter().position(|e| e.id == id);
                     let mut permanently_deleted = false;
-                    let mut server_uid = None;
+                    // (mailbox tag, uid, permanent)
+                    let mut server_op: Option<(String, u32, bool)> = None;
                     if let Some(email) = self.emails.iter_mut().find(|e| e.id == id) {
                         if email.folder == "trash" {
+                            // Already in the local Trash: this is the second
+                            // delete, so it is the final one. The copy on the
+                            // server lives in whichever mailbox it came from.
                             permanently_deleted = true;
+                            if let (Some(origin), Some(uid)) =
+                                (email.origin_folder.clone(), email.uid)
+                            {
+                                server_op = Some((origin, uid, true));
+                            }
+                        } else if email.folder == "archive" {
+                            // All Mail is the last label holding a message, so
+                            // there is no lesser delete to offer here: removing
+                            // it from this mailbox removes it from the account.
+                            permanently_deleted = true;
+                            if let Some(uid) = email.uid {
+                                server_op = Some(("archive".to_string(), uid, true));
+                            }
                         } else {
                             if email.folder == "inbox" {
-                                server_uid = email.uid;
+                                server_op = email.uid.map(|u| ("inbox".to_string(), u, false));
                             }
                             // Remember where it came from. Deletion only
                             // reaches the server for INBOX (expunging from
@@ -3220,9 +3265,15 @@ impl Application for ClearEmailApp {
                             email.folder = "trash".to_string();
                         }
                     }
-                    if let Some(uid) = server_uid {
+                    if let Some((tag, uid, permanent)) = server_op {
                         if let Some(acc) = self.accounts.get(self.selected_account_idx) {
-                            delete_on_server(acc.clone(), uid, self.sender.clone());
+                            delete_on_server(
+                                acc.clone(),
+                                tag,
+                                uid,
+                                permanent,
+                                self.sender.clone(),
+                            );
                         }
                     }
                     if permanently_deleted {
