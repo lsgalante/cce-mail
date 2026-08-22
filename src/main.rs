@@ -222,6 +222,16 @@ struct ClearEmailApp {
     /// When the most recent IMAP sync was spawned — folder switches re-sync
     /// through [`Self::start_sync`], throttled against tab-hopping.
     last_sync_start: Option<std::time::Instant>,
+    /// Set when a sync was skipped because the account had no password: the
+    /// vault was not readable yet. `tick` retries at this instant, so an
+    /// unlock heals the account on its own rather than waiting for the user
+    /// to go looking for a Sync Now.
+    secret_retry_at: Option<std::time::Instant>,
+    /// Whether the missing password has already been reported. Separate from
+    /// `secret_retry_at`, which `tick` clears before each attempt — reusing
+    /// that as the "already said this" flag made every retry look like the
+    /// first and logged the same line every few seconds.
+    secret_missing_reported: bool,
     status_message: Option<StatusToast>,
     sender: calloop::channel::Sender<AppMessage>,
 
@@ -469,6 +479,11 @@ const LIST_W_MIN: f32 = 180.0;
 const DETAIL_W_MIN: f32 = 220.0;
 /// Half-width of the separator's grab band (±, matching ScrollRegion's slop).
 const SPLIT_GRAB_SLOP: f32 = 4.0;
+
+/// How long to wait before re-reading the keyring after a sync found the
+/// account had no password. Short enough that unlocking the vault feels
+/// self-healing, long enough that a vault left locked costs nothing.
+const SECRET_RETRY_SECS: u64 = 5;
 
 /// Row pitch of the toolkit context menu — its own layout constant
 /// (`ContextMenuState`), mirrored here because hit-testing is done app-side.
@@ -1905,15 +1920,78 @@ impl ClearEmailApp {
     /// Spawn an IMAP sync for the selected account. Unforced calls (folder
     /// switches) are throttled so tab-hopping doesn't stack connections;
     /// forced calls (explicit account selection) always run.
+    /// Re-read a keyring-backed account's password when it has gone missing.
+    ///
+    /// Secrets otherwise resolve exactly once, at startup — and the compositor
+    /// restores every saved window at once, so cce-mail can read the vault in
+    /// the same second KeePassXC is still claiming org.freedesktop.secrets.
+    /// The account is then left holding an empty password and every sync fails
+    /// with the server's `Empty username or password` until the app is
+    /// restarted (diagnosed 2026-08-22 from the mirrored stderr). Re-reading
+    /// before a sync heals that race, and the mid-session re-lock with it.
+    ///
+    /// Deliberately only when the password is MISSING: the resolver's other
+    /// branch writes a non-empty password back INTO the keyring, which has no
+    /// business running on every sync.
+    fn refresh_account_secret(&mut self, idx: usize) {
+        let Some(acc) = self.accounts.get_mut(idx) else {
+            return;
+        };
+        if !acc.password.is_empty() || is_mock_account(acc) {
+            return;
+        }
+        let email = acc.email.clone();
+        let migrated = resolve_account_secrets(std::slice::from_mut(acc));
+        if !self.accounts[idx].password.is_empty() {
+            eprintln!("cce-mail: recovered {} credentials from the keyring", email);
+        }
+        if migrated {
+            save_accounts(&self.accounts);
+        }
+    }
+
     fn start_sync(&mut self, force: bool) {
         const MIN_SYNC_GAP: std::time::Duration = std::time::Duration::from_secs(30);
         if !force && self.last_sync_start.is_some_and(|t| t.elapsed() < MIN_SYNC_GAP) {
             return;
         }
-        if let Some(acc) = self.accounts.get(self.selected_account_idx) {
-            sync_imap(acc.clone(), self.sender.clone());
-            self.last_sync_start = Some(std::time::Instant::now());
+        self.refresh_account_secret(self.selected_account_idx);
+
+        let Some((email, is_oauth, no_password, mock)) = self
+            .accounts
+            .get(self.selected_account_idx)
+            .map(|a| (a.email.clone(), a.is_oauth, a.password.is_empty(), is_mock_account(a)))
+        else {
+            return;
+        };
+
+        // Still nothing to log in with: say what is actually wrong rather than
+        // relaying the server's reply, which reads as a bug in the app. OAuth
+        // accounts legitimately carry no password — the token comes from the
+        // refresh — so they are exempt.
+        if !is_oauth && no_password && !mock {
+            // First miss only. The retry below runs until the vault opens, so
+            // saying this every few seconds would spam the session log for as
+            // long as it stays shut, and keep clobbering whatever toast the
+            // user is actually reading.
+            if !self.secret_missing_reported {
+                self.secret_missing_reported = true;
+                let msg = format!("No password for {} — is the keyring unlocked?", email);
+                eprintln!("cce-mail: {} (retrying every {}s)", msg, SECRET_RETRY_SECS);
+                self.status_message = Some(StatusToast::error(msg));
+            }
+            self.secret_retry_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(SECRET_RETRY_SECS));
+            // last_sync_start is left alone: unlocking the vault should not
+            // then have to wait out the throttle.
+            return;
         }
+
+        self.secret_retry_at = None;
+        self.secret_missing_reported = false;
+        let account = self.accounts[self.selected_account_idx].clone();
+        sync_imap(account, self.sender.clone());
+        self.last_sync_start = Some(std::time::Instant::now());
     }
 
     fn save_emails(&self) {
@@ -2439,15 +2517,10 @@ impl Application for ClearEmailApp {
             Vec::new()
         };
 
-        let last_sync_start = if let Some(acc) = accounts.get(selected_account_idx) {
-            sync_imap(acc.clone(), _sender.clone());
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        Self {
-            last_sync_start,
+        let mut app = Self {
+            last_sync_start: None,
+            secret_retry_at: None,
+            secret_missing_reported: false,
             keys: EmailKeys::load(),
             mail_menu,
             folder_dropdown,
@@ -2489,7 +2562,14 @@ impl Application for ClearEmailApp {
             font_system: cce_ui::create_font_system(),
             needs_rebuild: true,
             ui_context: UiContext::new(),
-        }
+        };
+
+        // The first sync goes through start_sync like every other one, so it
+        // gets the same keyring refresh and missing-password guard. It used to
+        // call sync_imap inline here — the one sync that bypassed both, and
+        // precisely the one that fails when the vault is not up yet.
+        app.start_sync(true);
+        app
     }
 
     fn settings(&self) -> WindowSettings {
@@ -2902,6 +2982,17 @@ impl Application for ClearEmailApp {
         if self.ui_context.tick(dt) {
             *needs_rebuild = true;
             self.needs_rebuild = true;
+        }
+
+        // A sync skipped for a missing password retries itself, so unlocking
+        // the vault brings mail in without the user having to ask again.
+        // No redraw is requested here: a failed retry changes nothing on
+        // screen (the toast is already up), and asking for one every few
+        // seconds would keep this demand-driven loop from ever idling. A
+        // successful one repaints when its results arrive.
+        if self.secret_retry_at.is_some_and(|t| std::time::Instant::now() >= t) {
+            self.secret_retry_at = None;
+            self.start_sync(true);
         }
 
         // Only info toasts expire; an error stays until clicked or replaced.
