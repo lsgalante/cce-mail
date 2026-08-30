@@ -4629,6 +4629,69 @@ impl Application for ClearEmailApp {
         // Read before ctx: detail_body_geom takes &self whole.
         let (_, body_h) = self.detail_body_geom();
 
+        // A visible context menu takes Escape — it was mouse-dismiss only.
+        if event.state == ElementState::Pressed
+            && event.logical_key == Key::Named(cce_ui::widget::NamedKey::Escape)
+            && cce_ui::widget::context_menu::is_visible()
+        {
+            cce_ui::widget::context_menu::hide();
+            self.context_menu_actions.clear();
+            *needs_rebuild = true;
+            self.needs_rebuild = true;
+            return None;
+        }
+
+        // An open bar dropdown takes the keyboard — Escape closes it, arrows
+        // move the hover, Enter selects — routed and drained exactly like its
+        // mouse events (see handle_mouse_input; the freshly-opened accounts
+        // reload stays mouse-only, since a key cannot open a closed
+        // dropdown). No key ever reached these before: every propagate below
+        // is gated on compose/search state that an open dropdown never
+        // satisfies (the cce-files bug).
+        if self.account_dropdown.open {
+            if self.ui_context.propagate_event(&kev, self.account_dropdown.id()) {
+                if self.account_dropdown.take_change() {
+                    let idx = self.account_dropdown.selected;
+                    if idx < self.accounts.len() {
+                        if idx != self.selected_account_idx {
+                            msg_out = Some(AppMessage::SelectAccount(idx));
+                        }
+                    } else {
+                        // The trailing "Manage Accounts…" pseudo-entry.
+                        self.account_dropdown.selected = self.selected_account_idx;
+                        msg_out = Some(AppMessage::ManageAccounts);
+                    }
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+                return msg_out;
+            }
+        } else if self.mail_menu.open {
+            if self.ui_context.propagate_event(&kev, self.mail_menu.id()) {
+                if self.mail_menu.take_change() {
+                    msg_out = match self.mail_menu.selected {
+                        0 => Some(AppMessage::ComposeNew),
+                        1 => Some(AppMessage::SyncNow),
+                        _ => Some(AppMessage::Quit),
+                    };
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+                return msg_out;
+            }
+        } else if self.folder_dropdown.open {
+            if self.ui_context.propagate_event(&kev, self.folder_dropdown.id()) {
+                if self.folder_dropdown.take_change() {
+                    if let Some(f) = self.folders.get(self.folder_dropdown.selected) {
+                        msg_out = Some(AppMessage::SwitchFolder(f.tag.clone()));
+                    }
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+                return msg_out;
+            }
+        }
+
         // Arrow keys move the selection and Delete removes it. Handled up
         // here, ahead of the ui_context borrow and everything routed through
         // it: the list would otherwise eat Up/Down to scroll itself, and
