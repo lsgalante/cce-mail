@@ -2055,6 +2055,13 @@ fn delete_on_server(
         if is_mock_account(&account) {
             return;
         }
+        // Same guard as start_sync: dialing out with an empty password gets
+        // the server's baffling "Empty username or password" instead of the
+        // actual problem — the keyring never yielded the credential.
+        if !account.is_oauth && account.password.is_empty() {
+            eprintln!("cce-mail: server delete: no password (keyring locked or entry missing); not connecting");
+            return;
+        }
         let Some(mut session) = open_imap_session(&mut account, &sender, true) else {
             return;
         };
@@ -2135,6 +2142,14 @@ fn fetch_attachment(
         };
         if is_mock_account(&account) {
             report(&sender, Err("This account has no server copy".to_string()));
+            return;
+        }
+        // Same guard as start_sync: dialing out with an empty password gets
+        // the server's baffling "Empty username or password" instead of the
+        // actual problem — the keyring never yielded the credential.
+        if !account.is_oauth && account.password.is_empty() {
+            eprintln!("cce-mail: attachment fetch: no password (keyring locked or entry missing); not connecting");
+            report(&sender, Err("No password — is the keyring unlocked?".to_string()));
             return;
         }
         let Some(mut session) = open_imap_session(&mut account, &sender, false) else {
@@ -2260,6 +2275,13 @@ fn fetch_html_part(
 fn set_seen_on_server(mut account: AccountInfo, uid: u32, seen: bool, sender: calloop::channel::Sender<AppMessage>) {
     std::thread::spawn(move || {
         if is_mock_account(&account) {
+            return;
+        }
+        // Same guard as start_sync: dialing out with an empty password gets
+        // the server's baffling "Empty username or password" instead of the
+        // actual problem — the keyring never yielded the credential.
+        if !account.is_oauth && account.password.is_empty() {
+            eprintln!("cce-mail: seen-flag push: no password (keyring locked or entry missing); not connecting");
             return;
         }
         let Some(mut session) = open_imap_session(&mut account, &sender, false) else {
