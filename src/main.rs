@@ -2180,49 +2180,74 @@ fn fetch_html_part(
     sender: calloop::channel::Sender<AppMessage>,
 ) {
     std::thread::spawn(move || {
-        let report = |r: Option<String>| {
+        // Falling back to text is silent in the UI by design, but the WHY
+        // must not vanish with it — stderr, like every other failure here.
+        let report = |r: Option<String>, why: &str| {
+            if r.is_none() {
+                eprintln!("cce-mail: html fetch uid {uid} in {mailbox:?}: {why}");
+            }
             let _ = sender.send(AppMessage::HtmlFetched(email_id, r));
         };
         if is_mock_account(&account) {
-            report(None);
+            report(None, "mock account has no server copy");
+            return;
+        }
+        // Same guard as start_sync: dialing out with an empty password gets
+        // the server's baffling "Empty username or password" instead of the
+        // actual problem — the keyring never yielded the credential.
+        if !account.is_oauth && account.password.is_empty() {
+            report(None, "no password (keyring locked or entry missing); not connecting");
             return;
         }
         let Some(mut session) = open_imap_session(&mut account, &sender, false) else {
-            report(None);
+            report(None, "IMAP connection failed");
             return;
         };
-        if session.select(&mailbox).is_err() {
-            report(None);
+        if let Err(e) = session.select(&mailbox) {
+            report(None, &format!("cannot select mailbox: {e}"));
             let _ = session.logout();
             return;
         }
         let spec = match session.uid_fetch(uid.to_string(), "(BODYSTRUCTURE)") {
-            Ok(fetches) => fetches
-                .iter()
-                .next()
-                .and_then(|f| f.bodystructure().and_then(find_html_part)),
-            Err(_) => None,
+            Ok(fetches) => match fetches.iter().next() {
+                Some(f) => match f.bodystructure() {
+                    Some(bs) => match find_html_part(bs) {
+                        Some(spec) => Ok(spec),
+                        None => Err("no text/html part in the structure".to_string()),
+                    },
+                    None => Err("fetch reply carried no BODYSTRUCTURE".to_string()),
+                },
+                None => Err("server returned no message for the uid".to_string()),
+            },
+            Err(e) => Err(format!("BODYSTRUCTURE fetch failed: {e}")),
         };
-        let Some(spec) = spec else {
-            report(None);
-            let _ = session.logout();
-            return;
+        let spec = match spec {
+            Ok(spec) => spec,
+            Err(why) => {
+                report(None, &why);
+                let _ = session.logout();
+                return;
+            }
         };
         let query = format!("(UID BODY.PEEK[{}]<0.{}>)", section_str(&spec.path), HTML_FETCH_CAP);
         let section_path = imap_proto::types::SectionPath::Part(spec.path.clone(), None);
         let html = match session.uid_fetch(uid.to_string(), &query) {
-            Ok(fetches) => fetches
-                .iter()
-                .next()
-                .and_then(|f| f.section(&section_path))
-                .and_then(|bytes| {
-                    mail_parser::MessageParser::default()
-                        .parse(&spec.synthesize(bytes))
-                        .and_then(|m| m.body_html(0).map(|c| c.into_owned()))
-                }),
-            Err(_) => None,
+            Ok(fetches) => match fetches.iter().next().and_then(|f| f.section(&section_path)) {
+                Some(bytes) => match mail_parser::MessageParser::default()
+                    .parse(&spec.synthesize(bytes))
+                    .and_then(|m| m.body_html(0).map(|c| c.into_owned()))
+                {
+                    Some(html) => Ok(html),
+                    None => Err("part bytes did not decode as HTML".to_string()),
+                },
+                None => Err(format!("no data for section {}", section_str(&spec.path))),
+            },
+            Err(e) => Err(format!("part fetch failed: {e}")),
         };
-        report(html);
+        match html {
+            Ok(html) => report(Some(html), ""),
+            Err(why) => report(None, &why),
+        }
         let _ = session.logout();
     });
 }
@@ -3025,11 +3050,15 @@ impl ClearEmailApp {
             .find(|e| e.id == id)
             .map(|e| (e.folder.clone(), e.uid))
         else {
+            eprintln!("cce-mail: html view: message {id} has no server uid; staying on text");
             return;
         };
         // Same mailbox rule as OpenAttachment: a uid only means anything
         // inside the mailbox the sync pulled it from.
-        let Some(mailbox) = self.mailbox_for(&folder) else { return };
+        let Some(mailbox) = self.mailbox_for(&folder) else {
+            eprintln!("cce-mail: html view: folder {folder:?} has no server mailbox; staying on text");
+            return;
+        };
         let Some(acc) = self.accounts.get(self.selected_account_idx) else { return };
         self.html_pending = Some(id);
         fetch_html_part(acc.clone(), mailbox, uid, id, self.sender.clone());
