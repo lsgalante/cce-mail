@@ -1760,11 +1760,17 @@ const TAG_TRASH: &str = "trash";
 
 /// The folders that exist before the server has been asked — and the order the
 /// switcher always leads with. Discovered folders are appended after these.
+///
+/// Only INBOX carries a mailbox here: it is the one name RFC 3501 guarantees.
+/// Archive and sent start local and get their mailbox from special-use
+/// discovery (`resolve_folders`) — guessing a provider's names instead (this
+/// used to say `[Gmail]/All Mail`) means every non-Gmail account SELECTs a
+/// mailbox that does not exist, on every sync.
 fn default_folders() -> Vec<FolderInfo> {
     vec![
         FolderInfo { tag: TAG_INBOX.into(), label: "Inbox".into(), mailbox: "INBOX".into() },
-        FolderInfo { tag: TAG_ARCHIVE.into(), label: "All Mail".into(), mailbox: "[Gmail]/All Mail".into() },
-        FolderInfo { tag: TAG_SENT.into(), label: "Sent".into(), mailbox: "[Gmail]/Sent Mail".into() },
+        FolderInfo { tag: TAG_ARCHIVE.into(), label: "Archive".into(), mailbox: String::new() },
+        FolderInfo { tag: TAG_SENT.into(), label: "Sent".into(), mailbox: String::new() },
         // Local-only: this app owns Drafts and Trash, so they have no mailbox
         // and the server's own Drafts/Trash are deliberately not adopted.
         FolderInfo { tag: TAG_DRAFTS.into(), label: "Drafts".into(), mailbox: String::new() },
@@ -1847,30 +1853,17 @@ fn decode_imap_utf7(raw: &str) -> String {
 
 /// Ask the server which folders exist, folded into the default set.
 ///
-/// Mailboxes the server flags `\\Drafts` or `\\Trash` are deliberately skipped:
-/// this app keeps Drafts and Trash locally, and adopting the server's would
-/// give one tag two meanings. `\\All` and `\\Sent` fill in the mailbox names
-/// for the archive and sent folders instead of the guesses in
-/// `default_folders` — which is how an account that calls its sent mail
-/// "Sent Messages" (iCloud) starts syncing at all.
+/// `None` means LIST itself failed — the caller falls back to the last saved
+/// discovery rather than the defaults, whose archive/sent have no mailbox yet.
 fn list_folders(
     session: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>,
-) -> Vec<FolderInfo> {
-    let mut folders = default_folders();
-    let Ok(names) = session.list(Some(""), Some("*")) else {
-        return folders;
-    };
+) -> Option<Vec<FolderInfo>> {
+    let names = session.list(Some(""), Some("*")).ok()?;
 
-    let set_mailbox = |folders: &mut Vec<FolderInfo>, tag: &str, mailbox: &str| {
-        if let Some(f) = folders.iter_mut().find(|f| f.tag == tag) {
-            f.mailbox = mailbox.to_string();
-        }
-    };
-
-    let mut custom: Vec<FolderInfo> = Vec::new();
+    let mut entries: Vec<(String, Option<&'static str>)> = Vec::new();
     for n in names.iter() {
         let mut noselect = false;
-        let mut special: Option<&str> = None;
+        let mut special: Option<&'static str> = None;
         for a in n.attributes() {
             match a {
                 imap::types::NameAttribute::NoSelect => noselect = true,
@@ -1878,6 +1871,7 @@ fn list_folders(
                     let c = c.as_ref();
                     for (flag, kind) in [
                         ("\\All", "all"),
+                        ("\\Archive", "archive"),
                         ("\\Sent", "sent"),
                         ("\\Drafts", "drafts"),
                         ("\\Trash", "trash"),
@@ -1890,15 +1884,50 @@ fn list_folders(
                 _ => {}
             }
         }
-        if noselect {
-            continue;
+        if !noselect {
+            entries.push((n.name().to_string(), special));
         }
-        let raw = n.name().to_string();
+    }
+    Some(resolve_folders(entries))
+}
+
+/// Fold the LIST reply into the default folder set: each entry is a selectable
+/// mailbox name plus its special-use verdict (RFC 6154).
+///
+/// Mailboxes the server flags `\Drafts` or `\Trash` are deliberately skipped:
+/// this app keeps Drafts and Trash locally, and adopting the server's would
+/// give one tag two meanings. `\Sent` fills in the sent mailbox — which is how
+/// an account that calls its sent mail "Sent Messages" (iCloud) syncs at all.
+/// The archive slot takes `\All` (Gmail's All Mail) or, failing that,
+/// `\Archive` (everyone else's), `\All` winning in either LIST order; it also
+/// adopts the server's own label, because what the folder *is* differs — All
+/// Mail holds everything, an Archive folder only what was archived — and a
+/// slot labelled for one provider reads as a lie on another.
+fn resolve_folders(entries: Vec<(String, Option<&str>)>) -> Vec<FolderInfo> {
+    let mut folders = default_folders();
+
+    let adopt = |folders: &mut Vec<FolderInfo>, tag: &str, mailbox: &str, relabel: bool| {
+        if let Some(f) = folders.iter_mut().find(|f| f.tag == tag) {
+            f.mailbox = mailbox.to_string();
+            if relabel {
+                f.label = folder_label(mailbox);
+            }
+        }
+    };
+
+    let mut archive_from_all = false;
+    let mut custom: Vec<FolderInfo> = Vec::new();
+    for (raw, special) in entries {
         match special {
             Some("drafts") | Some("trash") => continue,
-            Some("all") => set_mailbox(&mut folders, TAG_ARCHIVE, &raw),
-            Some("sent") => set_mailbox(&mut folders, TAG_SENT, &raw),
-            _ if raw.eq_ignore_ascii_case("INBOX") => set_mailbox(&mut folders, TAG_INBOX, &raw),
+            Some("all") => {
+                adopt(&mut folders, TAG_ARCHIVE, &raw, true);
+                archive_from_all = true;
+            }
+            Some("archive") if !archive_from_all => adopt(&mut folders, TAG_ARCHIVE, &raw, true),
+            Some("archive") => continue,
+            Some("sent") => adopt(&mut folders, TAG_SENT, &raw, false),
+            _ if raw.eq_ignore_ascii_case("INBOX") => adopt(&mut folders, TAG_INBOX, &raw, false),
             _ => custom.push(FolderInfo {
                 tag: raw.clone(),
                 label: folder_label(&raw),
@@ -2068,12 +2097,19 @@ fn sync_imap(
         // Ask what exists before fetching anything: discovery is what supplies
         // the real mailbox names, so an account that calls its sent mail
         // "Sent Messages" is handled without guessing, and it is what puts the
-        // account's own folders in the switcher.
-        let discovered = list_folders(&mut session);
-        let _ = sender.send(AppMessage::FoldersDiscovered(
-            account.email.clone(),
-            discovered.clone(),
-        ));
+        // account's own folders in the switcher. If LIST itself fails, sync
+        // from the last discovery instead — the defaults know no archive/sent
+        // mailbox — and leave the saved set alone.
+        let discovered = match list_folders(&mut session) {
+            Some(d) => {
+                let _ = sender.send(AppMessage::FoldersDiscovered(
+                    account.email.clone(),
+                    d.clone(),
+                ));
+                d
+            }
+            None => load_folders(&account.email),
+        };
 
         let empty = std::collections::HashSet::new();
         let mut folders = Vec::new();
@@ -6302,7 +6338,10 @@ mod tests {
         let mut trashed = msg(1, Some(77), "trash", "deleted from All Mail", true);
         trashed.origin_folder = Some("archive".to_string());
         let live = msg(2, Some(78), "archive", "still there", true);
-        let known = known_uids(&[trashed, live], &default_folders());
+        // As after discovery: the archive slot has been given its mailbox.
+        let mut folders = default_folders();
+        folders.iter_mut().find(|f| f.tag == TAG_ARCHIVE).unwrap().mailbox = "Archive".into();
+        let known = known_uids(&[trashed, live], &folders);
         let archive = known.get("archive").expect("archive tracked");
         assert!(archive.contains(&77), "a trashed message stays known");
         assert!(archive.contains(&78));
@@ -6323,14 +6362,64 @@ mod tests {
         assert_eq!(f.len(), 5);
         assert_eq!(f[0].tag, TAG_INBOX);
         assert_eq!(f[0].label, "Inbox");
-        let archive = f.iter().find(|f| f.tag == TAG_ARCHIVE).expect("archive present");
-        assert_eq!(archive.label, "All Mail");
-        assert!(archive.is_server_backed());
-        // Drafts and Trash are this app's own, not the server's.
-        for tag in [TAG_DRAFTS, TAG_TRASH] {
-            let local = f.iter().find(|f| f.tag == tag).expect("local folder present");
-            assert!(!local.is_server_backed(), "{} must stay local", tag);
+        assert!(f[0].is_server_backed(), "INBOX is the one guaranteed mailbox");
+        // Archive and sent wait for discovery to name their mailbox: the old
+        // [Gmail]/… guesses here failed SELECT on every non-Gmail account.
+        for tag in [TAG_ARCHIVE, TAG_SENT, TAG_DRAFTS, TAG_TRASH] {
+            let local = f.iter().find(|f| f.tag == tag).expect("folder present");
+            assert!(!local.is_server_backed(), "{} must start local", tag);
         }
+    }
+
+    #[test]
+    fn resolve_folders_takes_special_use_over_guesses() {
+        // iCloud-shaped: \Archive (not Gmail's \All), sent as "Sent Messages".
+        let f = resolve_folders(vec![
+            ("INBOX".into(), None),
+            ("Archive".into(), Some("archive")),
+            ("Sent Messages".into(), Some("sent")),
+            ("Deleted Messages".into(), Some("trash")),
+            ("Notes".into(), None),
+        ]);
+        let archive = f.iter().find(|f| f.tag == TAG_ARCHIVE).unwrap();
+        assert_eq!(archive.mailbox, "Archive");
+        assert_eq!(archive.label, "Archive");
+        let sent = f.iter().find(|f| f.tag == TAG_SENT).unwrap();
+        assert_eq!(sent.mailbox, "Sent Messages");
+        assert_eq!(sent.label, "Sent");
+        assert!(f.iter().any(|f| f.tag == "Notes"));
+        assert!(!f.iter().any(|f| f.mailbox == "Deleted Messages"));
+
+        // Gmail-shaped: \All names the archive, and its label comes along.
+        let f = resolve_folders(vec![
+            ("INBOX".into(), None),
+            ("[Gmail]/All Mail".into(), Some("all")),
+            ("[Gmail]/Sent Mail".into(), Some("sent")),
+        ]);
+        let archive = f.iter().find(|f| f.tag == TAG_ARCHIVE).unwrap();
+        assert_eq!(archive.mailbox, "[Gmail]/All Mail");
+        assert_eq!(archive.label, "All Mail");
+
+        // \All wins over \Archive in either LIST order.
+        for entries in [
+            vec![("Everything".into(), Some("all")), ("Archive".into(), Some("archive"))],
+            vec![("Archive".into(), Some("archive")), ("Everything".into(), Some("all"))],
+        ] {
+            let f = resolve_folders(entries);
+            let archive = f.iter().find(|f| f.tag == TAG_ARCHIVE).unwrap();
+            assert_eq!(archive.mailbox, "Everything");
+        }
+    }
+
+    #[test]
+    fn resolve_folders_without_special_use_stays_local() {
+        // A server that flags nothing gets no guessed mailbox: its folders
+        // appear as themselves and archive/sent simply do not sync, rather
+        // than SELECTing a [Gmail] name that does not exist.
+        let f = resolve_folders(vec![("INBOX".into(), None), ("Sent".into(), None)]);
+        assert!(!f.iter().find(|f| f.tag == TAG_ARCHIVE).unwrap().is_server_backed());
+        assert!(!f.iter().find(|f| f.tag == TAG_SENT).unwrap().is_server_backed());
+        assert!(f.iter().any(|f| f.tag == "Sent" && f.mailbox == "Sent"));
     }
 
     #[test]
