@@ -1936,6 +1936,18 @@ fn resolve_folders(entries: Vec<(String, Option<&str>)>) -> Vec<FolderInfo> {
         }
     }
 
+    // A folder literally named "Archive" fills the slot when nothing was
+    // flagged: iCloud leaves a plain-CREATEd Archive without \Archive (the
+    // flag rides on CREATE (USE (\Archive)), which only Apple's own clients
+    // send), and without this the switcher shows the local archive beside the
+    // server's — two rows named Archive claiming one meaning.
+    if !folders.iter().any(|f| f.tag == TAG_ARCHIVE && f.is_server_backed()) {
+        if let Some(i) = custom.iter().position(|f| f.mailbox.eq_ignore_ascii_case("archive")) {
+            let named = custom.remove(i);
+            adopt(&mut folders, TAG_ARCHIVE, &named.mailbox, true);
+        }
+    }
+
     custom.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
     folders.extend(custom);
     folders
@@ -6420,6 +6432,25 @@ mod tests {
         assert!(!f.iter().find(|f| f.tag == TAG_ARCHIVE).unwrap().is_server_backed());
         assert!(!f.iter().find(|f| f.tag == TAG_SENT).unwrap().is_server_backed());
         assert!(f.iter().any(|f| f.tag == "Sent" && f.mailbox == "Sent"));
+    }
+
+    #[test]
+    fn resolve_folders_adopts_an_archive_by_name_when_nothing_is_flagged() {
+        // iCloud lists a plain-CREATEd "Archive" with no \Archive flag; the
+        // slot adopts it by name rather than showing two Archive rows.
+        let f = resolve_folders(vec![("INBOX".into(), None), ("Archive".into(), None)]);
+        let archive = f.iter().find(|f| f.tag == TAG_ARCHIVE).unwrap();
+        assert_eq!(archive.mailbox, "Archive");
+        assert_eq!(f.iter().filter(|f| f.label == "Archive").count(), 1);
+
+        // A flagged folder still wins over the name.
+        let f = resolve_folders(vec![
+            ("Archive".into(), None),
+            ("Everything".into(), Some("all")),
+        ]);
+        let archive = f.iter().find(|f| f.tag == TAG_ARCHIVE).unwrap();
+        assert_eq!(archive.mailbox, "Everything");
+        assert!(f.iter().any(|f| f.tag == "Archive"), "the named folder stays custom");
     }
 
     #[test]
