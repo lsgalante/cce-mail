@@ -10,10 +10,14 @@
 //! * **The network session is ephemeral** — no cookies or cache ever touch
 //!   disk.
 //! * **All remote loads are blocked by default** by a compiled WebKit content
-//!   filter (`data:` stays allowed for inline images). Tracking pixels never
-//!   fire. [`MailWebView::set_images_allowed`] lifts the filter for the
-//!   current message only — an explicit per-message choice, reset on the
-//!   next [`MailWebView::load_html`].
+//!   filter (`data:` and `cid:` stay allowed — a message's own bytes carry
+//!   no tracking). Tracking pixels never fire.
+//!   [`MailWebView::set_images_allowed`] lifts the filter for the current
+//!   message only — an explicit per-message choice, reset on the next
+//!   [`MailWebView::load_html`].
+//! * **`cid:` inline attachments render natively**: a registered URI scheme
+//!   handler serves them from the per-message store filled by
+//!   [`MailWebView::set_inline_parts`].
 //! * **Navigation never happens in-pane.** A link click is intercepted by
 //!   `decide-policy` and handed back through [`MailWebView::take_link_click`]
 //!   for the app to open externally; form submissions are dropped.
@@ -23,6 +27,7 @@
 //! first [`MailWebView::load_html`], so a text-only session pays nothing.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 use std::rc::Rc;
 
@@ -51,14 +56,22 @@ struct Pending {
     frame: Option<(Vec<u8>, u32, u32)>,
 }
 
-/// The WebKit content filter source: block every URL except `data:`, so a
-/// message renders from its own bytes alone. Compiled once (WebKit caches
-/// the compiled form in the store directory) and attached to the UCM
-/// whenever remote content is disallowed.
+/// The WebKit content filter source: block every URL except `data:` and
+/// `cid:`, so a message renders from its own bytes alone — inline
+/// attachments carry no tracking, which is why they pass while every
+/// remote load waits on the Load Images chip. Compiled once (WebKit caches
+/// the compiled form in the store directory, keyed by [`FILTER_ID`]) and
+/// attached to the UCM whenever remote content is disallowed.
 const BLOCK_REMOTE_FILTER: &str = r#"[
   {"trigger": {"url-filter": ".*"}, "action": {"type": "block"}},
-  {"trigger": {"url-filter": "^data:"}, "action": {"type": "ignore-previous-rules"}}
+  {"trigger": {"url-filter": "^data:"}, "action": {"type": "ignore-previous-rules"}},
+  {"trigger": {"url-filter": "^cid:"}, "action": {"type": "ignore-previous-rules"}}
 ]"#;
+
+/// Bumped whenever [`BLOCK_REMOTE_FILTER`] changes: the store caches the
+/// compiled filter under this name, and a new name is cheaper to reason
+/// about than trusting it to notice changed source.
+const FILTER_ID: &str = "block-remote-v2";
 
 pub struct MailWebView {
     display: *mut WPEDisplay,
@@ -80,6 +93,9 @@ pub struct MailWebView {
     /// The message currently loaded, kept so lifting the image block can
     /// re-render the same content.
     html: Option<CString>,
+    /// The current message's inline attachments, served by the `cid:`
+    /// scheme handler: content-id → (mime type, decoded bytes).
+    inline: Rc<RefCell<HashMap<String, (String, Vec<u8>)>>>,
     images_allowed: bool,
     /// Last uploaded frame in the image registry: (id, w px, h px).
     image: Option<(u32, u32, u32)>,
@@ -130,6 +146,21 @@ impl MailWebView {
 
             let filter = compile_block_filter();
 
+            // The `cid:` scheme, served straight out of the inline store —
+            // the same registration cce-browser uses for its `cce:` pages.
+            // Process-wide and registered once, like the frame sink.
+            let inline: Rc<RefCell<HashMap<String, (String, Vec<u8>)>>> =
+                Rc::new(RefCell::new(HashMap::new()));
+            let ctx = webkit_web_context_get_default();
+            let scheme = cstr("cid");
+            webkit_web_context_register_uri_scheme(
+                ctx,
+                scheme.as_ptr(),
+                Some(on_cid_request),
+                Rc::into_raw(inline.clone()) as gpointer,
+                None,
+            );
+
             Self {
                 display,
                 toplevel,
@@ -145,6 +176,7 @@ impl MailWebView {
                     .ok(),
                 links: Rc::new(RefCell::new(Vec::new())),
                 html: None,
+                inline,
                 images_allowed: false,
                 image: None,
                 last_frame: None,
@@ -175,11 +207,15 @@ impl MailWebView {
                 std::ptr::null::<c_char>(),
             ) as *mut WebKitWebView;
 
-            // The lockdown. JavaScript stays off for the life of the view;
-            // images follow `images_allowed`.
+            // The lockdown. JavaScript stays off for the life of the view.
+            // With a compiled filter the image setting stays ON — the filter
+            // is what gates remote loads, and it lets cid:/data: through so
+            // inline attachments always render. Only when the filter failed
+            // to compile does auto-load-images carry the block alone, at the
+            // cost of inline images too (privacy over completeness).
             let settings = webkit_web_view_get_settings(wv);
             webkit_settings_set_enable_javascript(settings, 0);
-            webkit_settings_set_auto_load_images(settings, self.images_allowed as gboolean);
+            webkit_settings_set_auto_load_images(settings, self.images_on() as gboolean);
             self.apply_filter_policy();
 
             // Link clicks leave through the app, never navigate in-pane.
@@ -247,10 +283,22 @@ impl MailWebView {
         self.reload_current();
     }
 
+    /// Install the message's inline attachments for the `cid:` handler,
+    /// replacing the previous message's. Call BEFORE `load_html`, or the
+    /// page's image requests race the store swap.
+    pub fn set_inline_parts(&mut self, parts: Vec<(String, String, Vec<u8>)>) {
+        let mut store = self.inline.borrow_mut();
+        store.clear();
+        for (cid, mime, bytes) in parts {
+            store.insert(cid, (mime, bytes));
+        }
+    }
+
     /// Drop the shown message (selection cleared / folder switched). The
     /// view and its processes stay for the next message.
     pub fn clear(&mut self) {
         self.html = None;
+        self.inline.borrow_mut().clear();
         self.links.borrow_mut().clear();
         self.pending.borrow_mut().frame = None;
         if let Some((id, ..)) = self.image.take() {
@@ -279,12 +327,19 @@ impl MailWebView {
         self.images_allowed
     }
 
+    /// Whether WebKit's own image loading is on — see `ensure_view` for why
+    /// this is not simply `images_allowed`.
+    fn images_on(&self) -> bool {
+        self.images_allowed || !self.filter.is_null()
+    }
+
     fn reload_current(&mut self) {
         let Some(html) = self.html.clone() else { return };
+        let images_on = self.images_on();
         let (wv, _) = self.ensure_view();
         unsafe {
             let settings = webkit_web_view_get_settings(wv);
-            webkit_settings_set_auto_load_images(settings, self.images_allowed as gboolean);
+            webkit_settings_set_auto_load_images(settings, images_on as gboolean);
             webkit_web_view_load_html(wv, html.as_ptr(), std::ptr::null());
         }
         // The old message's frame must not linger under the new one — the
@@ -565,7 +620,7 @@ unsafe fn compile_block_filter() -> *mut WebKitUserContentFilter {
 
     let cdir = cstr(&dir.to_string_lossy());
     let store = webkit_user_content_filter_store_new(cdir.as_ptr());
-    let id = cstr("block-remote");
+    let id = cstr(FILTER_ID);
     let bytes = g_bytes_new(
         BLOCK_REMOTE_FILTER.as_ptr() as *const c_void,
         BLOCK_REMOTE_FILTER.len() as u64,
@@ -603,6 +658,56 @@ unsafe fn compile_block_filter() -> *mut WebKitUserContentFilter {
 
 unsafe extern "C" fn drop_links_ref(data: gpointer, _c: *mut GClosure) {
     drop(Rc::from_raw(data as *const RefCell<Vec<String>>));
+}
+
+/// Minimal %XX decoding for the `cid:` URI path — Content-IDs are almost
+/// always plain, but `@` does arrive as `%40` from some composers.
+fn percent_decode_bytes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let (Some(h), Some(l)) = (
+                bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
+            ) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Serves the page's `cid:` image requests from the inline store. Runs on
+/// the main thread (the cce-browser `cce:` handler's contract). A cid the
+/// message structure did not carry answers with an error — a broken-image
+/// glyph, never a network fetch.
+unsafe extern "C" fn on_cid_request(request: *mut WebKitURISchemeRequest, data: gpointer) {
+    let store = &*(data as *const RefCell<HashMap<String, (String, Vec<u8>)>>);
+    let uri = from_cstr(webkit_uri_scheme_request_get_uri(request)).unwrap_or_default();
+    let cid = percent_decode_bytes(uri.strip_prefix("cid:").unwrap_or(""));
+    match store.borrow().get(&cid) {
+        Some((mime, bytes)) => {
+            // g_bytes_new copies; the stream owns that copy outright.
+            let gb = g_bytes_new(bytes.as_ptr() as *const c_void, bytes.len() as u64);
+            let stream = g_memory_input_stream_new_from_bytes(gb);
+            let ctype = cstr(mime);
+            webkit_uri_scheme_request_finish(request, stream, bytes.len() as i64, ctype.as_ptr());
+            g_bytes_unref(gb);
+            g_object_unref(stream as *mut _);
+        }
+        None => {
+            let msg = cstr(&format!("no inline part for cid:{cid}"));
+            let err = g_error_new_literal(1, 0, msg.as_ptr());
+            webkit_uri_scheme_request_finish_error(request, err);
+            g_error_free(err);
+        }
+    }
 }
 
 /// Every navigation decision. The initial `load_html` arrives as type OTHER

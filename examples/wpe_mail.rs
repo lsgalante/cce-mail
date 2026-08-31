@@ -39,4 +39,43 @@ fn main() {
     println!("center pixel: ({r},{g},{b})");
     assert!(r > 180 && g < 80 && b < 80, "expected the red body, got ({r},{g},{b})");
     println!("OK: {frames} frames, red body rendered, remote pixel blocked from loading");
+
+    // Phase 2: a cid: inline image, served by the registered scheme handler
+    // from the per-message store — full-bleed green, so the center pixel
+    // proves the request went store → stream → raster.
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><rect width="200" height="200" fill="#00c000"/></svg>"##;
+    view.set_inline_parts(vec![(
+        "logo@test".to_string(),
+        "image/svg+xml".to_string(),
+        svg.to_vec(),
+    )]);
+    view.load_html(
+        r#"<html><body style="margin:0"><img src="cid:logo@test" style="display:block;width:800px;height:600px"></body></html>"#,
+    );
+    let mut cid_frames = 0;
+    for i in 0..120 {
+        if view.pump() {
+            cid_frames += 1;
+            println!(
+                "t={:>5}ms cid frame#{cid_frames} px@center={:?}",
+                i * 50,
+                view.sample_pixel(400, 300)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Wait for the frame that actually shows the image, not the first
+        // paint before the subresource arrived. All three channels: white
+        // (the pre-image paint) also has a green channel over 150.
+        if cid_frames > 0 {
+            if let Some((r, g, b)) = view.sample_pixel(400, 300) {
+                if g > 150 && r < 80 && b < 80 {
+                    break;
+                }
+            }
+        }
+    }
+    let (r, g, b) = view.sample_pixel(400, 300).expect("no readback");
+    println!("cid image center pixel: ({r},{g},{b})");
+    assert!(g > 150 && r < 80 && b < 80, "expected the green cid image, got ({r},{g},{b})");
+    println!("OK: cid inline image rendered through the scheme handler");
 }

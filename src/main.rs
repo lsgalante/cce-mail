@@ -127,10 +127,20 @@ enum AppMessage {
     #[cfg(feature = "wpe")]
     Spin,
     /// The on-demand HTML part fetch for email `0` finished: `Some` carries
-    /// the decoded HTML, `None` means no HTML part (or the fetch failed) —
-    /// the pane stays on the text body.
+    /// the decoded HTML plus its inline images, `None` means no HTML part
+    /// (or the fetch failed) — the pane stays on the text body.
     #[cfg(feature = "wpe")]
-    HtmlFetched(usize, Option<String>),
+    HtmlFetched(usize, Option<HtmlMail>),
+}
+
+/// One message's renderable HTML: the decoded body plus the cid: inline
+/// attachments it references — (content-id, mime type, decoded bytes),
+/// served to the page by the webview's `cid:` scheme handler.
+#[cfg(feature = "wpe")]
+#[derive(Debug, Clone)]
+struct HtmlMail {
+    html: String,
+    inline: Vec<(String, String, Vec<u8>)>,
 }
 
 /// The single status slot at the bottom of the window. Info toasts count
@@ -259,7 +269,7 @@ struct ClearEmailApp {
     #[cfg(feature = "wpe")]
     html_pending: Option<usize>,
     #[cfg(feature = "wpe")]
-    html_cache: std::collections::HashMap<usize, String>,
+    html_cache: std::collections::HashMap<usize, HtmlMail>,
     /// The user asked for the text body of the current message.
     #[cfg(feature = "wpe")]
     show_text: bool,
@@ -689,6 +699,14 @@ const PART_FETCH_CAP: u32 = 65536;
 #[cfg(feature = "wpe")]
 const HTML_FETCH_CAP: u32 = 1_048_576;
 
+/// Caps on the cid: inline images fetched alongside the HTML: per part
+/// (pre-decode) and summed per message. A signature logo is kilobytes; a
+/// message inlining more than this renders what fits and the rest break.
+#[cfg(feature = "wpe")]
+const INLINE_PART_CAP: u32 = 2_097_152;
+#[cfg(feature = "wpe")]
+const INLINE_TOTAL_CAP: usize = 8 * 1024 * 1024;
+
 /// In-memory HTML bodies kept for re-opening without a refetch. Bodies can
 /// be large, so the cache is small and simply dumped when full.
 #[cfg(feature = "wpe")]
@@ -824,6 +842,67 @@ fn find_html_part(bs: &imap_proto::types::BodyStructure<'_>) -> Option<TextPartS
     let mut best = None;
     walk(bs, &mut Vec::new(), &mut best);
     best
+}
+
+/// A part carrying a Content-ID — a candidate for the HTML body's `cid:`
+/// references. Whether it is actually fetched depends on the HTML: only
+/// referenced parts are worth the round trip.
+#[cfg(feature = "wpe")]
+#[derive(Debug, Clone, PartialEq)]
+struct InlinePartSpec {
+    /// Content-ID with the RFC 2392 angle brackets stripped — the form a
+    /// `cid:` URI names it by.
+    cid: String,
+    section: Vec<u32>,
+    encoding: String,
+    mime: String,
+}
+
+/// DFS over a BODYSTRUCTURE for every part with a Content-ID, in the same
+/// section-numbering scheme as the other walks.
+#[cfg(feature = "wpe")]
+fn find_inline_parts(bs: &imap_proto::types::BodyStructure<'_>) -> Vec<InlinePartSpec> {
+    use imap_proto::types::BodyStructure as B;
+    fn push(
+        common: &imap_proto::types::BodyContentCommon<'_>,
+        other: &imap_proto::types::BodyContentSinglePart<'_>,
+        path: &[u32],
+        out: &mut Vec<InlinePartSpec>,
+    ) {
+        let Some(id) = &other.id else { return };
+        let cid = id.trim().trim_start_matches('<').trim_end_matches('>').to_string();
+        if cid.is_empty() {
+            return;
+        }
+        out.push(InlinePartSpec {
+            cid,
+            section: if path.is_empty() { vec![1] } else { path.to_vec() },
+            encoding: encoding_str(&other.transfer_encoding),
+            mime: format!(
+                "{}/{}",
+                common.ty.ty.to_ascii_lowercase(),
+                common.ty.subtype.to_ascii_lowercase()
+            ),
+        });
+    }
+    fn walk(bs: &B<'_>, path: &mut Vec<u32>, out: &mut Vec<InlinePartSpec>) {
+        match bs {
+            B::Basic { common, other, .. } | B::Text { common, other, .. } => {
+                push(common, other, path, out)
+            }
+            B::Multipart { bodies, .. } => {
+                for (i, b) in bodies.iter().enumerate() {
+                    path.push(i as u32 + 1);
+                    walk(b, path, out);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(bs, &mut Vec::new(), &mut out);
+    out
 }
 
 /// One attachment as the server describes it: everything needed to list it
@@ -2197,7 +2276,7 @@ fn fetch_html_part(
     std::thread::spawn(move || {
         // Falling back to text is silent in the UI by design, but the WHY
         // must not vanish with it — stderr, like every other failure here.
-        let report = |r: Option<String>, why: &str| {
+        let report = |r: Option<HtmlMail>, why: &str| {
             if r.is_none() {
                 eprintln!("cce-mail: html fetch uid {uid} in {mailbox:?}: {why}");
             }
@@ -2223,11 +2302,13 @@ fn fetch_html_part(
             let _ = session.logout();
             return;
         }
-        let spec = match session.uid_fetch(uid.to_string(), "(BODYSTRUCTURE)") {
+        // One structure fetch feeds both walks: the html part to render and
+        // the Content-ID parts its `cid:` references may name.
+        let parsed = match session.uid_fetch(uid.to_string(), "(BODYSTRUCTURE)") {
             Ok(fetches) => match fetches.iter().next() {
                 Some(f) => match f.bodystructure() {
                     Some(bs) => match find_html_part(bs) {
-                        Some(spec) => Ok(spec),
+                        Some(spec) => Ok((spec, find_inline_parts(bs))),
                         None => Err("no text/html part in the structure".to_string()),
                     },
                     None => Err("fetch reply carried no BODYSTRUCTURE".to_string()),
@@ -2236,8 +2317,8 @@ fn fetch_html_part(
             },
             Err(e) => Err(format!("BODYSTRUCTURE fetch failed: {e}")),
         };
-        let spec = match spec {
-            Ok(spec) => spec,
+        let (spec, inline_specs) = match parsed {
+            Ok(parts) => parts,
             Err(why) => {
                 report(None, &why);
                 let _ = session.logout();
@@ -2260,7 +2341,45 @@ fn fetch_html_part(
             Err(e) => Err(format!("part fetch failed: {e}")),
         };
         match html {
-            Ok(html) => report(Some(html), ""),
+            Ok(html) => {
+                // Only the inline parts the HTML actually names are worth a
+                // round trip; the rest are ordinary attachments to the chips.
+                let mut inline = Vec::new();
+                let mut total = 0usize;
+                for p in inline_specs {
+                    if !html.contains(&p.cid) {
+                        continue;
+                    }
+                    if total >= INLINE_TOTAL_CAP {
+                        eprintln!(
+                            "cce-mail: html fetch uid {uid}: inline images over {INLINE_TOTAL_CAP} bytes; the rest will show broken"
+                        );
+                        break;
+                    }
+                    let query = format!(
+                        "(UID BODY.PEEK[{}]<0.{}>)",
+                        section_str(&p.section),
+                        INLINE_PART_CAP
+                    );
+                    let section_path =
+                        imap_proto::types::SectionPath::Part(p.section.clone(), None);
+                    match session.uid_fetch(uid.to_string(), &query) {
+                        Ok(fetches) => {
+                            if let Some(bytes) =
+                                fetches.iter().next().and_then(|f| f.section(&section_path))
+                            {
+                                let decoded = decode_part_bytes(&p.encoding, bytes);
+                                total += decoded.len();
+                                inline.push((p.cid, p.mime, decoded));
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("cce-mail: html fetch uid {uid}: inline part {} failed: {e}", p.cid)
+                        }
+                    }
+                }
+                report(Some(HtmlMail { html, inline }), "");
+            }
             Err(why) => report(None, &why),
         }
         let _ = session.logout();
@@ -3038,9 +3157,9 @@ impl ClearEmailApp {
         if self.html_loaded.take().is_some() {
             self.webview.clear();
         }
-        if let Some(html) = self.html_cache.get(&id) {
-            let html = html.clone();
-            self.webview.load_html(&html);
+        if let Some(mail) = self.html_cache.get(&id) {
+            let mail = mail.clone();
+            self.show_html_mail(&mail);
             self.html_loaded = Some(id);
             return;
         }
@@ -3056,12 +3175,22 @@ impl ClearEmailApp {
             if let Some(email) = self.emails.iter().find(|e| e.id == id) {
                 let html = format!(
                     "<!doctype html><html><body style=\"font-family:sans-serif;margin:16px\">\
+                     <img src=\"cid:demo-logo@cce-mail\" width=\"48\" height=\"48\" style=\"float:right\">\
                      <h2 style=\"color:#204060\">{}</h2><p>{}</p>\
                      <p><a href=\"https://example.com/\">an external link</a></p></body></html>",
                     email.subject,
                     email.body.replace('\n', "<br>")
                 );
-                self.webview.load_html(&html);
+                let logo = br##"<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"><circle cx="24" cy="24" r="22" fill="#00a040"/></svg>"##;
+                let mail = HtmlMail {
+                    html,
+                    inline: vec![(
+                        "demo-logo@cce-mail".to_string(),
+                        "image/svg+xml".to_string(),
+                        logo.to_vec(),
+                    )],
+                };
+                self.show_html_mail(&mail);
                 self.html_loaded = Some(id);
                 return;
             }
@@ -3087,6 +3216,15 @@ impl ClearEmailApp {
     }
     #[cfg(not(feature = "wpe"))]
     fn request_html(&mut self, _id: usize) {}
+
+    /// Hand a message to the webview: inline images first (the `cid:`
+    /// handler must be able to answer the page's very first request), then
+    /// the HTML.
+    #[cfg(feature = "wpe")]
+    fn show_html_mail(&mut self, mail: &HtmlMail) {
+        self.webview.set_inline_parts(mail.inline.clone());
+        self.webview.load_html(&mail.html);
+    }
 
     /// Drop the HTML view state (selection cleared, folder or account
     /// switched, message deleted). The webview and its processes stay.
@@ -4122,13 +4260,13 @@ impl Application for ClearEmailApp {
                 if self.html_pending == Some(id) {
                     self.html_pending = None;
                 }
-                if let Some(html) = html {
+                if let Some(mail) = html {
                     if self.html_cache.len() >= HTML_CACHE_CAP {
                         self.html_cache.clear();
                     }
-                    self.html_cache.insert(id, html.clone());
+                    self.html_cache.insert(id, mail.clone());
                     if self.selected_email_id == Some(id) {
-                        self.webview.load_html(&html);
+                        self.show_html_mail(&mail);
                         self.html_loaded = Some(id);
                         *needs_rebuild = true;
                         self.needs_rebuild = true;
@@ -5909,6 +6047,63 @@ mod tests {
         assert_eq!(spec.subtype, "html");
         assert_eq!(spec.encoding, "base64");
         assert_eq!(spec.charset.as_deref(), Some("ISO-8859-1"));
+    }
+
+    #[cfg(feature = "wpe")]
+    fn cid_part<'a>(ty: &'a str, subtype: &'a str, cid: &'a str) -> BodyStructure<'a> {
+        BodyStructure::Basic {
+            common: BodyContentCommon {
+                ty: ContentType { ty, subtype, params: None },
+                disposition: None,
+                language: None,
+                location: None,
+            },
+            other: BodyContentSinglePart {
+                id: Some(cid.into()),
+                md5: None,
+                description: None,
+                transfer_encoding: ContentEncoding::Base64,
+                octets: 0,
+            },
+            extension: None,
+        }
+    }
+
+    #[cfg(feature = "wpe")]
+    #[test]
+    fn inline_part_walk_finds_content_ids() {
+        // multipart/related( text/HTML, image/PNG cid ) inside mixed with a
+        // plain attachment — the classic inline-logo shape.
+        let bs = multipart(
+            "MIXED",
+            vec![
+                multipart(
+                    "RELATED",
+                    vec![
+                        text_part("HTML", ContentEncoding::QuotedPrintable, None),
+                        cid_part("IMAGE", "PNG", "<logo@corp>"),
+                    ],
+                ),
+                basic_part("APPLICATION", "PDF"),
+            ],
+        );
+        let parts = find_inline_parts(&bs);
+        assert_eq!(
+            parts,
+            vec![InlinePartSpec {
+                cid: "logo@corp".to_string(), // brackets stripped
+                section: vec![1, 2],
+                encoding: "base64".to_string(),
+                mime: "image/png".to_string(),
+            }]
+        );
+        // A structure with no Content-IDs yields nothing — basic_part and
+        // text_part both carry id: None.
+        assert!(find_inline_parts(&multipart(
+            "MIXED",
+            vec![text_part("PLAIN", ContentEncoding::SevenBit, None)]
+        ))
+        .is_empty());
     }
 
     #[cfg(feature = "wpe")]
