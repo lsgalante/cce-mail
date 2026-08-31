@@ -2,6 +2,17 @@
 name = "cce-mail"
 version = "0.1.0"
 edition = "2021"
+# Only runs bindgen when the `wpe` feature is on, so a featureless build
+# needs no WPE headers.
+build = "build.rs"
+
+[features]
+# HTML mail rendering via embedded WPE WebKit (the same engine and embedding
+# pattern as cce-browser's default build — see src/wpe/). Default, so a
+# routine sweep rebuild ships the HTML view instead of silently reverting to
+# text-only. Needs `pacman -S wpewebkit`.
+default = ["wpe"]
+wpe = ["dep:rustix"]
 
 [dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }
@@ -20,4 +31,16 @@ native-tls = "0.2"
 reqwest = { version = "0.12", features = ["json"] }
 mail-parser = "0.11.5"
 imap-proto = "0.10"
+# Only used by the `wpe` backend, to hold GLib's changing pollfd set in one
+# epoll fd that calloop can watch (same bridge as cce-browser's).
+rustix = { version = "0.38", features = ["event"], optional = true }
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"
+
+# Headless smoke test for the embedded webview (no Wayland session needed).
+[[example]]
+name = "wpe_mail"
+required-features = ["wpe"]
 

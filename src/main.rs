@@ -1,4 +1,7 @@
 mod scroll_region;
+/// Embedded WPE WebKit for the HTML mail view — see src/wpe/mod.rs.
+#[cfg(feature = "wpe")]
+mod wpe;
 use scroll_region::ScrollRegion;
 use wayland_client::QueueHandle;
 use cce_ui::cosmic_text::FontSystem;
@@ -120,6 +123,14 @@ enum AppMessage {
     StatusError(String),
     EmailsSynced(String, Vec<FolderSync>),
     UpdateAccountTokens(String, Option<String>, Option<u64>),
+    /// GLib has work (or produced a frame): pump the embedded webview.
+    #[cfg(feature = "wpe")]
+    Spin,
+    /// The on-demand HTML part fetch for email `0` finished: `Some` carries
+    /// the decoded HTML, `None` means no HTML part (or the fetch failed) —
+    /// the pane stays on the text body.
+    #[cfg(feature = "wpe")]
+    HtmlFetched(usize, Option<String>),
 }
 
 /// The single status slot at the bottom of the window. Info toasts count
@@ -143,6 +154,16 @@ impl StatusToast {
             StatusToast::Info { text, .. } | StatusToast::Error { text } => text,
         }
     }
+}
+
+/// The two painted chips of the HTML view (detail header band, right side).
+#[cfg(feature = "wpe")]
+#[derive(Clone, Copy)]
+enum HtmlChip {
+    /// Switch between the rendered HTML and the text body.
+    ToggleView,
+    /// Lift/restore the remote-content block for this message.
+    ToggleImages,
 }
 
 /// App shortcuts, resolved once at startup from input.kdl
@@ -224,6 +245,30 @@ struct ClearEmailApp {
     detail_hovered: bool,
     body_sb_dragging: bool,
     body_sb_drag_offset: f32,
+
+    // HTML mail view (feature `wpe`). The host boots at startup (cheap: no
+    // WebKit processes until the first message renders); the fetched HTML is
+    // keyed by email id and pulled on demand, since the synced `body` is
+    // only a 1200-char text preview.
+    #[cfg(feature = "wpe")]
+    webview: wpe::MailWebView,
+    /// Email id whose HTML the webview currently shows.
+    #[cfg(feature = "wpe")]
+    html_loaded: Option<usize>,
+    /// Email id with an HTML fetch in flight.
+    #[cfg(feature = "wpe")]
+    html_pending: Option<usize>,
+    #[cfg(feature = "wpe")]
+    html_cache: std::collections::HashMap<usize, String>,
+    /// The user asked for the text body of the current message.
+    #[cfg(feature = "wpe")]
+    show_text: bool,
+    /// Where the page was last drawn (logical px), for routing input to it.
+    #[cfg(feature = "wpe")]
+    webview_rect: (f32, f32, f32, f32),
+    /// A press went to the page; the matching release must follow it there.
+    #[cfg(feature = "wpe")]
+    webview_mouse_down: bool,
     /// Width of the email-list band (the rows), user-draggable via the
     /// list/detail separator. The stored preference survives narrow windows
     /// un-clobbered — [`Self::split_geom`] clamps at use, not here.
@@ -638,6 +683,17 @@ const BACKFILL_DELAY_SECS: u64 = 3;
 /// 1200 chars, so 64 KiB of qp/base64 is plenty.
 const PART_FETCH_CAP: u32 = 65536;
 
+/// Byte cap on an on-demand HTML part fetch (pre-decode). Marketing mail
+/// runs tens of KB; 1 MiB covers pathological newsletters without letting
+/// one message stall the connection.
+#[cfg(feature = "wpe")]
+const HTML_FETCH_CAP: u32 = 1_048_576;
+
+/// In-memory HTML bodies kept for re-opening without a refetch. Bodies can
+/// be large, so the cache is small and simply dumped when full.
+#[cfg(feature = "wpe")]
+const HTML_CACHE_CAP: usize = 16;
+
 /// The text part chosen from a BODYSTRUCTURE walk: its IMAP section path plus
 /// the metadata needed to rebuild a decodable single-part MIME message.
 struct TextPartSpec {
@@ -728,6 +784,46 @@ fn find_text_part(bs: &imap_proto::types::BodyStructure<'_>) -> Option<TextPartS
     let mut best = None;
     walk(bs, &mut Vec::new(), &mut best);
     best.map(|(_, spec)| spec)
+}
+
+/// DFS over a BODYSTRUCTURE for the first text/html part, for the HTML
+/// view. Separate from [`find_text_part`] because the two walks want
+/// opposite parts of a multipart/alternative: the sync wants the cheap
+/// plain preview, the HTML view wants the real thing.
+#[cfg(feature = "wpe")]
+fn find_html_part(bs: &imap_proto::types::BodyStructure<'_>) -> Option<TextPartSpec> {
+    use imap_proto::types::BodyStructure as B;
+    fn walk(bs: &B<'_>, path: &mut Vec<u32>, best: &mut Option<TextPartSpec>) {
+        if best.is_some() {
+            return;
+        }
+        match bs {
+            B::Text { common, other, .. } if common.ty.subtype.eq_ignore_ascii_case("html") => {
+                let charset = common.ty.params.as_ref().and_then(|ps| {
+                    ps.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("charset"))
+                        .map(|(_, v)| v.to_string())
+                });
+                *best = Some(TextPartSpec {
+                    path: if path.is_empty() { vec![1] } else { path.clone() },
+                    subtype: "html".to_string(),
+                    charset,
+                    encoding: encoding_str(&other.transfer_encoding),
+                });
+            }
+            B::Multipart { bodies, .. } => {
+                for (i, b) in bodies.iter().enumerate() {
+                    path.push(i as u32 + 1);
+                    walk(b, path, best);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut best = None;
+    walk(bs, &mut Vec::new(), &mut best);
+    best
 }
 
 /// One attachment as the server describes it: everything needed to list it
@@ -2069,6 +2165,68 @@ fn fetch_attachment(
     });
 }
 
+/// Fetch a message's full text/html part by UID for the HTML view — the
+/// sync caches only a 1200-char text preview. Same thread shape as
+/// [`fetch_attachment`]; the outcome comes back as
+/// [`AppMessage::HtmlFetched`]. The BODYSTRUCTURE is fetched here rather
+/// than reusing anything from sync time, so it works for mail cached
+/// before this feature existed and can never go stale.
+#[cfg(feature = "wpe")]
+fn fetch_html_part(
+    mut account: AccountInfo,
+    mailbox: String,
+    uid: u32,
+    email_id: usize,
+    sender: calloop::channel::Sender<AppMessage>,
+) {
+    std::thread::spawn(move || {
+        let report = |r: Option<String>| {
+            let _ = sender.send(AppMessage::HtmlFetched(email_id, r));
+        };
+        if is_mock_account(&account) {
+            report(None);
+            return;
+        }
+        let Some(mut session) = open_imap_session(&mut account, &sender, false) else {
+            report(None);
+            return;
+        };
+        if session.select(&mailbox).is_err() {
+            report(None);
+            let _ = session.logout();
+            return;
+        }
+        let spec = match session.uid_fetch(uid.to_string(), "(BODYSTRUCTURE)") {
+            Ok(fetches) => fetches
+                .iter()
+                .next()
+                .and_then(|f| f.bodystructure().and_then(find_html_part)),
+            Err(_) => None,
+        };
+        let Some(spec) = spec else {
+            report(None);
+            let _ = session.logout();
+            return;
+        };
+        let query = format!("(UID BODY.PEEK[{}]<0.{}>)", section_str(&spec.path), HTML_FETCH_CAP);
+        let section_path = imap_proto::types::SectionPath::Part(spec.path.clone(), None);
+        let html = match session.uid_fetch(uid.to_string(), &query) {
+            Ok(fetches) => fetches
+                .iter()
+                .next()
+                .and_then(|f| f.section(&section_path))
+                .and_then(|bytes| {
+                    mail_parser::MessageParser::default()
+                        .parse(&spec.synthesize(bytes))
+                        .and_then(|m| m.body_html(0).map(|c| c.into_owned()))
+                }),
+            Err(_) => None,
+        };
+        report(html);
+        let _ = session.logout();
+    });
+}
+
 /// Push a message's read state to the server (INBOX, by UID). UI-silent
 /// (stderr still logs failures): this fires on every message open, so no
 /// Connecting/success toasts, and a failed push is self-healing — the
@@ -2753,6 +2911,145 @@ impl ClearEmailApp {
         msg
     }
 
+    /// Whether the detail pane is showing (or about to show) the rendered
+    /// HTML view of the selected message.
+    #[cfg(feature = "wpe")]
+    fn html_active(&self) -> bool {
+        !self.show_text
+            && self.selected_email_id.is_some()
+            && self.html_loaded == self.selected_email_id
+            && !self.compose_open
+    }
+
+    /// HTML view with an actual frame on screen — the gate for routing
+    /// input to the page (before the first frame the text body is still
+    /// what the user sees and scrolls).
+    #[cfg(feature = "wpe")]
+    fn html_on_show(&self) -> bool {
+        self.html_active() && self.webview.image().is_some()
+    }
+
+    #[cfg(feature = "wpe")]
+    fn in_webview(&self, px: f32, py: f32) -> bool {
+        let (x, y, w, h) = self.webview_rect;
+        w > 0.0 && px >= x && px <= x + w && py >= y && py <= y + h
+    }
+
+    /// Window-logical position → device pixels relative to the page origin
+    /// (the webview's input convention).
+    #[cfg(feature = "wpe")]
+    fn webview_px(&self, px: f32, py: f32) -> (f32, f32) {
+        let (x, y, ..) = self.webview_rect;
+        let s = self.scale_factor as f32;
+        ((px - x) * s, (py - y) * s)
+    }
+
+    /// The HTML-view chips in the detail header band, right-aligned so they
+    /// never collide with the attachment chips growing from the left. Paint
+    /// and hit-test both call this — the detail_chip_rects convention.
+    #[cfg(feature = "wpe")]
+    fn html_chip_specs(&self) -> Vec<(String, HtmlChip, (f32, f32, f32, f32))> {
+        let Some(id) = self.selected_email_id else { return Vec::new() };
+        if self.compose_open || self.html_loaded != Some(id) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let y = DETAIL_CHIPS_Y + MENUBAR_H;
+        let mut right = self.width as f32 - cce_ui::layout::scrollbar_width() - 10.0;
+        let mut add = |label: String, chip: HtmlChip| {
+            let w = label.chars().count() as f32 * 6.0 + 16.0;
+            right -= w;
+            out.push((label, chip, (right, y, w, 22.0)));
+            right -= 8.0;
+        };
+        // Built right-to-left: the view toggle holds the corner.
+        add(
+            if self.show_text { "View: Text".to_string() } else { "View: HTML".to_string() },
+            HtmlChip::ToggleView,
+        );
+        if !self.show_text {
+            add(
+                if self.webview.images_allowed() {
+                    "Images: On".to_string()
+                } else {
+                    "Load Images".to_string()
+                },
+                HtmlChip::ToggleImages,
+            );
+        }
+        out
+    }
+
+    /// Show `id`'s HTML: from the cache immediately, else a background
+    /// fetch. Called on every non-draft selection.
+    #[cfg(feature = "wpe")]
+    fn request_html(&mut self, id: usize) {
+        self.show_text = false;
+        if self.html_loaded == Some(id) {
+            return;
+        }
+        if self.html_loaded.take().is_some() {
+            self.webview.clear();
+        }
+        if let Some(html) = self.html_cache.get(&id) {
+            let html = html.clone();
+            self.webview.load_html(&html);
+            self.html_loaded = Some(id);
+            return;
+        }
+        if self.html_pending == Some(id) {
+            return;
+        }
+        // Debug affordance (CCE_* env-var convention): the mock account has
+        // no server to fetch HTML from, so this renders any message's plain
+        // body through the HTML view — how a shadow session verifies the
+        // in-app pipeline without credentials (examples/wpe_mail.rs covers
+        // the engine alone). Trusted local data; escaping is not the point.
+        if std::env::var_os("CCE_MAIL_HTML_DEMO").is_some() {
+            if let Some(email) = self.emails.iter().find(|e| e.id == id) {
+                let html = format!(
+                    "<!doctype html><html><body style=\"font-family:sans-serif;margin:16px\">\
+                     <h2 style=\"color:#204060\">{}</h2><p>{}</p>\
+                     <p><a href=\"https://example.com/\">an external link</a></p></body></html>",
+                    email.subject,
+                    email.body.replace('\n', "<br>")
+                );
+                self.webview.load_html(&html);
+                self.html_loaded = Some(id);
+                return;
+            }
+        }
+        let Some((folder, Some(uid))) = self
+            .emails
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| (e.folder.clone(), e.uid))
+        else {
+            return;
+        };
+        // Same mailbox rule as OpenAttachment: a uid only means anything
+        // inside the mailbox the sync pulled it from.
+        let Some(mailbox) = self.mailbox_for(&folder) else { return };
+        let Some(acc) = self.accounts.get(self.selected_account_idx) else { return };
+        self.html_pending = Some(id);
+        fetch_html_part(acc.clone(), mailbox, uid, id, self.sender.clone());
+    }
+    #[cfg(not(feature = "wpe"))]
+    fn request_html(&mut self, _id: usize) {}
+
+    /// Drop the HTML view state (selection cleared, folder or account
+    /// switched, message deleted). The webview and its processes stay.
+    #[cfg(feature = "wpe")]
+    fn reset_html(&mut self) {
+        if self.html_loaded.take().is_some() {
+            self.webview.clear();
+        }
+        self.html_pending = None;
+        self.show_text = false;
+    }
+    #[cfg(not(feature = "wpe"))]
+    fn reset_html(&mut self) {}
+
     /// The detail-pane body box: (top y, height). Paint, layout, the
     /// scrollbar and the scroll clamps all derive from this one pair.
     fn detail_body_geom(&self) -> (f32, f32) {
@@ -2932,6 +3229,19 @@ impl ClearEmailApp {
                 {
                     labels.push(TextLabel {
                         text: detail_chip_label(att),
+                        x: cx + 8.0,
+                        y: cy + 5.0,
+                        font_size: 10.0,
+                        color: [0xc8, 0xc8, 0xd2],
+                    });
+                }
+
+                // HTML-view chip labels (quads paint in display_list; both
+                // sides lay out via html_chip_specs).
+                #[cfg(feature = "wpe")]
+                for (text, _, (cx, cy, _, _)) in self.html_chip_specs() {
+                    labels.push(TextLabel {
+                        text,
                         x: cx + 8.0,
                         y: cy + 5.0,
                         font_size: 10.0,
@@ -3169,6 +3479,20 @@ impl Application for ClearEmailApp {
             detail_hovered: false,
             body_sb_dragging: false,
             body_sb_drag_offset: 0.0,
+            #[cfg(feature = "wpe")]
+            webview: wpe::MailWebView::new((800, 600)),
+            #[cfg(feature = "wpe")]
+            html_loaded: None,
+            #[cfg(feature = "wpe")]
+            html_pending: None,
+            #[cfg(feature = "wpe")]
+            html_cache: std::collections::HashMap::new(),
+            #[cfg(feature = "wpe")]
+            show_text: false,
+            #[cfg(feature = "wpe")]
+            webview_rect: (0.0, 0.0, 0.0, 0.0),
+            #[cfg(feature = "wpe")]
+            webview_mouse_down: false,
             list_w: load_list_w().unwrap_or(LIST_W_DEFAULT),
             split_dragging: false,
             context_menu_actions: Vec::new(),
@@ -3193,6 +3517,47 @@ impl Application for ClearEmailApp {
         app
     }
 
+    /// Wake on GLib activity rather than polling for it — cce-browser's
+    /// bridge: the epoll fd carrying WPE's pollfd set, plus a timer for the
+    /// timeout GLib asks for. Both fire `Spin`, which pumps the webview.
+    /// With no page loaded GLib schedules nothing, so the timer settles at
+    /// its 1s ceiling and the app stays effectively idle.
+    #[cfg(feature = "wpe")]
+    fn register_sources(&mut self, handle: &calloop::LoopHandle<'_, EngineState<Self>>) {
+        use calloop::{generic::Generic, Interest, Mode, PostAction};
+
+        if let Some(fd) = self.webview.poll_fd_owned() {
+            let tx = self.sender.clone();
+            // Level-triggered: `pump` drains the epoll, so an un-consumed
+            // socket re-arms rather than being missed.
+            let source = Generic::new(fd, Interest::READ, Mode::Level);
+            if let Err(e) = handle.insert_source(source, move |_, _, _| {
+                let _ = tx.send(AppMessage::Spin);
+                Ok(PostAction::Continue)
+            }) {
+                eprintln!("cce-mail: could not watch the GLib fd ({e}); falling back to the timer alone");
+            }
+        }
+
+        let tx = self.sender.clone();
+        let timer = calloop::timer::Timer::from_duration(std::time::Duration::from_millis(100));
+        if let Err(e) = handle.insert_source(timer, move |_, _, state| {
+            let _ = tx.send(AppMessage::Spin);
+            let next = state
+                .inner
+                .as_ref()
+                .and_then(|app| app.webview.poll_timeout())
+                .unwrap_or(std::time::Duration::from_millis(1000))
+                .clamp(
+                    std::time::Duration::from_millis(8),
+                    std::time::Duration::from_millis(1000),
+                );
+            calloop::timer::TimeoutAction::ToDuration(next)
+        }) {
+            eprintln!("cce-mail: could not arm the GLib timer ({e})");
+        }
+    }
+
     fn settings(&self) -> WindowSettings {
         WindowSettings {
             title: "Mail".to_string(),
@@ -3215,6 +3580,7 @@ impl Application for ClearEmailApp {
                 self.selected_email_id = None;
                 self.email_list.set_scroll_y(0.0);
                 self.body_scroll = 0.0;
+                self.reset_html();
                 self.start_sync(first_visit);
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
@@ -3247,6 +3613,7 @@ impl Application for ClearEmailApp {
                 }
                 self.selected_email_id = Some(id);
                 self.body_scroll = 0.0;
+                self.request_html(id);
                 let mut push_seen_uid = None;
                 if let Some(email) = self.emails.iter_mut().find(|e| e.id == id) {
                     if !email.read {
@@ -3269,6 +3636,7 @@ impl Application for ClearEmailApp {
                 self.selected_email_id = None;
                 self.email_list.set_scroll_y(0.0);
                 self.body_scroll = 0.0;
+                self.reset_html();
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -3524,6 +3892,13 @@ impl Application for ClearEmailApp {
                         None => None,
                     };
                     self.body_scroll = 0.0;
+                    // The webview still shows the deleted message; swap to
+                    // the new selection's HTML (request_html marks nothing
+                    // read — that stays SelectEmail's job).
+                    self.reset_html();
+                    if let Some(next_id) = self.selected_email_id {
+                        self.request_html(next_id);
+                    }
                     if let Some(next_id) = self.selected_email_id {
                         if let Some(i) = rows.iter().position(|id| *id == next_id) {
                             self.scroll_row_into_view(i);
@@ -3570,6 +3945,9 @@ impl Application for ClearEmailApp {
                 self.selected_email_id = None;
                 self.email_list.set_scroll_y(0.0);
                 self.body_scroll = 0.0;
+                self.reset_html();
+                #[cfg(feature = "wpe")]
+                self.html_cache.clear();
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
@@ -3628,6 +4006,11 @@ impl Application for ClearEmailApp {
                     let prior = std::mem::take(&mut self.emails);
                     self.emails = merge_sync(prior, &folders);
                     save_emails_for_account(&email, &self.emails);
+                    // The merge can re-key ids, so id-keyed HTML is no
+                    // longer trustworthy. The loaded view stays (the user
+                    // is reading it); a re-open refetches.
+                    #[cfg(feature = "wpe")]
+                    self.html_cache.clear();
                 } else if active.is_some() {
                     // A background account: fold into its cache on disk only.
                     let prior = load_emails_for_account(&email);
@@ -3658,6 +4041,47 @@ impl Application for ClearEmailApp {
                     acc.access_token = access_token;
                     acc.token_expiry = expiry;
                     save_accounts(&self.accounts);
+                }
+            }
+            #[cfg(feature = "wpe")]
+            AppMessage::Spin => {
+                if self.webview.pump() {
+                    *needs_rebuild = true;
+                    self.needs_rebuild = true;
+                }
+                // Link clicks never navigate the pane; they leave through
+                // the XDG default browser.
+                while let Some(uri) = self.webview.take_link_click() {
+                    if uri.starts_with("http://")
+                        || uri.starts_with("https://")
+                        || uri.starts_with("mailto:")
+                    {
+                        let mut cmd = std::process::Command::new("xdg-open");
+                        cmd.arg(&uri);
+                        let _ = cce_ui::process::spawn_detached(cmd);
+                        self.status_message =
+                            Some(StatusToast::info(format!("Opening {}", ellipsize(&uri, 60)), 4.0));
+                        *needs_rebuild = true;
+                        self.needs_rebuild = true;
+                    }
+                }
+            }
+            #[cfg(feature = "wpe")]
+            AppMessage::HtmlFetched(id, html) => {
+                if self.html_pending == Some(id) {
+                    self.html_pending = None;
+                }
+                if let Some(html) = html {
+                    if self.html_cache.len() >= HTML_CACHE_CAP {
+                        self.html_cache.clear();
+                    }
+                    self.html_cache.insert(id, html.clone());
+                    if self.selected_email_id == Some(id) {
+                        self.webview.load_html(&html);
+                        self.html_loaded = Some(id);
+                        *needs_rebuild = true;
+                        self.needs_rebuild = true;
+                    }
                 }
             }
         }
@@ -3983,8 +4407,57 @@ impl Application for ClearEmailApp {
                             quads.push((cx + cw - 1.0, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
                         }
 
+                        // HTML-view chips, right-aligned in the same band
+                        // (labels ride in the labels pass; same rect fn).
+                        #[cfg(feature = "wpe")]
+                        for (_, _, (cx, cy, cw, ch)) in self.html_chip_specs() {
+                            quads.push((cx, cy, cw, ch, [0.14, 0.14, 0.20, 1.0]));
+                            quads.push((cx, cy, cw, 1.0, [0.25, 0.35, 0.50, 0.40]));
+                            quads.push((cx, cy + ch - 1.0, cw, 1.0, [0.25, 0.35, 0.50, 0.40]));
+                            quads.push((cx, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
+                            quads.push((cx + cw - 1.0, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
+                        }
+
                         let body_w = (w_f32 - (detail_x + 15.0)).max(100.0);
                         let line_h = 12.0 * 1.4; // get_text_buffer_laid_out's placed-text metric
+
+                        // The rendered HTML view: one image quad where the
+                        // text body would go. WebKit owns scrolling inside
+                        // the page, so the app's body scroll state is
+                        // disarmed while this is up.
+                        #[cfg(feature = "wpe")]
+                        let html_img = if self.html_active() {
+                            let s = self.scale_factor as f32;
+                            self.webview.resize(
+                                (body_w * s) as u32,
+                                (body_h * s) as u32,
+                                s,
+                            );
+                            self.webview_rect = (detail_x, body_y, body_w, body_h);
+                            self.webview.image()
+                        } else {
+                            None
+                        };
+                        #[cfg(not(feature = "wpe"))]
+                        let html_img: Option<(u32, u32, u32)> = None;
+
+                        if let Some((img_id, ..)) = html_img {
+                            self.body_content_h = 0.0;
+                            self.body_scroll = 0.0;
+                            // White ground: frames lag a resize by a beat,
+                            // and mail HTML assumes a white canvas.
+                            quads.push((detail_x, body_y, body_w, body_h, [1.0, 1.0, 1.0, 1.0]));
+                            quads.pc.image(
+                                img_id,
+                                cce_ui::scene::layout::Rect {
+                                    x: detail_x,
+                                    y: body_y,
+                                    width: body_w,
+                                    height: body_h,
+                                },
+                                1.0,
+                            );
+                        } else {
 
                         // Measure with the exact shaping the renderer will use, so the
                         // scroll clamp and the thumb track the real wrapped height.
@@ -4028,6 +4501,7 @@ impl Application for ClearEmailApp {
                                 align_v: cce_ui::scene::paint::AlignV::Top,
                             },
                         );
+                        }
                     }
                 }
             }
@@ -4225,7 +4699,15 @@ impl Application for ClearEmailApp {
                 }
             }
 
-            // Detail pane: no hover routing — no widgets there any more.
+            // Detail pane: no widget hover routing — but the rendered HTML
+            // page tracks the pointer (hover states, drag selection). While
+            // a press is held the page keeps the pointer even outside the
+            // rect, so selections drag naturally.
+            #[cfg(feature = "wpe")]
+            if self.html_on_show() && (self.webview_mouse_down || self.in_webview(px, py)) {
+                let (wx, wy) = self.webview_px(px, py);
+                self.webview.mouse_move(wx, wy);
+            }
         }
 
         if changed {
@@ -4325,6 +4807,20 @@ impl Application for ClearEmailApp {
                                 msg_out = Some(AppMessage::OpenAttachment(email.id, i));
                                 changed = true;
                             }
+                        }
+                    }
+                    // HTML-view chips: same convention, right side of the band.
+                    #[cfg(feature = "wpe")]
+                    for (_, chip, (cx, cy, cw, ch)) in self.html_chip_specs() {
+                        if px >= cx && px <= cx + cw && py >= cy && py <= cy + ch {
+                            match chip {
+                                HtmlChip::ToggleView => self.show_text = !self.show_text,
+                                HtmlChip::ToggleImages => {
+                                    let lift = !self.webview.images_allowed();
+                                    self.webview.set_images_allowed(lift);
+                                }
+                            }
+                            changed = true;
                         }
                     }
                 }
@@ -4571,10 +5067,37 @@ impl Application for ClearEmailApp {
                 }
             }
 
-            // The detail pane takes no events at all now: Reply/Delete/Mark
-            // Read/Unread moved to the Message menu, and detail_body is a
-            // read-only boxed-text render — focusing the TextBox only let you
-            // invisibly edit the display copy.
+            // The detail pane takes no widget events — but the rendered HTML
+            // page does take raw pointer input (text selection, link
+            // clicks). Presses reach here only after every overlay (card
+            // menu, bar dropdowns) had its chance and returned; the release
+            // follows the press wherever the pointer went, so a drag out of
+            // the pane still ends cleanly.
+            #[cfg(feature = "wpe")]
+            if button == MouseButton::Left {
+                match state {
+                    ElementState::Pressed => {
+                        if !scrollbar_took_press
+                            && !self.body_sb_dragging
+                            && !self.split_dragging
+                            && self.html_on_show()
+                            && self.in_webview(px, py)
+                        {
+                            let (wx, wy) = self.webview_px(px, py);
+                            self.webview.mouse_button_ui(button, true, wx, wy);
+                            self.webview_mouse_down = true;
+                            changed = true;
+                        }
+                    }
+                    ElementState::Released => {
+                        if std::mem::take(&mut self.webview_mouse_down) {
+                            let (wx, wy) = self.webview_px(px, py);
+                            self.webview.mouse_button_ui(button, false, wx, wy);
+                            changed = true;
+                        }
+                    }
+                }
+            }
         }
 
         if changed {
@@ -4599,19 +5122,40 @@ impl Application for ClearEmailApp {
             }
         }
 
-        // Detail-pane body scroll.
+        // Detail-pane body scroll — or, in the HTML view, the page's own
+        // scrolling: the wheel goes to the engine (winit-signed device px,
+        // the webview's convention) and WebKit moves the document.
         if !self.compose_open && self.selected_email_id.is_some() {
             if px > separator_x {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
-                    MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
-                };
-                let (_, body_h) = self.detail_body_geom();
-                let max = (self.body_content_h - body_h).max(0.0);
-                let old = self.body_scroll;
-                self.body_scroll = (self.body_scroll + dy).clamp(0.0, max);
-                if (self.body_scroll - old).abs() > 0.01 {
-                    changed = true;
+                #[cfg(feature = "wpe")]
+                let html_wheel = self.html_on_show() && self.in_webview(px, py);
+                #[cfg(not(feature = "wpe"))]
+                let html_wheel = false;
+                if html_wheel {
+                    #[cfg(feature = "wpe")]
+                    {
+                        let s = self.scale_factor;
+                        let (dx, dy) = match delta {
+                            MouseScrollDelta::LineDelta(x, y) => {
+                                ((*x as f64) * 24.0 * s, (*y as f64) * 24.0 * s)
+                            }
+                            MouseScrollDelta::PixelDelta(p) => (p.x * s, p.y * s),
+                        };
+                        let (wx, wy) = self.webview_px(px, py);
+                        self.webview.wheel(dx, dy, wx, wy);
+                    }
+                } else {
+                    let dy = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
+                        MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
+                    };
+                    let (_, body_h) = self.detail_body_geom();
+                    let max = (self.body_content_h - body_h).max(0.0);
+                    let old = self.body_scroll;
+                    self.body_scroll = (self.body_scroll + dy).clamp(0.0, max);
+                    if (self.body_scroll - old).abs() > 0.01 {
+                        changed = true;
+                    }
                 }
             }
         }
@@ -4727,6 +5271,11 @@ impl Application for ClearEmailApp {
             }
         }
 
+        // Read before ctx: html_on_show(&self) cannot run while ui_context
+        // is mutably borrowed, and nothing below changes what it reads.
+        #[cfg(feature = "wpe")]
+        let html_on_show = self.html_on_show();
+
         let ctx = &mut self.ui_context;
 
         if self.compose_open {
@@ -4782,6 +5331,34 @@ impl Application for ClearEmailApp {
                     self.search_open = true;
                     ctx.set_focused(&mut self.search_box);
                     self.search_box.focus();
+                    handled = true;
+                }
+            }
+
+            // HTML view: page keys and the copy chord go to the engine
+            // (hover-scoped like the text body's keys below). Up/Down stay
+            // with the list selection either way.
+            #[cfg(feature = "wpe")]
+            if !handled
+                && self.detail_hovered
+                && html_on_show
+                && !self.search_box.editing
+                && event.state == ElementState::Pressed
+            {
+                use cce_ui::widget::NamedKey;
+                let forward = match &event.logical_key {
+                    Key::Named(
+                        NamedKey::PageDown | NamedKey::PageUp | NamedKey::Home | NamedKey::End,
+                    ) => true,
+                    Key::Character(c) if event.ctrl && c.eq_ignore_ascii_case("c") => {
+                        self.webview.copy_selection();
+                        handled = true;
+                        false
+                    }
+                    _ => false,
+                };
+                if forward {
+                    self.webview.key_ui(event);
                     handled = true;
                 }
             }
@@ -5256,6 +5833,45 @@ mod tests {
         // attachments only → None (caller falls back to a capped full fetch)
         let bs = multipart("MIXED", vec![basic_part("APPLICATION", "OCTET-STREAM")]);
         assert!(find_text_part(&bs).is_none());
+    }
+
+    #[cfg(feature = "wpe")]
+    #[test]
+    fn html_part_walk_prefers_html_over_plain() {
+        // The same alternative the sync reads plain out of: the HTML view
+        // must land on the other branch.
+        let bs = multipart(
+            "MIXED",
+            vec![
+                multipart(
+                    "ALTERNATIVE",
+                    vec![
+                        text_part("PLAIN", ContentEncoding::QuotedPrintable, Some(("CHARSET", "UTF-8"))),
+                        text_part("HTML", ContentEncoding::Base64, Some(("CHARSET", "ISO-8859-1"))),
+                    ],
+                ),
+                basic_part("APPLICATION", "PDF"),
+            ],
+        );
+        let spec = find_html_part(&bs).expect("finds the html part");
+        assert_eq!(section_str(&spec.path), "1.2");
+        assert_eq!(spec.subtype, "html");
+        assert_eq!(spec.encoding, "base64");
+        assert_eq!(spec.charset.as_deref(), Some("ISO-8859-1"));
+    }
+
+    #[cfg(feature = "wpe")]
+    #[test]
+    fn html_part_walk_toplevel_and_absent() {
+        // Non-multipart text/html is section 1 (RFC 3501).
+        let spec = find_html_part(&text_part("HTML", ContentEncoding::SevenBit, None)).unwrap();
+        assert_eq!(spec.path, vec![1]);
+        // Plain-only mail has no HTML view: the pane stays on text.
+        let bs = multipart(
+            "MIXED",
+            vec![text_part("PLAIN", ContentEncoding::SevenBit, None)],
+        );
+        assert!(find_html_part(&bs).is_none());
     }
 
     #[test]
