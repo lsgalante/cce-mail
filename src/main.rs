@@ -1,8 +1,7 @@
-mod scroll_region;
 /// Embedded WPE WebKit for the HTML mail view — see src/wpe/mod.rs.
 #[cfg(feature = "wpe")]
 mod wpe;
-use scroll_region::ScrollRegion;
+use cce_ui::widget::ScrollRegion;
 use wayland_client::QueueHandle;
 use cce_ui::cosmic_text::FontSystem;
 use cce_ui::engine::{Application, CursorIcon, EngineState, LogicalPosition, LogicalSize, WindowSettings};
@@ -3387,6 +3386,18 @@ impl ClearEmailApp {
                 })
                 .collect();
 
+            // Row labels carry the list-viewport bounds, unlike the other
+            // hand-emitted labels: `get_item_draw_y` returns PARTIALLY visible
+            // cards (the toolkit ScrollRegion's intersection contract), so an
+            // edge card's text must be cut at the viewport instead of bleeding
+            // into the menubar above or the frame below. Emitted straight into
+            // `pc` — the shared `labels` drain is boundless.
+            let list_bounds = Some([
+                list_x,
+                self.email_list.viewport_y,
+                list_x + list_w,
+                self.email_list.viewport_y + self.email_list.viewport_h,
+            ]);
             for (idx, email) in filtered.iter().enumerate() {
                 if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
                     // Sender — recipient on sent rows (every sent mail is
@@ -3396,45 +3407,53 @@ impl ClearEmailApp {
                     } else {
                         email.from.clone()
                     };
-                    labels.push(TextLabel {
-                        text: ellipsize(&row_head, fit(21.0)),
-                        x: list_x + 20.0,
-                        y: draw_y + 6.0,
-                        font_size: 11.0,
-                        color: if !email.read { [0xff, 0xff, 0xff] } else { [0xb0, 0xb0, 0xb8] },
-                    });
+                    pc.text_with(
+                        ellipsize(&row_head, fit(21.0)),
+                        list_x + 20.0,
+                        draw_y + 6.0,
+                        11.0,
+                        if !email.read { [0xff, 0xff, 0xff] } else { [0xb0, 0xb0, 0xb8] },
+                        None,
+                        list_bounds,
+                    );
 
                     // Date — right-aligned inside the row, clear of the scrollbar strip
                     let date_w = TextLabel::estimate_width(&email.date, 9.0);
-                    labels.push(TextLabel {
-                        text: email.date.clone(),
-                        x: list_x + list_w - 14.0 - date_w,
-                        y: draw_y + 7.0,
-                        font_size: 9.0,
-                        color: [0x70, 0x70, 0x75],
-                    });
+                    pc.text_with(
+                        email.date.clone(),
+                        list_x + list_w - 14.0 - date_w,
+                        draw_y + 7.0,
+                        9.0,
+                        [0x70, 0x70, 0x75],
+                        None,
+                        list_bounds,
+                    );
 
                     // Subject
-                    labels.push(TextLabel {
-                        text: ellipsize(&email.subject, fit(29.0)),
-                        x: list_x + 20.0,
-                        y: draw_y + 20.0,
-                        font_size: 10.0,
-                        color: if !email.read { [0x3a, 0x9a, 0xff] } else { [0x83, 0x83, 0x8a] },
-                    });
+                    pc.text_with(
+                        ellipsize(&email.subject, fit(29.0)),
+                        list_x + 20.0,
+                        draw_y + 20.0,
+                        10.0,
+                        if !email.read { [0x3a, 0x9a, 0xff] } else { [0x83, 0x83, 0x8a] },
+                        None,
+                        list_bounds,
+                    );
 
                     // Snippet — collapse ALL whitespace: CRLF bodies leave bare '\r'
                     // after a plain '\n' replace, and the renderer treats it as a
                     // line break, bleeding preview lines into the next row.
                     let snippet_raw = email.body.split_whitespace().collect::<Vec<_>>().join(" ");
                     let snippet = ellipsize(&snippet_raw, fit(37.0));
-                    labels.push(TextLabel {
-                        text: snippet,
-                        x: list_x + 20.0,
-                        y: draw_y + 34.0,
-                        font_size: 9.0,
-                        color: [0x60, 0x60, 0x65],
-                    });
+                    pc.text_with(
+                        snippet,
+                        list_x + 20.0,
+                        draw_y + 34.0,
+                        9.0,
+                        [0x60, 0x60, 0x65],
+                        None,
+                        list_bounds,
+                    );
                 }
             }
         }
@@ -4601,7 +4620,18 @@ impl Application for ClearEmailApp {
             quads.extend(list_quads);
         }
 
-        // Visible List Item Buttons
+        // Visible List Item Buttons — `get_item_draw_y` returns PARTIALLY
+        // visible cards too (the toolkit ScrollRegion's intersection
+        // contract), so the whole card pass runs under the list viewport clip:
+        // an edge card renders cut by the clip instead of vanishing. The
+        // unread dots ride the same PaintCtx (the tuple sink forwards to it),
+        // so the clip covers them too.
+        quads.pc.push_clip(cce_ui::scene::layout::Rect {
+            x: self.email_list.x,
+            y: self.email_list.viewport_y,
+            width: self.email_list.w,
+            height: self.email_list.viewport_h,
+        });
         for idx in 0..filtered.len() {
             if self.email_list.get_item_draw_y(idx, 0.0).is_some() {
                 cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.email_buttons[idx], &mut *quads.pc);
@@ -4614,6 +4644,7 @@ impl Application for ClearEmailApp {
                 }
             }
         }
+        quads.pc.pop_clip();
         // Scrollbar after the rows so the thumb rides on top of them instead of
         // peeking through the inter-row gaps.
         {
