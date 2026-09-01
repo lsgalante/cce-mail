@@ -3986,8 +3986,11 @@ impl Application for ClearEmailApp {
                         self.status_message = Some(StatusToast::info(format!("Saved {} — opening...", name), 4.0));
                         // Route through the XDG default — which, since the
                         // Default Apps work, is a cce app for pdf/images.
-                        let mut cmd = std::process::Command::new("xdg-open");
-                        cmd.arg(&path);
+                        // `gio open` reads the same mimeapps.list as xdg-open
+                        // but resolves in C (~8ms) instead of shell (~60ms),
+                        // all of it before the handler even spawns.
+                        let mut cmd = std::process::Command::new("gio");
+                        cmd.arg("open").arg(&path);
                         let _ = cce_ui::process::spawn_detached(cmd);
                     }
                     Err(e) => {
@@ -4312,8 +4315,10 @@ impl Application for ClearEmailApp {
                         || uri.starts_with("https://")
                         || uri.starts_with("mailto:")
                     {
-                        let mut cmd = std::process::Command::new("xdg-open");
-                        cmd.arg(&uri);
+                        // gio, not xdg-open: same mimeapps resolution, minus
+                        // ~50ms of shell script on the click-to-tab path.
+                        let mut cmd = std::process::Command::new("gio");
+                        cmd.arg("open").arg(&uri);
                         let _ = cce_ui::process::spawn_detached(cmd);
                         self.status_message =
                             Some(StatusToast::info(format!("Opening {}", ellipsize(&uri, 60)), 4.0));
