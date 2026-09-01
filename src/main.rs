@@ -254,6 +254,10 @@ struct ClearEmailApp {
     detail_hovered: bool,
     body_sb_dragging: bool,
     body_sb_drag_offset: f32,
+    /// Raise/sink hysteresis for the detail-pane bar (shared toolkit type).
+    /// The window bg behind the pane is opaque, so "sunk" here is fully
+    /// hidden — an overlay bar that appears on scroll and idles away.
+    body_sb_activity: cce_ui::widget::ScrollbarActivity,
 
     // HTML mail view (feature `wpe`). The host boots at startup (cheap: no
     // WebKit processes until the first message renders); the fetched HTML is
@@ -3304,8 +3308,10 @@ impl ClearEmailApp {
         if max_scroll <= 0.0 {
             return None;
         }
-        let sb_w = cce_ui::layout::scrollbar_width();
-        let sb_x = w - sb_w - 4.0;
+        // Page-level bar geometry (the settings page look): the DE width
+        // widened, stood off the window's right edge by the configured inset.
+        let sb_w = cce_ui::layout::scrollbar_width() * 1.6;
+        let sb_x = w - sb_w - cce_ui::layout::scrollbar_inset();
         let thumb_h = (body_h * body_h / self.body_content_h).clamp(20.0, body_h);
         let thumb_y = body_y + (self.body_scroll / max_scroll) * (body_h - thumb_h);
         Some((sb_x, body_y, sb_w, body_h, thumb_y, thumb_h))
@@ -3314,6 +3320,10 @@ impl ClearEmailApp {
     /// Left press on the scrollbar strip (±4px slop like ScrollRegion): grab the
     /// thumb where it was clicked, or jump the track and drag from the thumb center.
     fn body_sb_press(&mut self, px: f32, py: f32) -> bool {
+        // A sunk bar is not drawn and takes no input; the press falls through.
+        if !self.body_sb_activity.raised() {
+            return false;
+        }
         let Some((sb_x, track_y, sb_w, track_h, thumb_y, thumb_h)) = self.body_scrollbar_geom() else {
             return false;
         };
@@ -3630,7 +3640,12 @@ impl Application for ClearEmailApp {
             .with_placeholder("Search mail — sender, subject or body");
         search_box.font_size = 11.0;
 
-        let email_list = ScrollRegion::new(54.0, 4.0);
+        // Designer raise/sink treatment: idle the bar sinks under the list's
+        // translucent bg fill (dimly visible through it), a scroll raises it
+        // over the cards; stood off the list's right edge by the DE inset.
+        let email_list = ScrollRegion::new(54.0, 4.0)
+            .with_sink_behind(true)
+            .with_edge_inset(cce_ui::layout::scrollbar_inset());
 
         let accounts = load_accounts();
         // Last-used account wins (sidecar file), else the configured default:
@@ -3735,6 +3750,7 @@ impl Application for ClearEmailApp {
             detail_hovered: false,
             body_sb_dragging: false,
             body_sb_drag_offset: 0.0,
+            body_sb_activity: cce_ui::widget::ScrollbarActivity::new(),
             #[cfg(feature = "wpe")]
             webview: wpe::MailWebView::new((800, 600)),
             #[cfg(feature = "wpe")]
@@ -4358,6 +4374,20 @@ impl Application for ClearEmailApp {
             self.needs_rebuild = true;
         }
 
+        // Raise/sink upkeep for the two scrollbars (email list, detail pane):
+        // true while the post-scroll hold runs or on the depth flip, keeping
+        // frames coming so the sink actually renders.
+        if self.email_list.tick(dt) {
+            *needs_rebuild = true;
+            self.needs_rebuild = true;
+        }
+        let body_holding = self.body_sb_activity.holding();
+        let body_visible = self.body_scrollbar_geom().is_some();
+        if self.body_sb_activity.tick(dt, body_visible, self.body_sb_dragging) || body_holding {
+            *needs_rebuild = true;
+            self.needs_rebuild = true;
+        }
+
         // A sync skipped for a missing password retries itself, so unlocking
         // the vault brings mail in without the user having to ask again.
         // No redraw is requested here: a failed retry changes nothing on
@@ -4752,10 +4782,15 @@ impl Application for ClearEmailApp {
                         let max_scroll = (content_h - body_h).max(0.0);
                         self.body_scroll = self.body_scroll.clamp(0.0, max_scroll);
 
-                        // Scrollbar (ScrollRegion's colors) when the body overflows.
-                        if let Some((sb_x, track_y, sb_w, track_h, thumb_y, thumb_h)) = self.body_scrollbar_geom() {
-                            quads.push((sb_x, track_y, sb_w, track_h, cce_ui::color::scrollbar_track_color()));
-                            quads.push((sb_x, thumb_y, sb_w, thumb_h, cce_ui::color::scrollbar_thumb_color()));
+                        // Scrollbar (ScrollRegion's colors) while raised: a
+                        // scroll shows it, 0.7s of quiet hides it (the window
+                        // bg is opaque — no plate for a sunk layer to show
+                        // through, so sunk is simply not drawn).
+                        if self.body_sb_activity.raised() {
+                            if let Some((sb_x, track_y, sb_w, track_h, thumb_y, thumb_h)) = self.body_scrollbar_geom() {
+                                quads.push((sb_x, track_y, sb_w, track_h, cce_ui::color::scrollbar_track_color()));
+                                quads.push((sb_x, thumb_y, sb_w, thumb_h, cce_ui::color::scrollbar_thumb_color()));
+                            }
                         }
 
                         quads.pc.text_boxed(
@@ -4923,6 +4958,20 @@ impl Application for ClearEmailApp {
             if self.body_sb_drag_to(py) {
                 changed = true;
             }
+        }
+
+        // Detail-bar hover bookkeeping: hover only SUSTAINS a raised bar (the
+        // hysteresis contract), so raw strip geometry is the right input.
+        if !self.compose_open {
+            let over = self
+                .body_scrollbar_geom()
+                .is_some_and(|(sb_x, track_y, sb_w, track_h, _, _)| {
+                    px >= sb_x - 4.0
+                        && px <= sb_x + sb_w + 4.0
+                        && py >= track_y
+                        && py <= track_y + track_h
+                });
+            self.body_sb_activity.set_hover(over);
         }
 
         // Active split drag: the separator follows the pointer, clamped so
@@ -5099,6 +5148,8 @@ impl Application for ClearEmailApp {
                 }
                 ElementState::Released => {
                     if std::mem::take(&mut self.body_sb_dragging) {
+                        // Drag release starts the hold before the bar hides.
+                        self.body_sb_activity.bump();
                         changed = true;
                     }
                     if std::mem::take(&mut self.split_dragging) {
@@ -5427,6 +5478,9 @@ impl Application for ClearEmailApp {
                     let old = self.body_scroll;
                     self.body_scroll = (self.body_scroll + dy).clamp(0.0, max);
                     if (self.body_scroll - old).abs() > 0.01 {
+                        // The scroll raises the bar in the same frame.
+                        self.body_sb_activity.bump();
+                        self.body_sb_activity.recompute(true, self.body_sb_dragging);
                         changed = true;
                     }
                 }
