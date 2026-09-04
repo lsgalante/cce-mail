@@ -7,7 +7,7 @@ use cce_ui::cosmic_text::FontSystem;
 use cce_ui::engine::{Application, CursorIcon, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, WidgetHost,
-    TextBox, Button, TextLabel, Key, Dropdown
+    TextBox, Button, TextLabel, Key, Dropdown, Bounds, ScrollMotion, LINE_PX
 };
 use cce_ui::context::UiContext;
 use native_tls::TlsConnector;
@@ -250,6 +250,10 @@ struct ClearEmailApp {
     /// wheel/keyboard scrolling to the pane. The sb_* pair is the scrollbar
     /// thumb drag (grab offset within the thumb), mirroring ScrollRegion.
     body_scroll: f32,
+    /// Drives `body_scroll` (the DRAWN offset): wheel notches glide it, a
+    /// trackpad flick coasts it. Direct writes — selection reset, thumb drag,
+    /// the paint-time clamp — are adopted by the motion on its next step.
+    body_motion: ScrollMotion,
     body_content_h: f32,
     detail_hovered: bool,
     body_sb_dragging: bool,
@@ -3358,6 +3362,20 @@ impl ClearEmailApp {
         (self.body_scroll - old).abs() > 0.01
     }
 
+    /// Advance the detail body's wheel glide / flick coast; true while the
+    /// offset is moving, so the frame loop keeps drawing until it settles.
+    fn tick_body_scroll(&mut self, dt: f32) -> bool {
+        self.body_motion.reconcile(0.0, self.body_scroll);
+        if !self.body_motion.is_animating() {
+            return false;
+        }
+        let (_, body_h) = self.detail_body_geom();
+        let max = (self.body_content_h - body_h).max(0.0);
+        let moved = self.body_motion.tick(dt, Bounds::max(0.0), Bounds::max(max));
+        self.body_scroll = self.body_motion.y.pos();
+        moved || self.body_motion.is_animating()
+    }
+
     fn emit_text_prims(&mut self, pc: &mut cce_ui::scene::paint::PaintCtx) {
         let mut labels = Vec::new();
 
@@ -3746,6 +3764,7 @@ impl Application for ClearEmailApp {
             synced_tags: std::collections::HashSet::new(),
             selected_email_id: None,
             body_scroll: 0.0,
+            body_motion: ScrollMotion::new(),
             body_content_h: 0.0,
             detail_hovered: false,
             body_sb_dragging: false,
@@ -4378,6 +4397,12 @@ impl Application for ClearEmailApp {
         // true while the post-scroll hold runs or on the depth flip, keeping
         // frames coming so the sink actually renders.
         if self.email_list.tick(dt) {
+            *needs_rebuild = true;
+            self.needs_rebuild = true;
+        }
+        // The body's own glide/coast: the wheel only moves the target, this
+        // is what carries the drawn offset there.
+        if self.tick_body_scroll(dt) {
             *needs_rebuild = true;
             self.needs_rebuild = true;
         }
@@ -5469,15 +5494,14 @@ impl Application for ClearEmailApp {
                         self.webview.wheel(dx, dy, wx, wy);
                     }
                 } else {
-                    let dy = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
-                        MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
-                    };
                     let (_, body_h) = self.detail_body_geom();
                     let max = (self.body_content_h - body_h).max(0.0);
-                    let old = self.body_scroll;
-                    self.body_scroll = (self.body_scroll + dy).clamp(0.0, max);
-                    if (self.body_scroll - old).abs() > 0.01 {
+                    // A wheel notch moves the target (tick_body_scroll glides
+                    // the offset there); a trackpad finger moves the offset now.
+                    self.body_motion.reconcile(0.0, self.body_scroll);
+                    let moved = self.body_motion.apply(delta, (LINE_PX, LINE_PX), Bounds::max(0.0), Bounds::max(max));
+                    self.body_scroll = self.body_motion.y.pos();
+                    if moved {
                         // The scroll raises the bar in the same frame.
                         self.body_sb_activity.bump();
                         self.body_sb_activity.recompute(true, self.body_sb_dragging);
@@ -5698,17 +5722,28 @@ impl Application for ClearEmailApp {
                 && event.state == ElementState::Pressed
             {
                 let max = (self.body_content_h - body_h).max(0.0);
-                let old = self.body_scroll;
-                match &event.logical_key {
+                let b = Bounds::max(max);
+                let s = cce_ui::widget::scroll_motion::scroll_settings();
+                // Pages glide from the current TARGET, so a held key
+                // accumulates into one motion rather than restarting it.
+                self.body_motion.reconcile(0.0, self.body_scroll);
+                let moved = match &event.logical_key {
                     // Up/Down belong to the selection; the body still has
                     // Page keys, Home/End, the wheel and its scrollbar.
-                    Key::Named(cce_ui::widget::NamedKey::PageDown) => self.body_scroll = (self.body_scroll + body_h).min(max),
-                    Key::Named(cce_ui::widget::NamedKey::PageUp) => self.body_scroll = (self.body_scroll - body_h).max(0.0),
-                    Key::Named(cce_ui::widget::NamedKey::Home) => self.body_scroll = 0.0,
-                    Key::Named(cce_ui::widget::NamedKey::End) => self.body_scroll = max,
-                    _ => {}
-                }
-                if (self.body_scroll - old).abs() > 0.01 {
+                    Key::Named(cce_ui::widget::NamedKey::PageDown) => {
+                        let t = self.body_motion.y.target() + body_h;
+                        self.body_motion.y.scroll_to(t, b, &s)
+                    }
+                    Key::Named(cce_ui::widget::NamedKey::PageUp) => {
+                        let t = self.body_motion.y.target() - body_h;
+                        self.body_motion.y.scroll_to(t, b, &s)
+                    }
+                    Key::Named(cce_ui::widget::NamedKey::Home) => self.body_motion.y.scroll_to(0.0, b, &s),
+                    Key::Named(cce_ui::widget::NamedKey::End) => self.body_motion.y.scroll_to(max, b, &s),
+                    _ => false,
+                };
+                self.body_scroll = self.body_motion.y.pos();
+                if moved {
                     handled = true;
                 }
             }
