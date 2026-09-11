@@ -142,18 +142,29 @@ struct HtmlMail {
     inline: Vec<(String, String, Vec<u8>)>,
 }
 
-/// The single status slot at the bottom of the window. Info toasts count
-/// down in `tick` and expire; errors carry no timer — they stay until
+/// The single status slot at the bottom of the window. Info toasts expire on
+/// a deadline checked in `tick`; errors carry no timer — they stay until
 /// clicked away or replaced, so a failed sync can't vanish unseen.
+///
+/// The deadline is a wall clock rather than a `ttl` counted down by `tick`'s
+/// `dt`, because `dt` is animation time: the runner clamps it to one frame
+/// after an idle sleep, and a window whose only pending work is a toast's own
+/// expiry never leaves that sleep. Counted in `dt`, a 4 s toast sat on screen
+/// for about four minutes.
 #[derive(Debug, Clone)]
 enum StatusToast {
-    Info { text: String, ttl: f32 },
+    Info { text: String, expires_at: std::time::Instant },
     Error { text: String },
 }
 
 impl StatusToast {
+    /// `ttl` is in seconds, resolved to a deadline here so every call site
+    /// keeps reading as a duration.
     fn info(text: impl Into<String>, ttl: f32) -> Self {
-        StatusToast::Info { text: text.into(), ttl }
+        StatusToast::Info {
+            text: text.into(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs_f32(ttl),
+        }
     }
     fn error(text: impl Into<String>) -> Self {
         StatusToast::Error { text: text.into() }
@@ -4383,6 +4394,15 @@ impl Application for ClearEmailApp {
         }
     }
 
+    /// A live info toast's only pending work is its own expiry, which the
+    /// runner cannot see: nothing redraws, so the loop would park on its
+    /// default idle sleep and retire the toast up to a second late. Poll
+    /// while one is up; the scheduled backfill is happy with the default.
+    fn idle_poll_interval(&self) -> Option<std::time::Duration> {
+        matches!(self.status_message, Some(StatusToast::Info { .. }))
+            .then(|| std::time::Duration::from_millis(100))
+    }
+
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
         // Pump the widget tick walk: animating widgets (dropdown menus'
         // expand/contract) register as tick receivers and report changed
@@ -4432,9 +4452,8 @@ impl Application for ClearEmailApp {
         }
 
         // Only info toasts expire; an error stays until clicked or replaced.
-        if let Some(StatusToast::Info { ref mut ttl, .. }) = self.status_message {
-            *ttl -= dt;
-            if *ttl <= 0.0 {
+        if let Some(StatusToast::Info { expires_at, .. }) = self.status_message {
+            if std::time::Instant::now() >= expires_at {
                 self.status_message = None;
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
