@@ -4948,6 +4948,10 @@ impl Application for ClearEmailApp {
                     qc,
                 );
             }
+            // The menu font's family: a TextLabel carries only a size, so
+            // `None` here drew the menu in the default sans while the labels
+            // had been laid out in the configured face.
+            let (menu_family, _) = cce_ui::widget::context_menu::label_font();
             for label in cce_ui::widget::context_menu::text_labels() {
                 __pc.text_with(
                     label.text.clone(),
@@ -4955,7 +4959,7 @@ impl Application for ClearEmailApp {
                     label.y,
                     label.font_size,
                     label.color,
-                    None,
+                    Some(menu_family.clone()),
                     menu_bounds,
                 );
             }
