@@ -615,6 +615,18 @@ fn pane_gap() -> f32 {
     cce_ui::layout::root_plate_gap()
 }
 
+/// The pane plates' fill: the DE's list colour carrying the blur-behind
+/// sentinel — a NEGATIVE alpha, which is how shader2d is told to sample the
+/// frosted backdrop beneath this surface rather than compositing flatly over
+/// it. The plate is then transparent AND blurred, which is what lets a
+/// scrollbar parked underneath read as genuinely behind it instead of as a
+/// stripe drawn through it.
+fn pane_fill() -> [f32; 4] {
+    let mut c = cce_ui::color::list_bg_color();
+    c[3] = -c[3].abs();
+    c
+}
+
 /// The padding INSIDE a pane plate, between its rim and its content
 /// (`style.surface.plate.padding`, DE-wide — the pane rung's own value, 20
 /// here, where the root rung's [`pane_pad`] is 12). Uniform on all four
@@ -3019,23 +3031,58 @@ impl ClearEmailApp {
         self.detail_pane_geom().1 + pane_inner_pad()
     }
 
-    /// The body scrollbar's lane inside the plate: (x, width). Independent of
-    /// whether the bar is currently needed, so the text column keeps its width
-    /// and does not reflow the moment the body grows past the pane.
+    /// The body scrollbar's lane: (x, width), on the plate's CENTRE line, as
+    /// the list's bar rides its plate's.
     fn detail_sb_lane(&self) -> (f32, f32) {
         let (px, _, pw, _) = self.detail_pane_geom();
         // Page-level bar width (the settings page look), as `parameters_bg`
         // and the settings pages widen theirs.
         let sb_w = cce_ui::layout::scrollbar_width() * 1.6;
-        (px + pw - sb_w - cce_ui::layout::scrollbar_inset(), sb_w)
+        (px + (pw - sb_w) / 2.0, sb_w)
     }
 
-    /// Width of the detail pane's text column: from the content's left edge to
-    /// a gutter short of the scrollbar lane.
+    /// Width of the detail pane's text column: the whole plate inside its
+    /// padding. No lane is reserved for the bar any more — it rides over the
+    /// text the way the list's rides over its rows, and is only in front
+    /// while scrolling.
     fn detail_content_w(&self) -> f32 {
+        let (px, _, pw, _) = self.detail_pane_geom();
         let (_, _, detail_x) = self.split_geom();
-        let (sb_x, _) = self.detail_sb_lane();
-        (sb_x - 6.0 - detail_x).max(100.0)
+        ((px + pw - pane_inner_pad()) - detail_x).max(100.0)
+    }
+
+    /// The detail pane's bar as pills at `alpha`. Emitted TWICE a frame: once
+    /// under the plate at full strength (the copy seen through the frost),
+    /// once over the body as the fore copy fades in and out.
+    fn push_body_scrollbar(&self, pc: &mut cce_ui::scene::paint::PaintCtx, alpha: f32) {
+        let a = alpha.clamp(0.0, 1.0);
+        if a <= 0.001 {
+            return;
+        }
+        let Some((sb_x, track_y, sb_w, track_h, thumb_y, thumb_h)) = self.body_scrollbar_geom()
+        else {
+            return;
+        };
+        let dim = |mut c: [f32; 4]| {
+            c[3] *= a;
+            c
+        };
+        use cce_ui::scene::layout::Rect;
+        let all = (true, true, true, true);
+        // Pills, as `ScrollRegion::push_scrollbar_prims` draws them: radius is
+        // half the shorter extent.
+        pc.rounded_rect(
+            Rect { x: sb_x, y: track_y, width: sb_w, height: track_h },
+            sb_w.min(track_h) * 0.5,
+            all,
+            dim(cce_ui::color::scrollbar_track_color()),
+        );
+        pc.rounded_rect(
+            Rect { x: sb_x, y: thumb_y, width: sb_w, height: thumb_h },
+            sb_w.min(thumb_h) * 0.5,
+            all,
+            dim(cce_ui::color::scrollbar_thumb_color()),
+        );
     }
 
     /// Move the selection `delta` rows through the list as it is displayed,
@@ -4794,11 +4841,29 @@ impl Application for ClearEmailApp {
         // cards span its full width — does.
         {
             let (px, py, pw, ph) = self.detail_pane_geom();
+            // BOTH panes' bars go down here, before EITHER plate, each at
+            // full strength: a frosted plate laid over one is what dims and
+            // blurs it, and that is what reads as the bar being behind the
+            // pane rather than drawn across it.
+            //
+            // The list's belongs to the block further down, with its own
+            // plate, and sat there until it came out invisible. A blur plate
+            // samples the frame so far, but only the FIRST one in a frame
+            // takes that snapshot — the second reuses it (the renderer's
+            // consecutive-blur-plate optimisation, which a non-blur draw
+            // between them did not defeat here). So the detail plate was
+            // frosting over a backdrop from before the list's bar existed.
+            // Emitting both bars ahead of both plates puts them in whichever
+            // snapshot gets taken. The two panes do not overlap, so each
+            // plate carrying the other's bar in its sampled backdrop costs
+            // nothing.
+            self.push_body_scrollbar(&mut *quads.pc, 1.0);
+            self.email_list.push_scrollbar_prims(&mut *quads.pc);
             quads.pc.rounded_rect(
                 cce_ui::scene::layout::Rect { x: px, y: py, width: pw, height: ph },
                 cce_ui::layout::list_corner_radius(),
                 (true, true, true, true),
-                cce_ui::color::list_bg_color(),
+                pane_fill(),
             );
         }
 
@@ -4808,16 +4873,8 @@ impl Application for ClearEmailApp {
             cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.search_box, &mut *quads.pc);
         }
         {
-            // No sunk layer is emitted here. A frameless sink-behind region
-            // leaves the layering to its host, and the host's only other
-            // option — the bar under the plate fill — does not hide it: this
-            // plate is translucent, so a sunk bar reads straight through the
-            // rows as a permanent stripe, which riding the centre line made
-            // impossible to miss. Behind the list means out of sight, so the
-            // bar is drawn only once it rises (`push_prims`, after the rows),
-            // the same treatment the detail pane's own bar already gets. The
-            // opaque-plate hosts that DO show a sunk bar through are what
-            // `push_scrollbar_prims` exists for.
+            // The list's behind copy is NOT emitted here — it goes down with
+            // the detail pane's, ahead of both plates; see there.
             // The list is a plate, so it wears the DE's list radius rather
             // than square corners — `ScrollRegion`'s own framed paint draws
             // its surface at exactly this getter.
@@ -4830,7 +4887,7 @@ impl Application for ClearEmailApp {
                 },
                 cce_ui::layout::list_corner_radius(),
                 (true, true, true, true),
-                cce_ui::color::list_bg_color(),
+                pane_fill(),
             );
         }
 
@@ -4969,26 +5026,11 @@ impl Application for ClearEmailApp {
                         // scroll shows it, 0.7s of quiet hides it (the window
                         // bg is opaque — no plate for a sunk layer to show
                         // through, so sunk is simply not drawn).
-                        if self.body_sb_activity.raised() {
-                            if let Some((sb_x, track_y, sb_w, track_h, thumb_y, thumb_h)) = self.body_scrollbar_geom() {
-                                // Pills, as `ScrollRegion::push_scrollbar_prims`
-                                // draws them: radius is half the shorter extent.
-                                use cce_ui::scene::layout::Rect;
-                                let all = (true, true, true, true);
-                                quads.pc.rounded_rect(
-                                    Rect { x: sb_x, y: track_y, width: sb_w, height: track_h },
-                                    sb_w.min(track_h) * 0.5,
-                                    all,
-                                    cce_ui::color::scrollbar_track_color(),
-                                );
-                                quads.pc.rounded_rect(
-                                    Rect { x: sb_x, y: thumb_y, width: sb_w, height: thumb_h },
-                                    sb_w.min(thumb_h) * 0.5,
-                                    all,
-                                    cce_ui::color::scrollbar_thumb_color(),
-                                );
-                            }
-                        }
+                        // The fore copy, faded in over the body. Driven by the
+                        // activity's fade rather than its latch, so it keeps
+                        // drawing all the way out instead of being cut off the
+                        // instant the bar stops counting as raised.
+                        self.push_body_scrollbar(&mut *quads.pc, self.body_sb_activity.fade());
 
                         quads.pc.text_boxed(
                             email.body.clone(),
