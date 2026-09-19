@@ -624,6 +624,13 @@ const OPTICAL_TRIM: f32 = 1.0;
 /// 14, so the groove is worth about half a pixel a side.
 const CARVE_TRIM: f32 = 0.5;
 
+/// And one more for the bar's TOP edge alone. Under the DE's top-left light
+/// the groove along a control's upper edge reads a pixel deeper than the one
+/// down its side, so an item placed on the same inset as the window's left and
+/// right left 13px of plate above it against 12 beside it. The band height
+/// below follows it, or the gap it opens at the top just moves underneath.
+const TOP_TRIM: f32 = 1.0;
+
 /// The menubar band's height. One padding above its items, which then sit
 /// flush with the band's bottom edge, so the gap from an item down to the
 /// plates below is that same padding again (`list_geom` adds it). That is
@@ -631,8 +638,10 @@ const CARVE_TRIM: f32 = 0.5;
 /// items, items to plates, plates to rim.
 fn menubar_h() -> f32 {
     // The items' rects run CARVE_TRIM past the box they appear to fill, so the
-    // band has to clear that or the plates below sit a pixel too close.
-    window_pad() + BAR_ITEM_H + CARVE_TRIM
+    // band has to clear that or the plates below sit a pixel too close; and it
+    // follows TOP_TRIM up, so raising the items does not just move the extra
+    // pixel from above them to below.
+    window_pad() - TOP_TRIM + BAR_ITEM_H + CARVE_TRIM
 }
 
 /// A bar item's widget rect, from the box its plate should appear to fill:
@@ -4781,12 +4790,12 @@ impl Application for ClearEmailApp {
             // that to the rect the widget needs so the carve does not push the
             // silhouette off the grid the panes sit on.
             let (edge, gap) = (window_pad(), pane_gap());
-            let (rx, ry, rw, rh) = bar_item_rect(edge, edge, BAR_ITEM_H);
+            let (rx, ry, rw, rh) = bar_item_rect(edge, edge - TOP_TRIM, BAR_ITEM_H);
             self.mail_button.set_rect(rx, ry, rw, rh);
             let folder_x = w_f32 - edge - FOLDER_W;
-            let (rx, ry, rw, rh) = bar_item_rect(folder_x, edge, FOLDER_W);
+            let (rx, ry, rw, rh) = bar_item_rect(folder_x, edge - TOP_TRIM, FOLDER_W);
             self.folder_dropdown.set_rect(rx, ry, rw, rh);
-            let (rx, ry, rw, rh) = bar_item_rect(folder_x - gap - ACCOUNT_W, edge, ACCOUNT_W);
+            let (rx, ry, rw, rh) = bar_item_rect(folder_x - gap - ACCOUNT_W, edge - TOP_TRIM, ACCOUNT_W);
             self.account_dropdown.set_rect(rx, ry, rw, rh);
 
             cce_ui::scale::set_scale_factor(scale as f32);
