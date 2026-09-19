@@ -3347,12 +3347,23 @@ impl ClearEmailApp {
             return None;
         }
         // Page-level bar geometry (the settings page look): the DE width
-        // widened, stood off the window's right edge by the configured inset.
+        // widened as `parameters_bg` and the settings pages widen theirs,
+        // stood off the window's right edge by the configured inset.
         let sb_w = cce_ui::layout::scrollbar_width() * 1.6;
         let sb_x = w - sb_w - cce_ui::layout::scrollbar_inset();
-        let thumb_h = (body_h * body_h / self.body_content_h).clamp(20.0, body_h);
-        let thumb_y = body_y + (self.body_scroll / max_scroll) * (body_h - thumb_h);
-        Some((sb_x, body_y, sb_w, body_h, thumb_y, thumb_h))
+        // The track stops 4px short at each end, which is what every toolkit
+        // bar does (`ScrollRegion::scrollbar_geom`, `paint_relief_scrollbar`,
+        // `parameters_bg`); this one alone used to run the full pane height.
+        let track_y = body_y + 4.0;
+        let track_h = (body_h - 8.0).max(0.0);
+        let visible_ratio = body_h / self.body_content_h.max(1.0);
+        let thumb_h = if track_h <= 20.0 {
+            track_h
+        } else {
+            (track_h * visible_ratio).clamp(20.0, track_h)
+        };
+        let thumb_y = track_y + (self.body_scroll / max_scroll) * (track_h - thumb_h);
+        Some((sb_x, track_y, sb_w, track_h, thumb_y, thumb_h))
     }
 
     /// Left press on the scrollbar strip (±4px slop like ScrollRegion): grab the
@@ -3691,6 +3702,11 @@ impl Application for ClearEmailApp {
         // translucent bg fill (dimly visible through it), a scroll raises it
         // over the cards; stood off the list's right edge by the DE inset.
         let email_list = ScrollRegion::new(54.0, 4.0)
+            // Frameless: the cards sit straight on the plate. Explicit because
+            // the prim paint path below honors `draw_frame` (default true) and
+            // would otherwise draw the legacy 1px bordered box the old tuple
+            // path silently ignored.
+            .with_frame(false)
             .with_sink_behind(true)
             .with_edge_inset(cce_ui::layout::scrollbar_inset());
 
@@ -4706,9 +4722,20 @@ impl Application for ClearEmailApp {
             cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.search_box, &mut *quads.pc);
         }
         {
-            let mut list_quads = Vec::new();
-            self.email_list.push_quads(&mut list_quads);
-            quads.extend(list_quads);
+            // A frameless sink-behind region leaves the layering to its host:
+            // the sunk bar goes down FIRST, under the list's translucent fill,
+            // so it reads dimly through the plate instead of over the cards.
+            // The framed path does this for itself inside `push_prims`.
+            if !self.email_list.scrollbar_raised() {
+                self.email_list.push_scrollbar_prims(&mut *quads.pc);
+            }
+            quads.push((
+                self.email_list.x,
+                self.email_list.y,
+                self.email_list.w,
+                self.email_list.h,
+                cce_ui::color::list_bg_color(),
+            ));
         }
 
         // Visible List Item Buttons — `get_item_draw_y` returns PARTIALLY
@@ -4737,12 +4764,10 @@ impl Application for ClearEmailApp {
         }
         quads.pc.pop_clip();
         // Scrollbar after the rows so the thumb rides on top of them instead of
-        // peeking through the inter-row gaps.
-        {
-            let mut sb_quads = Vec::new();
-            self.email_list.push_scrollbar_quads(&mut sb_quads);
-            quads.extend(sb_quads);
-        }
+        // peeking through the inter-row gaps. Frameless, so `push_prims` emits
+        // the raised layer alone — pills, the toolkit's own geometry and
+        // colors, rather than the square quads the tuple path drew.
+        self.email_list.push_prims(&mut *quads.pc);
 
         // 4. Detail View Area
         if let Some(selected_id) = self.selected_email_id {
@@ -4844,8 +4869,22 @@ impl Application for ClearEmailApp {
                         // through, so sunk is simply not drawn).
                         if self.body_sb_activity.raised() {
                             if let Some((sb_x, track_y, sb_w, track_h, thumb_y, thumb_h)) = self.body_scrollbar_geom() {
-                                quads.push((sb_x, track_y, sb_w, track_h, cce_ui::color::scrollbar_track_color()));
-                                quads.push((sb_x, thumb_y, sb_w, thumb_h, cce_ui::color::scrollbar_thumb_color()));
+                                // Pills, as `ScrollRegion::push_scrollbar_prims`
+                                // draws them: radius is half the shorter extent.
+                                use cce_ui::scene::layout::Rect;
+                                let all = (true, true, true, true);
+                                quads.pc.rounded_rect(
+                                    Rect { x: sb_x, y: track_y, width: sb_w, height: track_h },
+                                    sb_w.min(track_h) * 0.5,
+                                    all,
+                                    cce_ui::color::scrollbar_track_color(),
+                                );
+                                quads.pc.rounded_rect(
+                                    Rect { x: sb_x, y: thumb_y, width: sb_w, height: thumb_h },
+                                    sb_w.min(thumb_h) * 0.5,
+                                    all,
+                                    cce_ui::color::scrollbar_thumb_color(),
+                                );
                             }
                         }
 
