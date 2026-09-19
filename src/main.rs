@@ -644,6 +644,16 @@ fn pane_fill() -> [f32; 4] {
     c
 }
 
+/// The same material as a face for a CONTROL plate: the panes' colour and
+/// translucency, but positive alpha. A control plate lays its face through
+/// `inset_plate`, which emits a stroke prim rather than a quad, and the
+/// blur-behind sentinel only reaches quads — so a bar item shares the panes'
+/// colour and see-through-ness, and takes its relief from the control rung
+/// instead of a frost it cannot carry.
+fn bar_item_face() -> [f32; 4] {
+    cce_ui::color::list_bg_color()
+}
+
 /// The padding INSIDE a pane plate, between its rim and its content
 /// (`style.surface.plate.padding`, DE-wide — the pane rung's own value, 20
 /// here, where the root rung's [`pane_pad`] is 12). Uniform on all four
@@ -3814,12 +3824,19 @@ impl Application for ClearEmailApp {
         // unambiguous. The recessed bar chrome itself is carved in
         // display_list.
         let bar_font = cce_ui::layout::parse_font_string(&cce_ui::layout::menubar_font()).0;
-        let mail_button = Button::new_icon("mail", "Mail", 0.0, 0.0, BAR_ITEM_H, BAR_ITEM_H);
+        // A plate at the control rung, faced with the panes' own material:
+        // `with_raised` puts the button on a control plate instead of the
+        // plateless border idiom it drew before.
+        let mail_button = Button::new_icon("mail", "Mail", 0.0, 0.0, BAR_ITEM_H, BAR_ITEM_H)
+            .with_raised(true)
+            .with_bg(bar_item_face());
         let folder_dropdown = Dropdown::new(
             vec!["Inbox".to_string()],
             0,
         )
-        .with_font_family(&bar_font);
+        .with_font_family(&bar_font)
+        .with_raised(true)
+        .with_face(bar_item_face());
 
         let mut search_box = TextBox::new(String::new())
             .with_multiline(false)
@@ -3853,7 +3870,9 @@ impl Application for ClearEmailApp {
             account_dropdown_options(&accounts),
             selected_account_idx,
         )
-        .with_font_family(&bar_font);
+        .with_font_family(&bar_font)
+        .with_raised(true)
+        .with_face(bar_item_face());
 
         let mut detail_body = TextBox::new(String::new()).with_multiline(true).with_draw_bg_border(false);
         detail_body.font_size = 12.0;
@@ -4843,6 +4862,19 @@ impl Application for ClearEmailApp {
         // 1. General window background (deep slate blue)
         quads.push((0.0, 0.0, w_f32, h_f32, [0.05, 0.05, 0.07, 1.0]));
 
+        // Anything that must show THROUGH a frosted plate has to exist before
+        // the FIRST blur plate in the frame: that one takes the backdrop
+        // snapshot and every later one reuses it, even with ordinary draws in
+        // between. So both scrollbars' behind copies go down here, at full
+        // strength, ahead of the bar's items as well as the panes' plates —
+        // the bar items became plates too, which made THEM the frame's first
+        // blur plate and quietly flattened the panes until this moved up.
+        //
+        // Each plate ends up carrying the other pane's bar in its sampled
+        // backdrop; they do not overlap, so that costs nothing.
+        self.push_body_scrollbar(&mut *quads.pc, 1.0);
+        self.email_list.push_scrollbar_prims(&mut *quads.pc);
+
         // The bar carries no chrome of its own: it is flush with the root
         // plate, the same face as the content below it, and its widgets are
         // the only thing marking the band. It used to be a plateau one step
@@ -4862,24 +4894,6 @@ impl Application for ClearEmailApp {
         // cards span its full width — does.
         {
             let (px, py, pw, ph) = self.detail_pane_geom();
-            // BOTH panes' bars go down here, before EITHER plate, each at
-            // full strength: a frosted plate laid over one is what dims and
-            // blurs it, and that is what reads as the bar being behind the
-            // pane rather than drawn across it.
-            //
-            // The list's belongs to the block further down, with its own
-            // plate, and sat there until it came out invisible. A blur plate
-            // samples the frame so far, but only the FIRST one in a frame
-            // takes that snapshot — the second reuses it (the renderer's
-            // consecutive-blur-plate optimisation, which a non-blur draw
-            // between them did not defeat here). So the detail plate was
-            // frosting over a backdrop from before the list's bar existed.
-            // Emitting both bars ahead of both plates puts them in whichever
-            // snapshot gets taken. The two panes do not overlap, so each
-            // plate carrying the other's bar in its sampled backdrop costs
-            // nothing.
-            self.push_body_scrollbar(&mut *quads.pc, 1.0);
-            self.email_list.push_scrollbar_prims(&mut *quads.pc);
             quads.pc.rounded_rect(
                 cce_ui::scene::layout::Rect { x: px, y: py, width: pw, height: ph },
                 cce_ui::layout::list_corner_radius(),
