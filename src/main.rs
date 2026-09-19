@@ -615,9 +615,14 @@ fn pane_gap() -> f32 {
     cce_ui::layout::root_plate_gap()
 }
 
-/// How far the detail pane's content sits inside ITS plate. Padding within a
-/// pane, not around one, so it is not `pane_pad`.
-const DETAIL_PAD: f32 = 15.0;
+/// The padding INSIDE a pane plate, between its rim and its content
+/// (`style.surface.plate.padding`, DE-wide — the pane rung's own value, 20
+/// here, where the root rung's [`pane_pad`] is 12). Uniform on all four
+/// sides: the detail pane used to carry 15 at the sides, 18 above its
+/// subject and 20 under its body.
+fn pane_inner_pad() -> f32 {
+    cce_ui::layout::plate_padding()
+}
 const LIST_W_DEFAULT: f32 = 300.0;
 const LIST_W_MIN: f32 = 180.0;
 /// The detail pane never gets squeezed below this by a drag or a narrow window.
@@ -640,19 +645,20 @@ const CONTEXT_ROW_H: f32 = 24.0;
 const SEARCH_ROW_H: f32 = 26.0;
 
 // Detail-pane vertical layout, every offset measured from the pane plate's
-// top edge (`detail_origin_y`) — they were measured from the menubar back
-// when the pane had no plate of its own and sat straight on the root. These
-// were literals scattered across paint, layout, the scrollbar geometry and
-// three input handlers; the 170/190 pair in particular had to move in
+// top-left of its CONTENT — the plate's rim taken in by `pane_inner_pad`
+// (`detail_origin_y`). They were measured from the menubar back when the pane
+// had no plate of its own, and carried the padding baked into each value;
+// the subject now sits at 0 because the origin already is the padded corner.
+// These were literals scattered across paint, layout, the scrollbar geometry
+// and three input handlers; the 170/190 pair in particular had to move in
 // lockstep or the scrollbar detached from the text it scrolls, so the body
 // pair lives behind `detail_body_geom` as one source.
-const DETAIL_SUBJECT_Y: f32 = 18.0;
-const DETAIL_FROM_Y: f32 = 43.0;
-const DETAIL_TO_Y: f32 = 63.0;
-const DETAIL_DATE_Y: f32 = 83.0;
-const DETAIL_CHIPS_Y: f32 = 98.0;
-const DETAIL_BODY_Y: f32 = 128.0;
-const DETAIL_BODY_BOTTOM_PAD: f32 = 20.0;
+const DETAIL_SUBJECT_Y: f32 = 0.0;
+const DETAIL_FROM_Y: f32 = 25.0;
+const DETAIL_TO_Y: f32 = 45.0;
+const DETAIL_DATE_Y: f32 = 65.0;
+const DETAIL_CHIPS_Y: f32 = 80.0;
+const DETAIL_BODY_Y: f32 = 110.0;
 
 // Compose modal geometry. One source of truth: the background quads, the
 // input rects, the labels, the chip row and the outside-click test all
@@ -2979,7 +2985,7 @@ impl ClearEmailApp {
         // The grab band rides the gap's centre line; the detail plate starts a
         // whole gap past the list, and its content one plate padding inside.
         let sep = pad + lw + gap / 2.0;
-        (lw, sep, pad + lw + gap + DETAIL_PAD)
+        (lw, sep, pad + lw + gap + pane_inner_pad())
     }
 
     /// The email list's band: (top y, height). The search row above it only
@@ -3007,9 +3013,10 @@ impl ClearEmailApp {
         (x, top, w, h)
     }
 
-    /// The y the pane's own offsets are measured from: its plate's top edge.
+    /// The y the pane's own offsets are measured from: the top of its content,
+    /// which is its plate's top edge taken in by the plate padding.
     fn detail_origin_y(&self) -> f32 {
-        self.detail_pane_geom().1
+        self.detail_pane_geom().1 + pane_inner_pad()
     }
 
     /// The body scrollbar's lane inside the plate: (x, width). Independent of
@@ -3272,7 +3279,7 @@ impl ClearEmailApp {
         let mut out = Vec::new();
         let y = self.detail_origin_y() + DETAIL_CHIPS_Y;
         let (px, _, pw, _) = self.detail_pane_geom();
-        let mut right = px + pw - DETAIL_PAD;
+        let mut right = px + pw - pane_inner_pad();
         let mut add = |label: String, chip: HtmlChip| {
             let w = label.chars().count() as f32 * 6.0 + 16.0;
             right -= w;
@@ -3396,7 +3403,7 @@ impl ClearEmailApp {
         let top = self.detail_origin_y() + DETAIL_BODY_Y;
         let (_, py, _, ph) = self.detail_pane_geom();
         // The body stops short of the plate's bottom edge, not the window's.
-        let h = ((py + ph - DETAIL_BODY_BOTTOM_PAD) - top).max(100.0);
+        let h = ((py + ph - pane_inner_pad()) - top).max(100.0);
         (top, h)
     }
 
