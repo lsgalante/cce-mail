@@ -205,10 +205,14 @@ impl EmailKeys {
 struct ClearEmailApp {
     keys: EmailKeys,
 
-    // Navigation / Sidebar — the whole bar is Dropdowns (MenuBar retired):
-    // two menu-button dropdowns (custom_display_text = fixed trigger label,
-    // rows are commands that re-fire on repeat) and two selection dropdowns.
-    mail_menu: cce_ui::widget::Adapted<Dropdown>,
+    // Navigation / Sidebar (MenuBar retired): a mail-icon button on the
+    // left whose click pops the app menu (New Message / Sync Now / Quit)
+    // through the toolkit context menu, and two selection dropdowns on
+    // the right.
+    /// The app menu trigger: the cce-icons `mail` glyph, plateless. Its
+    /// rows fire through `context_menu_actions`, the same path as a card's
+    /// right-click menu, so the bar owns no second menu implementation.
+    mail_button: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     /// Folder switcher: options[0] carries the live inbox unread count
     /// ("Inbox (6)"), refreshed each rebuild, so rows and trigger agree.
     folder_dropdown: cce_ui::widget::Adapted<Dropdown>,
@@ -585,6 +589,10 @@ fn save_emails_for_account(email: &str, emails: &[Email]) {
 /// text part come down the wire, so attachments never inflate a sync.
 /// Menubar height; all chrome below the bar offsets by this.
 const MENUBAR_H: f32 = 36.0;
+/// The mail-icon app-menu button: square, centred in the bar's height, at a
+/// fixed inset from the left edge (the slot the "Mail" text menu used to fill).
+const MAIL_BUTTON_PX: f32 = 26.0;
+const MAIL_BUTTON_X: f32 = 8.0;
 
 // List/detail split geometry. The list band starts at LIST_X; the separator
 // line sits LIST_SEP_GAP after the band and the detail pane LIST_DETAIL_GAP
@@ -2821,7 +2829,7 @@ impl ClearEmailApp {
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.compose_body.id(), self.compose_body.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.mail_menu.id(), self.mail_menu.as_ptr_mut());
+        let (id, ptr) = (self.mail_button.id(), self.mail_button.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.folder_dropdown.id(), self.folder_dropdown.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
@@ -3049,6 +3057,21 @@ impl ClearEmailApp {
                     || e.body.to_lowercase().contains(&search_lower)
             })
             .collect()
+    }
+
+    /// The app menu, hung off the bottom of the bar under the mail-icon
+    /// button. Same context-menu plumbing as a card's right-click menu:
+    /// labels to the toolkit, messages into the parallel
+    /// `context_menu_actions`, fired by `context_menu_press`.
+    fn open_mail_menu(&mut self) {
+        let (bx, _, _, _) = self.mail_button.rect();
+        let options = vec!["New Message".to_string(), "Sync Now".to_string(), "Quit".to_string()];
+        self.context_menu_actions = vec![
+            Some(AppMessage::ComposeNew),
+            Some(AppMessage::SyncNow),
+            Some(AppMessage::Quit),
+        ];
+        cce_ui::widget::context_menu::show(bx, MENUBAR_H, options, 0, self.mail_button.id());
     }
 
     /// Right-press on a message card: open its context menu at the pointer.
@@ -3644,19 +3667,14 @@ impl Application for ClearEmailApp {
     fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
         cce_ui::scale::set_scale_factor(1.0);
 
-        // The bar: three Dropdowns. Mail is a menu-button dropdown (fixed
-        // trigger label, command rows that re-fire on repeat — the
-        // custom_display_text mode); folder + account are selection dropdowns.
-        // Per-message actions are not here: they live on each card's
-        // right-click context menu, where the target is unambiguous.
-        // The recessed bar chrome itself is carved in display_list.
+        // The bar: the mail-icon app-menu button (its commands pop as a
+        // context menu, see `open_mail_menu`) and two selection dropdowns
+        // for folder + account. Per-message actions are not here: they live
+        // on each card's right-click context menu, where the target is
+        // unambiguous. The recessed bar chrome itself is carved in
+        // display_list.
         let bar_font = cce_ui::layout::parse_font_string(&cce_ui::layout::menubar_font()).0;
-        let mail_menu = Dropdown::new(
-            vec!["New Message".to_string(), "Sync Now".to_string(), "Quit".to_string()],
-            0,
-        )
-        .with_custom_display_text("Mail")
-        .with_font_family(&bar_font);
+        let mail_button = Button::new_icon("mail", "Mail", 0.0, 0.0, MAIL_BUTTON_PX, MAIL_BUTTON_PX);
         let folder_dropdown = Dropdown::new(
             vec!["Inbox".to_string()],
             0,
@@ -3751,7 +3769,7 @@ impl Application for ClearEmailApp {
             secret_missing_reported: false,
             backfill_at: None,
             keys: EmailKeys::load(),
-            mail_menu,
+            mail_button,
             folder_dropdown,
             account_dropdown,
             search_box,
@@ -4490,9 +4508,6 @@ impl Application for ClearEmailApp {
             // feeds the dl-text occlusion clamp, and the popover pass at the
             // end of this function draws it on top of everything.
             self.ui_context.clear_popovers();
-            if self.mail_menu.popover_rect().is_some() {
-                self.ui_context.register_popover(&mut self.mail_menu);
-            }
             if self.folder_dropdown.popover_rect().is_some() {
                 self.ui_context.register_popover(&mut self.folder_dropdown);
             }
@@ -4523,10 +4538,15 @@ impl Application for ClearEmailApp {
                 .iter()
                 .position(|f| f.tag == self.current_folder)
                 .unwrap_or(0);
-            // Menus left; selectors right at fixed offsets from the edge —
-            // anchoring to the folder label would make the account switcher
-            // drift as the folder name changes length.
-            self.mail_menu.set_rect(8.0, 5.0, 80.0, 26.0);
+            // Menu button left; selectors right at fixed offsets from the
+            // edge — anchoring to the folder label would make the account
+            // switcher drift as the folder name changes length.
+            self.mail_button.set_rect(
+                MAIL_BUTTON_X,
+                (MENUBAR_H - MAIL_BUTTON_PX) / 2.0,
+                MAIL_BUTTON_PX,
+                MAIL_BUTTON_PX,
+            );
             self.folder_dropdown.set_rect(w_f32 - 142.0, 5.0, 134.0, 26.0);
             self.account_dropdown.set_rect(w_f32 - 360.0, 5.0, 210.0, 26.0);
 
@@ -4681,7 +4701,7 @@ impl Application for ClearEmailApp {
                 (false, false, true, false),
             );
         }
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.mail_menu, &mut *quads.pc);
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.mail_button, &mut *quads.pc);
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.folder_dropdown, &mut *quads.pc);
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.account_dropdown, &mut *quads.pc);
 
@@ -5042,7 +5062,7 @@ impl Application for ClearEmailApp {
         let mv = cce_ui::widget::Event::PointerMove { x: px, y: py, local_x: px, local_y: py };
         let ctx = &mut self.ui_context;
 
-        if ctx.propagate_event(&mv, self.mail_menu.id()) { changed = true; }
+        if ctx.propagate_event(&mv, self.mail_button.id()) { changed = true; }
         if ctx.propagate_event(&mv, self.folder_dropdown.id()) { changed = true; }
 
         if self.compose_open {
@@ -5266,19 +5286,16 @@ impl Application for ClearEmailApp {
             }
         }
 
-        // The menu-button dropdowns — command rows; take_change re-fires on
-        // the same row (custom_display_text mode), so Sync Now works twice.
-        if ctx.propagate_event(&ev, self.mail_menu.id()) {
-            if self.mail_menu.take_change() {
-                msg_out = match self.mail_menu.selected {
-                    0 => Some(AppMessage::ComposeNew),
-                    1 => Some(AppMessage::SyncNow),
-                    _ => Some(AppMessage::Quit),
-                };
+        // The mail-icon button: a click pops the app menu under it. The
+        // rows fire on the NEXT press, through the context-menu gate at the
+        // top of this function.
+        if ctx.propagate_event(&ev, self.mail_button.id()) {
+            if state == ElementState::Released && self.mail_button.take_click() {
+                self.open_mail_menu();
             }
             *needs_rebuild = true;
             self.needs_rebuild = true;
-            return msg_out;
+            return None;
         }
         // Folder switcher.
         if ctx.propagate_event(&ev, self.folder_dropdown.id()) {
@@ -5579,19 +5596,6 @@ impl Application for ClearEmailApp {
                         self.account_dropdown.selected = self.selected_account_idx;
                         msg_out = Some(AppMessage::ManageAccounts);
                     }
-                }
-                *needs_rebuild = true;
-                self.needs_rebuild = true;
-                return msg_out;
-            }
-        } else if self.mail_menu.open {
-            if self.ui_context.propagate_event(&kev, self.mail_menu.id()) {
-                if self.mail_menu.take_change() {
-                    msg_out = match self.mail_menu.selected {
-                        0 => Some(AppMessage::ComposeNew),
-                        1 => Some(AppMessage::SyncNow),
-                        _ => Some(AppMessage::Quit),
-                    };
                 }
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
