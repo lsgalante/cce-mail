@@ -3764,15 +3764,16 @@ impl Application for ClearEmailApp {
 
         // Designer raise/sink treatment: idle the bar sinks under the list's
         // translucent bg fill (dimly visible through it), a scroll raises it
-        // over the cards; stood off the list's right edge by the DE inset.
+        // over the cards. It rides the plate's centre line, not its right rim
+        // — `edge_inset` is set from the band width in the layout pass below,
+        // because the splitter makes that width move.
         let email_list = ScrollRegion::new(54.0, 4.0)
             // Frameless: the cards sit straight on the plate. Explicit because
             // the prim paint path below honors `draw_frame` (default true) and
             // would otherwise draw the legacy 1px bordered box the old tuple
             // path silently ignored.
             .with_frame(false)
-            .with_sink_behind(true)
-            .with_edge_inset(cce_ui::layout::scrollbar_inset());
+            .with_sink_behind(true);
 
         let accounts = load_accounts();
         // Last-used account wins (sidecar file), else the configured default:
@@ -4660,6 +4661,12 @@ impl Application for ClearEmailApp {
             let (list_top, list_h) = self.list_geom();
             self.email_list.set_rect(list_x, list_top, list_w, list_h);
             self.email_list.update_bounds(list_count, list_top, list_h);
+            // Centre the bar on the plate: `edge_inset` is measured in from the
+            // RIGHT rim, so half the width the bar does not occupy puts the
+            // bar's own centre line on the plate's. Recomputed here rather than
+            // fixed at construction because the splitter moves `list_w`.
+            self.email_list.edge_inset =
+                (list_w - cce_ui::layout::scrollbar_width()) / 2.0;
 
             if self.email_buttons.len() != list_count {
                 // Widget ids are globally monotonic and never reused, so the fresh buttons
