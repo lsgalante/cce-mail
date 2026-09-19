@@ -4556,7 +4556,7 @@ impl Application for ClearEmailApp {
         let current_folder_str = self.current_folder.clone();
 
         let list_x = LIST_X;
-        let (list_w, separator_x, detail_x) = self.split_geom();
+        let (list_w, _separator_x, detail_x) = self.split_geom();
 
         if self.needs_rebuild || size_changed {
             // Bar layout — every open dropdown is a popover: registration
@@ -4752,8 +4752,11 @@ impl Application for ClearEmailApp {
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.folder_dropdown, &mut *quads.pc);
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.account_dropdown, &mut *quads.pc);
 
-        // 3. The detail pane's plate, and the separator seam between the two.
-        // Same fill and same radius as the list: the two panes are one pair.
+        // 3. The detail pane's plate. Same fill and same radius as the list:
+        // the two panes are one pair, and the gap between them is the seam —
+        // there is no drawn separator line. The split is still draggable in
+        // that gap; `cursor_icon` puts resize arrows over the grab band, which
+        // is what advertises it now that nothing is painted there.
         // Nothing here reaches the plate's corners (the body carries its own
         // text bounds), so this needs no rounded clip the way the list — whose
         // cards span its full width — does.
@@ -4766,7 +4769,6 @@ impl Application for ClearEmailApp {
                 cce_ui::color::list_bg_color(),
             );
         }
-        quads.push((separator_x, MENUBAR_H, 1.0, h_f32 - MENUBAR_H, [0.18, 0.18, 0.22, 1.0]));
 
         // Search band (only while open) and the list
         if self.search_open {
@@ -5085,9 +5087,10 @@ impl Application for ClearEmailApp {
     }
 
     fn cursor_icon(&self, x: f32, y: f32) -> Option<CursorIcon> {
-        // Resize arrows over the split separator's grab band, and for the
-        // whole drag — mid-drag the pointer legally outruns the clamped
-        // line, and the cursor must not flicker back to the arrow there.
+        // Resize arrows over the split's grab band — the only thing marking
+        // the split now that the separator line is gone — and for the whole
+        // drag: mid-drag the pointer legally outruns the clamped split, and
+        // the cursor must not flicker back to the arrow there.
         if !self.compose_open
             && !cce_ui::widget::context_menu::is_visible()
             && (self.split_dragging
