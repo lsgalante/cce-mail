@@ -585,14 +585,31 @@ fn save_emails_for_account(email: &str, emails: &[Email]) {
     }
 }
 
-/// Newest-N window fetched per sync. Only headers, structure, and the chosen
-/// text part come down the wire, so attachments never inflate a sync.
-/// Menubar height; all chrome below the bar offsets by this.
-const MENUBAR_H: f32 = 36.0;
-/// The mail-icon app-menu button: square, centred in the bar's height, at a
-/// fixed inset from the left edge (the slot the "Mail" text menu used to fill).
-const MAIL_BUTTON_PX: f32 = 26.0;
-const MAIL_BUTTON_X: f32 = 8.0;
+/// Inset from the WINDOW's outer edge to anything standing on the root
+/// plate. The plate's rolled rim eats the first `bevel_width` before its face
+/// even begins, so a bare [`pane_pad`] leaves a visibly thinner gap at the
+/// window's edges than between two things on the face — measured at 4px
+/// against 12px. Adding the roll makes every gap in the window read the same.
+fn window_pad() -> f32 {
+    cce_ui::layout::bevel_width() + pane_pad()
+}
+
+/// Height of one menubar control — the mail button and both switchers.
+const BAR_ITEM_H: f32 = 26.0;
+
+/// The menubar band's height. One padding above its items, which then sit
+/// flush with the band's bottom edge, so the gap from an item down to the
+/// plates below is that same padding again (`list_geom` adds it). That is
+/// what makes every vertical gap in the window one number: window rim to
+/// items, items to plates, plates to rim.
+fn menubar_h() -> f32 {
+    window_pad() + BAR_ITEM_H
+}
+
+/// Widths of the two switchers in the bar; their heights and every gap
+/// around them come from [`BAR_ITEM_H`] and the DE spacings.
+const FOLDER_W: f32 = 134.0;
+const ACCOUNT_W: f32 = 210.0;
 
 // List/detail split geometry. `list_w` (the list plate's width) is the one
 // draggable value — everything else derives from it through `split_geom`,
@@ -733,6 +750,8 @@ fn detail_chip_rects(atts: &[RemoteAttachment], detail_x: f32, origin_y: f32) ->
     rects
 }
 
+/// Newest-N window fetched per sync. Only headers, structure, and the chosen
+/// text part come down the wire, so attachments never inflate a sync.
 const FETCH_COUNT: usize = 50;
 
 /// Ceiling on how much one sync pass downloads. A mailbox with years of
@@ -2989,27 +3008,27 @@ impl ClearEmailApp {
     /// layout, and every hit-test — the stored `list_w` preference is never
     /// mutated by a window resize, only re-clamped here.
     fn split_geom(&self) -> (f32, f32, f32) {
-        let (pad, gap) = (pane_pad(), pane_gap());
+        let (edge, gap) = (window_pad(), pane_gap());
         // What is left for the detail plate once both outer gutters and the
         // split gap are taken: it may not fall under DETAIL_W_MIN.
-        let max_w = (self.width as f32 - 2.0 * pad - gap - DETAIL_W_MIN).max(LIST_W_MIN);
+        let max_w = (self.width as f32 - 2.0 * edge - gap - DETAIL_W_MIN).max(LIST_W_MIN);
         let lw = self.list_w.clamp(LIST_W_MIN, max_w);
         // The grab band rides the gap's centre line; the detail plate starts a
         // whole gap past the list, and its content one plate padding inside.
-        let sep = pad + lw + gap / 2.0;
-        (lw, sep, pad + lw + gap + pane_inner_pad())
+        let sep = edge + lw + gap / 2.0;
+        (lw, sep, edge + lw + gap + pane_inner_pad())
     }
 
     /// The email list's band: (top y, height). The search row above it only
     /// exists while the band is open, and the list takes that strip back when
     /// it closes — so nothing hardcodes the top.
     fn list_geom(&self) -> (f32, f32) {
-        let pad = pane_pad();
-        // One padding below the bar; the open search band and its own gap push
-        // the plate further down.
+        // One padding below the bar's items (an interior gap); the open search
+        // band and its own gap push the plate further down. The bottom is a
+        // WINDOW edge, so it clears the plate's roll as well.
         let band = if self.search_open { SEARCH_ROW_H + pane_gap() } else { 0.0 };
-        let top = MENUBAR_H + pad + band;
-        (top, (self.height as f32 - top - pad).max(50.0))
+        let top = menubar_h() + pane_pad() + band;
+        (top, (self.height as f32 - top - window_pad()).max(50.0))
     }
 
     /// The detail pane's plate: (x, y, w, h). It shares the list's vertical
@@ -3019,9 +3038,8 @@ impl ClearEmailApp {
     fn detail_pane_geom(&self) -> (f32, f32, f32, f32) {
         let (lw, _, _) = self.split_geom();
         let (top, h) = self.list_geom();
-        let pad = pane_pad();
-        let x = pad + lw + pane_gap();
-        let w = ((self.width as f32 - pad) - x).max(DETAIL_W_MIN);
+        let x = window_pad() + lw + pane_gap();
+        let w = ((self.width as f32 - window_pad()) - x).max(DETAIL_W_MIN);
         (x, top, w, h)
     }
 
@@ -3186,7 +3204,7 @@ impl ClearEmailApp {
             Some(AppMessage::SyncNow),
             Some(AppMessage::Quit),
         ];
-        cce_ui::widget::context_menu::show(bx, MENUBAR_H, options, 0, self.mail_button.id());
+        cce_ui::widget::context_menu::show(bx, menubar_h(), options, 0, self.mail_button.id());
     }
 
     /// Right-press on a message card: open its context menu at the pointer.
@@ -3542,7 +3560,7 @@ impl ClearEmailApp {
         let w_f32 = self.width as f32;
         let h_f32 = self.height as f32;
 
-        let list_x = pane_pad();
+        let list_x = window_pad();
         let (list_w, _separator_x, detail_x) = self.split_geom();
         // Row-label char budgets scale with the band; the bases are the
         // hand-tuned counts at the 300px default.
@@ -3796,7 +3814,7 @@ impl Application for ClearEmailApp {
         // unambiguous. The recessed bar chrome itself is carved in
         // display_list.
         let bar_font = cce_ui::layout::parse_font_string(&cce_ui::layout::menubar_font()).0;
-        let mail_button = Button::new_icon("mail", "Mail", 0.0, 0.0, MAIL_BUTTON_PX, MAIL_BUTTON_PX);
+        let mail_button = Button::new_icon("mail", "Mail", 0.0, 0.0, BAR_ITEM_H, BAR_ITEM_H);
         let folder_dropdown = Dropdown::new(
             vec!["Inbox".to_string()],
             0,
@@ -4628,7 +4646,7 @@ impl Application for ClearEmailApp {
 
         let current_folder_str = self.current_folder.clone();
 
-        let list_x = pane_pad();
+        let list_x = window_pad();
         let (list_w, _separator_x, detail_x) = self.split_geom();
 
         if self.needs_rebuild || size_changed {
@@ -4669,14 +4687,17 @@ impl Application for ClearEmailApp {
             // Menu button left; selectors right at fixed offsets from the
             // edge — anchoring to the folder label would make the account
             // switcher drift as the folder name changes length.
-            self.mail_button.set_rect(
-                MAIL_BUTTON_X,
-                (MENUBAR_H - MAIL_BUTTON_PX) / 2.0,
-                MAIL_BUTTON_PX,
-                MAIL_BUTTON_PX,
-            );
-            self.folder_dropdown.set_rect(w_f32 - 142.0, 5.0, 134.0, 26.0);
-            self.account_dropdown.set_rect(w_f32 - 360.0, 5.0, 210.0, 26.0);
+            // The bar row on the same two spacings as everything else: one
+            // padding in from each rim, one gap between siblings (which is
+            // the case `root_plate_gap` names as "control rows"). The items
+            // hang from the band's top padding, so their bottoms are flush
+            // with it and the plates below clear them by one padding.
+            let (edge, gap) = (window_pad(), pane_gap());
+            self.mail_button.set_rect(edge, edge, BAR_ITEM_H, BAR_ITEM_H);
+            let folder_x = w_f32 - edge - FOLDER_W;
+            self.folder_dropdown.set_rect(folder_x, edge, FOLDER_W, BAR_ITEM_H);
+            self.account_dropdown
+                .set_rect(folder_x - gap - ACCOUNT_W, edge, ACCOUNT_W, BAR_ITEM_H);
 
             cce_ui::scale::set_scale_factor(scale as f32);
 
@@ -4684,7 +4705,7 @@ impl Application for ClearEmailApp {
             // when closed so a stale rect can't be hit by anything that still
             // routes to it.
             if self.search_open {
-                self.search_box.set_rect(list_x, MENUBAR_H + pane_pad(), list_w, SEARCH_ROW_H);
+                self.search_box.set_rect(list_x, menubar_h() + pane_pad(), list_w, SEARCH_ROW_H);
             } else {
                 self.search_box.set_rect(-9999.0, -9999.0, 0.0, 0.0);
             }
@@ -5171,7 +5192,7 @@ impl Application for ClearEmailApp {
         if !self.compose_open
             && !cce_ui::widget::context_menu::is_visible()
             && (self.split_dragging
-                || ((x - self.split_geom().1).abs() <= SPLIT_GRAB_SLOP && y > MENUBAR_H))
+                || ((x - self.split_geom().1).abs() <= SPLIT_GRAB_SLOP && y > menubar_h()))
         {
             return Some(CursorIcon::EwResize);
         }
@@ -5222,11 +5243,11 @@ impl Application for ClearEmailApp {
         // neither pane collapses. Clamp into the stored value (not just at
         // paint) so the release persists what the user actually sees.
         if !self.compose_open && self.split_dragging {
-            let (pad, gap) = (pane_pad(), pane_gap());
-            let max_w = (self.width as f32 - 2.0 * pad - gap - DETAIL_W_MIN).max(LIST_W_MIN);
+            let (edge, gap) = (window_pad(), pane_gap());
+            let max_w = (self.width as f32 - 2.0 * edge - gap - DETAIL_W_MIN).max(LIST_W_MIN);
             // The pointer holds the gap's centre line, which is where the grab
             // band is — so the list ends half a gap back from it.
-            let new_w = (px - pad - gap / 2.0).clamp(LIST_W_MIN, max_w);
+            let new_w = (px - edge - gap / 2.0).clamp(LIST_W_MIN, max_w);
             if (new_w - self.list_w).abs() > 0.5 {
                 self.list_w = new_w;
                 changed = true;
@@ -5349,7 +5370,7 @@ impl Application for ClearEmailApp {
                     self.split_dragging = false;
                     // Grab the list/detail separator (±slop, below the bar).
                     let separator_x = self.split_geom().1;
-                    if (px - separator_x).abs() <= SPLIT_GRAB_SLOP && py > MENUBAR_H {
+                    if (px - separator_x).abs() <= SPLIT_GRAB_SLOP && py > menubar_h() {
                         self.split_dragging = true;
                         *needs_rebuild = true;
                         self.needs_rebuild = true;
