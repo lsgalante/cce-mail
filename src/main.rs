@@ -594,18 +594,30 @@ const MENUBAR_H: f32 = 36.0;
 const MAIL_BUTTON_PX: f32 = 26.0;
 const MAIL_BUTTON_X: f32 = 8.0;
 
-// List/detail split geometry. The list band starts at LIST_X; the separator
-// line sits LIST_SEP_GAP after the band and the detail pane LIST_DETAIL_GAP
-// after the separator. `list_w` (the band width) is the one draggable value —
-// everything else derives from it through `split_geom`.
-const LIST_X: f32 = 10.0;
-const LIST_SEP_GAP: f32 = 10.0;
-/// How far the detail pane's content sits inside its plate. Also the gap
-/// from the separator line to the plate's left edge, which is LIST_SEP_GAP
-/// so the line is centred between the two plates rather than hugging one.
+// List/detail split geometry. `list_w` (the list plate's width) is the one
+// draggable value — everything else derives from it through `split_geom`,
+// against the two DE-wide spacings below.
+
+/// The gutter between the window plate's rim and what sits on it
+/// (`style.surface.plate.root.padding`, DE-wide). EVERY inset around the
+/// panes is this one value — left, right, under the menubar, bottom — so the
+/// frame around them is uniform. cce-mail used to carry its own 10 for the
+/// sides and 15 for top and bottom.
+fn pane_pad() -> f32 {
+    cce_ui::layout::root_plate_padding()
+}
+
+/// The gap between sibling objects on the window plate
+/// (`style.surface.plate.root.gap`, DE-wide) — its own docs name pane splits
+/// as the case. One gap separates the two panes, with the drag band on its
+/// centre line.
+fn pane_gap() -> f32 {
+    cce_ui::layout::root_plate_gap()
+}
+
+/// How far the detail pane's content sits inside ITS plate. Padding within a
+/// pane, not around one, so it is not `pane_pad`.
 const DETAIL_PAD: f32 = 15.0;
-/// Separator line to detail CONTENT: across the gap, then the plate's padding.
-const LIST_DETAIL_GAP: f32 = LIST_SEP_GAP + DETAIL_PAD;
 const LIST_W_DEFAULT: f32 = 300.0;
 const LIST_W_MIN: f32 = 180.0;
 /// The detail pane never gets squeezed below this by a drag or a narrow window.
@@ -625,10 +637,7 @@ const CONTEXT_ROW_H: f32 = 24.0;
 // The search band. It is not permanent chrome: the `open_search` chord
 // ("/" by default) reveals and focuses it, and closing hands its strip back
 // to the list, so `list_geom` is the single source for where the rows start.
-const SEARCH_ROW_Y: f32 = 15.0;
 const SEARCH_ROW_H: f32 = 26.0;
-const LIST_TOP_WITH_SEARCH: f32 = 55.0;
-const LIST_BOTTOM_PAD: f32 = 15.0;
 
 // Detail-pane vertical layout, every offset measured from the pane plate's
 // top edge (`detail_origin_y`) — they were measured from the menubar back
@@ -2962,19 +2971,27 @@ impl ClearEmailApp {
     /// layout, and every hit-test — the stored `list_w` preference is never
     /// mutated by a window resize, only re-clamped here.
     fn split_geom(&self) -> (f32, f32, f32) {
-        let max_w = (self.width as f32 - LIST_X - LIST_SEP_GAP - LIST_DETAIL_GAP - DETAIL_W_MIN)
-            .max(LIST_W_MIN);
+        let (pad, gap) = (pane_pad(), pane_gap());
+        // What is left for the detail plate once both outer gutters and the
+        // split gap are taken: it may not fall under DETAIL_W_MIN.
+        let max_w = (self.width as f32 - 2.0 * pad - gap - DETAIL_W_MIN).max(LIST_W_MIN);
         let lw = self.list_w.clamp(LIST_W_MIN, max_w);
-        let sep = LIST_X + lw + LIST_SEP_GAP;
-        (lw, sep, sep + LIST_DETAIL_GAP)
+        // The grab band rides the gap's centre line; the detail plate starts a
+        // whole gap past the list, and its content one plate padding inside.
+        let sep = pad + lw + gap / 2.0;
+        (lw, sep, pad + lw + gap + DETAIL_PAD)
     }
 
     /// The email list's band: (top y, height). The search row above it only
     /// exists while the band is open, and the list takes that strip back when
     /// it closes — so nothing hardcodes the top.
     fn list_geom(&self) -> (f32, f32) {
-        let top = if self.search_open { LIST_TOP_WITH_SEARCH } else { SEARCH_ROW_Y } + MENUBAR_H;
-        (top, (self.height as f32 - top - LIST_BOTTOM_PAD).max(50.0))
+        let pad = pane_pad();
+        // One padding below the bar; the open search band and its own gap push
+        // the plate further down.
+        let band = if self.search_open { SEARCH_ROW_H + pane_gap() } else { 0.0 };
+        let top = MENUBAR_H + pad + band;
+        (top, (self.height as f32 - top - pad).max(50.0))
     }
 
     /// The detail pane's plate: (x, y, w, h). It shares the list's vertical
@@ -2982,10 +2999,11 @@ impl ClearEmailApp {
     /// right — two plates either side of the separator, which the equal gaps
     /// leave centred between them.
     fn detail_pane_geom(&self) -> (f32, f32, f32, f32) {
-        let (_, sep, _) = self.split_geom();
+        let (lw, _, _) = self.split_geom();
         let (top, h) = self.list_geom();
-        let x = sep + LIST_SEP_GAP;
-        let w = ((self.width as f32 - LIST_X) - x).max(DETAIL_W_MIN);
+        let pad = pane_pad();
+        let x = pad + lw + pane_gap();
+        let w = ((self.width as f32 - pad) - x).max(DETAIL_W_MIN);
         (x, top, w, h)
     }
 
@@ -3470,7 +3488,7 @@ impl ClearEmailApp {
         let w_f32 = self.width as f32;
         let h_f32 = self.height as f32;
 
-        let list_x = LIST_X;
+        let list_x = pane_pad();
         let (list_w, _separator_x, detail_x) = self.split_geom();
         // Row-label char budgets scale with the band; the bases are the
         // hand-tuned counts at the 300px default.
@@ -4555,7 +4573,7 @@ impl Application for ClearEmailApp {
 
         let current_folder_str = self.current_folder.clone();
 
-        let list_x = LIST_X;
+        let list_x = pane_pad();
         let (list_w, _separator_x, detail_x) = self.split_geom();
 
         if self.needs_rebuild || size_changed {
@@ -4611,7 +4629,7 @@ impl Application for ClearEmailApp {
             // when closed so a stale rect can't be hit by anything that still
             // routes to it.
             if self.search_open {
-                self.search_box.set_rect(list_x, SEARCH_ROW_Y + MENUBAR_H, list_w, SEARCH_ROW_H);
+                self.search_box.set_rect(list_x, MENUBAR_H + pane_pad(), list_w, SEARCH_ROW_H);
             } else {
                 self.search_box.set_rect(-9999.0, -9999.0, 0.0, 0.0);
             }
@@ -5145,9 +5163,11 @@ impl Application for ClearEmailApp {
         // neither pane collapses. Clamp into the stored value (not just at
         // paint) so the release persists what the user actually sees.
         if !self.compose_open && self.split_dragging {
-            let max_w = (self.width as f32 - LIST_X - LIST_SEP_GAP - LIST_DETAIL_GAP - DETAIL_W_MIN)
-                .max(LIST_W_MIN);
-            let new_w = (px - LIST_X - LIST_SEP_GAP).clamp(LIST_W_MIN, max_w);
+            let (pad, gap) = (pane_pad(), pane_gap());
+            let max_w = (self.width as f32 - 2.0 * pad - gap - DETAIL_W_MIN).max(LIST_W_MIN);
+            // The pointer holds the gap's centre line, which is where the grab
+            // band is — so the list ends half a gap back from it.
+            let new_w = (px - pad - gap / 2.0).clamp(LIST_W_MIN, max_w);
             if (new_w - self.list_w).abs() > 0.5 {
                 self.list_w = new_w;
                 changed = true;
