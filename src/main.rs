@@ -595,11 +595,34 @@ fn save_emails_for_account(email: &str, emails: &[Email]) {
 /// window's edges than between two things on the face — measured at 4px
 /// against 12px. Adding the roll makes every gap in the window read the same.
 fn window_pad() -> f32 {
-    cce_ui::layout::bevel_width() + pane_pad()
+    cce_ui::layout::bevel_width() + pane_pad() - OPTICAL_TRIM
 }
 
-/// Height of one menubar control — the mail button and both switchers.
+/// VISIBLE height of one menubar control — what you see, not the rect it is
+/// given. See [`bar_item_carve`].
 const BAR_ITEM_H: f32 = 26.0;
+
+/// How much an edge treatment optically eats out of the gap beside it.
+///
+/// A pane is a flat rounded rect: its silhouette IS its rect, so a gap between
+/// two of them measures exactly what the layout says. Every other edge here
+/// fades rather than stops — the root plate's rolled rim, and the carved
+/// groove a flush control plate cuts inside its own footprint — so the run of
+/// untouched plate beside one comes up short of the number that placed it.
+/// Laying all of them out on the same value therefore does NOT make the gaps
+/// look the same: measured against 12px between the panes, the window's edges
+/// read 13 and every gap touching a bar item read 14.
+///
+/// One pixel each, at this config's relief width. It is a measurement, not a
+/// derivation: screenshot, count columns of untouched plate between two
+/// elements, and compare with the gap between the panes.
+const OPTICAL_TRIM: f32 = 1.0;
+
+/// The same for a flush control plate's carved groove, which bites less deep
+/// than the root plate's roll. Measured the same way: with the bar's rects on
+/// [`OPTICAL_TRIM`] its gaps read 11 against the panes' 12, and on 0 they read
+/// 14, so the groove is worth about half a pixel a side.
+const CARVE_TRIM: f32 = 0.5;
 
 /// The menubar band's height. One padding above its items, which then sit
 /// flush with the band's bottom edge, so the gap from an item down to the
@@ -607,7 +630,17 @@ const BAR_ITEM_H: f32 = 26.0;
 /// what makes every vertical gap in the window one number: window rim to
 /// items, items to plates, plates to rim.
 fn menubar_h() -> f32 {
-    window_pad() + BAR_ITEM_H
+    // The items' rects run CARVE_TRIM past the box they appear to fill, so the
+    // band has to clear that or the plates below sit a pixel too close.
+    window_pad() + BAR_ITEM_H + CARVE_TRIM
+}
+
+/// A bar item's widget rect, from the box its plate should appear to fill:
+/// outset by the groove's bite so the gap beside it reads like the panes'.
+/// See [`CARVE_TRIM`].
+fn bar_item_rect(x: f32, y: f32, w: f32) -> (f32, f32, f32, f32) {
+    let t = CARVE_TRIM;
+    (x - t, y - t, w + 2.0 * t, BAR_ITEM_H + 2.0 * t)
 }
 
 /// Widths of the two switchers in the bar; their heights and every gap
@@ -4744,12 +4777,17 @@ impl Application for ClearEmailApp {
             // the case `root_plate_gap` names as "control rows"). The items
             // hang from the band's top padding, so their bottoms are flush
             // with it and the plates below clear them by one padding.
+            // Placed by where each PLATE should land; `bar_item_rect` converts
+            // that to the rect the widget needs so the carve does not push the
+            // silhouette off the grid the panes sit on.
             let (edge, gap) = (window_pad(), pane_gap());
-            self.mail_button.set_rect(edge, edge, BAR_ITEM_H, BAR_ITEM_H);
+            let (rx, ry, rw, rh) = bar_item_rect(edge, edge, BAR_ITEM_H);
+            self.mail_button.set_rect(rx, ry, rw, rh);
             let folder_x = w_f32 - edge - FOLDER_W;
-            self.folder_dropdown.set_rect(folder_x, edge, FOLDER_W, BAR_ITEM_H);
-            self.account_dropdown
-                .set_rect(folder_x - gap - ACCOUNT_W, edge, ACCOUNT_W, BAR_ITEM_H);
+            let (rx, ry, rw, rh) = bar_item_rect(folder_x, edge, FOLDER_W);
+            self.folder_dropdown.set_rect(rx, ry, rw, rh);
+            let (rx, ry, rw, rh) = bar_item_rect(folder_x - gap - ACCOUNT_W, edge, ACCOUNT_W);
+            self.account_dropdown.set_rect(rx, ry, rw, rh);
 
             cce_ui::scale::set_scale_factor(scale as f32);
 
