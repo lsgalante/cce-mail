@@ -600,7 +600,12 @@ const MAIL_BUTTON_X: f32 = 8.0;
 // everything else derives from it through `split_geom`.
 const LIST_X: f32 = 10.0;
 const LIST_SEP_GAP: f32 = 10.0;
-const LIST_DETAIL_GAP: f32 = 15.0;
+/// How far the detail pane's content sits inside its plate. Also the gap
+/// from the separator line to the plate's left edge, which is LIST_SEP_GAP
+/// so the line is centred between the two plates rather than hugging one.
+const DETAIL_PAD: f32 = 15.0;
+/// Separator line to detail CONTENT: across the gap, then the plate's padding.
+const LIST_DETAIL_GAP: f32 = LIST_SEP_GAP + DETAIL_PAD;
 const LIST_W_DEFAULT: f32 = 300.0;
 const LIST_W_MIN: f32 = 180.0;
 /// The detail pane never gets squeezed below this by a drag or a narrow window.
@@ -625,7 +630,9 @@ const SEARCH_ROW_H: f32 = 26.0;
 const LIST_TOP_WITH_SEARCH: f32 = 55.0;
 const LIST_BOTTOM_PAD: f32 = 15.0;
 
-// Detail-pane vertical layout, every offset measured from MENUBAR_H. These
+// Detail-pane vertical layout, every offset measured from the pane plate's
+// top edge (`detail_origin_y`) — they were measured from the menubar back
+// when the pane had no plate of its own and sat straight on the root. These
 // were literals scattered across paint, layout, the scrollbar geometry and
 // three input handlers; the 170/190 pair in particular had to move in
 // lockstep or the scrollbar detached from the text it scrolls, so the body
@@ -687,10 +694,10 @@ fn detail_chip_label(att: &RemoteAttachment) -> String {
 /// Rects of the detail pane's attachment chips, one per server attachment,
 /// in the fixed header band between Date and the body (the body top never
 /// moves). Paint and hit-test both call this — the compose-chip convention.
-fn detail_chip_rects(atts: &[RemoteAttachment], detail_x: f32) -> Vec<(f32, f32, f32, f32)> {
+fn detail_chip_rects(atts: &[RemoteAttachment], detail_x: f32, origin_y: f32) -> Vec<(f32, f32, f32, f32)> {
     let mut rects = Vec::with_capacity(atts.len());
     let mut x = detail_x;
-    let y = DETAIL_CHIPS_Y + MENUBAR_H;
+    let y = origin_y + DETAIL_CHIPS_Y;
     for att in atts {
         let w = detail_chip_label(att).chars().count() as f32 * 6.0 + 16.0;
         rects.push((x, y, w, 22.0));
@@ -2970,6 +2977,42 @@ impl ClearEmailApp {
         (top, (self.height as f32 - top - LIST_BOTTOM_PAD).max(50.0))
     }
 
+    /// The detail pane's plate: (x, y, w, h). It shares the list's vertical
+    /// band, and mirrors the list's inset from the window's left edge on the
+    /// right — two plates either side of the separator, which the equal gaps
+    /// leave centred between them.
+    fn detail_pane_geom(&self) -> (f32, f32, f32, f32) {
+        let (_, sep, _) = self.split_geom();
+        let (top, h) = self.list_geom();
+        let x = sep + LIST_SEP_GAP;
+        let w = ((self.width as f32 - LIST_X) - x).max(DETAIL_W_MIN);
+        (x, top, w, h)
+    }
+
+    /// The y the pane's own offsets are measured from: its plate's top edge.
+    fn detail_origin_y(&self) -> f32 {
+        self.detail_pane_geom().1
+    }
+
+    /// The body scrollbar's lane inside the plate: (x, width). Independent of
+    /// whether the bar is currently needed, so the text column keeps its width
+    /// and does not reflow the moment the body grows past the pane.
+    fn detail_sb_lane(&self) -> (f32, f32) {
+        let (px, _, pw, _) = self.detail_pane_geom();
+        // Page-level bar width (the settings page look), as `parameters_bg`
+        // and the settings pages widen theirs.
+        let sb_w = cce_ui::layout::scrollbar_width() * 1.6;
+        (px + pw - sb_w - cce_ui::layout::scrollbar_inset(), sb_w)
+    }
+
+    /// Width of the detail pane's text column: from the content's left edge to
+    /// a gutter short of the scrollbar lane.
+    fn detail_content_w(&self) -> f32 {
+        let (_, _, detail_x) = self.split_geom();
+        let (sb_x, _) = self.detail_sb_lane();
+        (sb_x - 6.0 - detail_x).max(100.0)
+    }
+
     /// Move the selection `delta` rows through the list as it is displayed,
     /// scrolling to keep the new row on screen. Returns the message to
     /// dispatch, if any.
@@ -3209,8 +3252,9 @@ impl ClearEmailApp {
             return Vec::new();
         }
         let mut out = Vec::new();
-        let y = DETAIL_CHIPS_Y + MENUBAR_H;
-        let mut right = self.width as f32 - cce_ui::layout::scrollbar_width() - 10.0;
+        let y = self.detail_origin_y() + DETAIL_CHIPS_Y;
+        let (px, _, pw, _) = self.detail_pane_geom();
+        let mut right = px + pw - DETAIL_PAD;
         let mut add = |label: String, chip: HtmlChip| {
             let w = label.chars().count() as f32 * 6.0 + 16.0;
             right -= w;
@@ -3331,8 +3375,10 @@ impl ClearEmailApp {
     /// The detail-pane body box: (top y, height). Paint, layout, the
     /// scrollbar and the scroll clamps all derive from this one pair.
     fn detail_body_geom(&self) -> (f32, f32) {
-        let top = DETAIL_BODY_Y + MENUBAR_H;
-        let h = (self.height as f32 - top - DETAIL_BODY_BOTTOM_PAD).max(100.0);
+        let top = self.detail_origin_y() + DETAIL_BODY_Y;
+        let (_, py, _, ph) = self.detail_pane_geom();
+        // The body stops short of the plate's bottom edge, not the window's.
+        let h = ((py + ph - DETAIL_BODY_BOTTOM_PAD) - top).max(100.0);
         (top, h)
     }
 
@@ -3340,17 +3386,14 @@ impl ClearEmailApp {
     /// (sb_x, track_y, sb_w, track_h, thumb_y, thumb_h). None when the body fits
     /// (no scrollbar drawn). The single source for display_list and the drag path.
     fn body_scrollbar_geom(&self) -> Option<(f32, f32, f32, f32, f32, f32)> {
-        let w = self.width as f32;
         let (body_y, body_h) = self.detail_body_geom();
         let max_scroll = (self.body_content_h - body_h).max(0.0);
         if max_scroll <= 0.0 {
             return None;
         }
-        // Page-level bar geometry (the settings page look): the DE width
-        // widened as `parameters_bg` and the settings pages widen theirs,
-        // stood off the window's right edge by the configured inset.
-        let sb_w = cce_ui::layout::scrollbar_width() * 1.6;
-        let sb_x = w - sb_w - cce_ui::layout::scrollbar_inset();
+        // The bar rides inside the pane plate, stood off ITS right edge by the
+        // configured inset — it belongs to the pane, not to the window.
+        let (sb_x, sb_w) = self.detail_sb_lane();
         // The track stops 4px short at each end, which is what every toolkit
         // bar does (`ScrollRegion::scrollbar_geom`, `paint_relief_scrollbar`,
         // `parameters_bg`); this one alone used to run the full pane height.
@@ -3428,7 +3471,7 @@ impl ClearEmailApp {
         let h_f32 = self.height as f32;
 
         let list_x = LIST_X;
-        let (list_w, separator_x, detail_x) = self.split_geom();
+        let (list_w, _separator_x, detail_x) = self.split_geom();
         // Row-label char budgets scale with the band; the bases are the
         // hand-tuned counts at the 300px default.
         let fit = |base: f32| (base * list_w / LIST_W_DEFAULT) as usize;
@@ -3539,22 +3582,22 @@ impl ClearEmailApp {
                 labels.push(TextLabel {
                     text: email.subject.clone(),
                     x: detail_x,
-                    y: DETAIL_SUBJECT_Y + MENUBAR_H,
+                    y: self.detail_origin_y() + DETAIL_SUBJECT_Y,
                     font_size: 15.0,
                     color: [0xff, 0xff, 0xff],
                 });
 
                 // Metadata
-                labels.push(TextLabel { text: format!("From: {}", email.from), x: detail_x, y: DETAIL_FROM_Y + MENUBAR_H, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
-                labels.push(TextLabel { text: format!("To:   {}", email.to), x: detail_x, y: DETAIL_TO_Y + MENUBAR_H, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-                labels.push(TextLabel { text: format!("Date: {}", email.date), x: detail_x, y: DETAIL_DATE_Y + MENUBAR_H, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                labels.push(TextLabel { text: format!("From: {}", email.from), x: detail_x, y: self.detail_origin_y() + DETAIL_FROM_Y, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
+                labels.push(TextLabel { text: format!("To:   {}", email.to), x: detail_x, y: self.detail_origin_y() + DETAIL_TO_Y, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                labels.push(TextLabel { text: format!("Date: {}", email.date), x: detail_x, y: self.detail_origin_y() + DETAIL_DATE_Y, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
 
                 // Server-attachment chip labels (quads paint in display_list;
                 // both sides lay out via detail_chip_rects).
                 for (att, (cx, cy, _, _)) in email
                     .remote_attachments
                     .iter()
-                    .zip(detail_chip_rects(&email.remote_attachments, detail_x))
+                    .zip(detail_chip_rects(&email.remote_attachments, detail_x, self.detail_origin_y()))
                 {
                     labels.push(TextLabel {
                         text: detail_chip_label(att),
@@ -3581,11 +3624,12 @@ impl ClearEmailApp {
         } else {
             let placeholder = "Select an email to view its content".to_string();
             let est_w = TextLabel::estimate_width(&placeholder, 13.0);
-            let px = separator_x + ((w_f32 - separator_x) - est_w) / 2.0;
+            let (plate_x, plate_y, plate_w, plate_h) = self.detail_pane_geom();
+            let px = plate_x + (plate_w - est_w) / 2.0;
             labels.push(TextLabel {
                 text: placeholder,
-                x: px.max(separator_x + 4.0),
-                y: h_f32 / 2.0 - 10.0,
+                x: px.max(plate_x + 4.0),
+                y: plate_y + plate_h / 2.0 - 10.0,
                 font_size: 13.0,
                 color: [0x60, 0x60, 0x65],
             });
@@ -3660,11 +3704,6 @@ struct __EmailQuadSink<'a> {
 impl<'a> __EmailQuadSink<'a> {
     fn push(&mut self, q: (f32, f32, f32, f32, [f32; 4])) {
         self.pc.quad(cce_ui::scene::layout::Rect { x: q.0, y: q.1, width: q.2, height: q.3 }, q.4);
-    }
-    fn extend<I: IntoIterator<Item = (f32, f32, f32, f32, [f32; 4])>>(&mut self, it: I) {
-        for q in it {
-            self.push(q);
-        }
     }
 }
 
@@ -4657,7 +4696,7 @@ impl Application for ClearEmailApp {
 
             // Detail View
             if let Some(body) = selected_email_state {
-                let detail_w = (w_f32 - (detail_x + 15.0)).max(100.0);
+                let detail_w = self.detail_content_w();
                 let (body_y, body_h) = self.detail_body_geom();
                 self.detail_body.set_rect(detail_x, body_y, detail_w, body_h);
                 self.detail_body.text = body;
@@ -4713,7 +4752,20 @@ impl Application for ClearEmailApp {
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.folder_dropdown, &mut *quads.pc);
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.account_dropdown, &mut *quads.pc);
 
-        // 3. Email List Panel Separator
+        // 3. The detail pane's plate, and the separator seam between the two.
+        // Same fill and same radius as the list: the two panes are one pair.
+        // Nothing here reaches the plate's corners (the body carries its own
+        // text bounds), so this needs no rounded clip the way the list — whose
+        // cards span its full width — does.
+        {
+            let (px, py, pw, ph) = self.detail_pane_geom();
+            quads.pc.rounded_rect(
+                cce_ui::scene::layout::Rect { x: px, y: py, width: pw, height: ph },
+                cce_ui::layout::list_corner_radius(),
+                (true, true, true, true),
+                cce_ui::color::list_bg_color(),
+            );
+        }
         quads.push((separator_x, MENUBAR_H, 1.0, h_f32 - MENUBAR_H, [0.18, 0.18, 0.22, 1.0]));
 
         // Search band (only while open) and the list
@@ -4796,7 +4848,7 @@ impl Application for ClearEmailApp {
                     if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
                         // Server-attachment chips in the header band (labels
                         // ride in the labels pass; same rect fn both places).
-                        for (cx, cy, cw, ch) in detail_chip_rects(&email.remote_attachments, detail_x) {
+                        for (cx, cy, cw, ch) in detail_chip_rects(&email.remote_attachments, detail_x, self.detail_origin_y()) {
                             quads.push((cx, cy, cw, ch, [0.14, 0.14, 0.20, 1.0]));
                             quads.push((cx, cy, cw, 1.0, [0.25, 0.35, 0.50, 0.40]));
                             quads.push((cx, cy + ch - 1.0, cw, 1.0, [0.25, 0.35, 0.50, 0.40]));
@@ -4815,7 +4867,7 @@ impl Application for ClearEmailApp {
                             quads.push((cx + cw - 1.0, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
                         }
 
-                        let body_w = (w_f32 - (detail_x + 15.0)).max(100.0);
+                        let body_w = self.detail_content_w();
                         let line_h = 12.0 * 1.4; // get_text_buffer_laid_out's placed-text metric
 
                         // The rendered HTML view: one image quad where the
@@ -5232,7 +5284,7 @@ impl Application for ClearEmailApp {
                         .and_then(|id| self.emails.iter().find(|e| e.id == id))
                     {
                         if !email.remote_attachments.is_empty() {
-                            let hit = detail_chip_rects(&email.remote_attachments, detail_x)
+                            let hit = detail_chip_rects(&email.remote_attachments, detail_x, self.detail_origin_y())
                                 .iter()
                                 .position(|&(cx, cy, cw, ch)| {
                                     px >= cx && px <= cx + cw && py >= cy && py <= cy + ch
