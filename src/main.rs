@@ -4729,13 +4729,20 @@ impl Application for ClearEmailApp {
             if !self.email_list.scrollbar_raised() {
                 self.email_list.push_scrollbar_prims(&mut *quads.pc);
             }
-            quads.push((
-                self.email_list.x,
-                self.email_list.y,
-                self.email_list.w,
-                self.email_list.h,
+            // The list is a plate, so it wears the DE's list radius rather
+            // than square corners — `ScrollRegion`'s own framed paint draws
+            // its surface at exactly this getter.
+            quads.pc.rounded_rect(
+                cce_ui::scene::layout::Rect {
+                    x: self.email_list.x,
+                    y: self.email_list.y,
+                    width: self.email_list.w,
+                    height: self.email_list.h,
+                },
+                cce_ui::layout::list_corner_radius(),
+                (true, true, true, true),
                 cce_ui::color::list_bg_color(),
-            ));
+            );
         }
 
         // Visible List Item Buttons — `get_item_draw_y` returns PARTIALLY
@@ -4744,12 +4751,18 @@ impl Application for ClearEmailApp {
         // an edge card renders cut by the clip instead of vanishing. The
         // unread dots ride the same PaintCtx (the tuple sink forwards to it),
         // so the clip covers them too.
-        quads.pc.push_clip(cce_ui::scene::layout::Rect {
-            x: self.email_list.x,
-            y: self.email_list.viewport_y,
-            width: self.email_list.w,
-            height: self.email_list.viewport_h,
-        });
+        // Rounded, not square: a card spans the plate's full width, so at the
+        // first and last row the clip is what carries the plate's corner onto
+        // the card riding in it — concentric, the way a plate cuts its children.
+        quads.pc.push_clip_rounded(
+            cce_ui::scene::layout::Rect {
+                x: self.email_list.x,
+                y: self.email_list.viewport_y,
+                width: self.email_list.w,
+                height: self.email_list.viewport_h,
+            },
+            cce_ui::layout::list_corner_radius(),
+        );
         for idx in 0..filtered.len() {
             if self.email_list.get_item_draw_y(idx, 0.0).is_some() {
                 cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.email_buttons[idx], &mut *quads.pc);
@@ -4762,7 +4775,7 @@ impl Application for ClearEmailApp {
                 }
             }
         }
-        quads.pc.pop_clip();
+        quads.pc.pop_clip_rounded();
         // Scrollbar after the rows so the thumb rides on top of them instead of
         // peeking through the inter-row gaps. Frameless, so `push_prims` emits
         // the raised layer alone — pills, the toolkit's own geometry and
