@@ -4808,13 +4808,16 @@ impl Application for ClearEmailApp {
             cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.search_box, &mut *quads.pc);
         }
         {
-            // A frameless sink-behind region leaves the layering to its host:
-            // the sunk bar goes down FIRST, under the list's translucent fill,
-            // so it reads dimly through the plate instead of over the cards.
-            // The framed path does this for itself inside `push_prims`.
-            if !self.email_list.scrollbar_raised() {
-                self.email_list.push_scrollbar_prims(&mut *quads.pc);
-            }
+            // No sunk layer is emitted here. A frameless sink-behind region
+            // leaves the layering to its host, and the host's only other
+            // option — the bar under the plate fill — does not hide it: this
+            // plate is translucent, so a sunk bar reads straight through the
+            // rows as a permanent stripe, which riding the centre line made
+            // impossible to miss. Behind the list means out of sight, so the
+            // bar is drawn only once it rises (`push_prims`, after the rows),
+            // the same treatment the detail pane's own bar already gets. The
+            // opaque-plate hosts that DO show a sunk bar through are what
+            // `push_scrollbar_prims` exists for.
             // The list is a plate, so it wears the DE's list radius rather
             // than square corners — `ScrollRegion`'s own framed paint draws
             // its surface at exactly this getter.
