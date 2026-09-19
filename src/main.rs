@@ -284,6 +284,10 @@ struct ClearEmailApp {
     // only a 1200-char text preview.
     #[cfg(feature = "wpe")]
     webview: wpe::MailWebView,
+    /// Whether a renderer has been handed over yet — the first one is the
+    /// process's own, any later one is a replacement after a reconnect. See
+    /// `renderer_init`.
+    seen_renderer: bool,
     /// Email id whose HTML the webview currently shows.
     #[cfg(feature = "wpe")]
     html_loaded: Option<usize>,
@@ -3966,6 +3970,7 @@ impl Application for ClearEmailApp {
             body_sb_activity: cce_ui::widget::ScrollbarActivity::new(),
             #[cfg(feature = "wpe")]
             webview: wpe::MailWebView::new((800, 600)),
+            seen_renderer: false,
             #[cfg(feature = "wpe")]
             html_loaded: None,
             #[cfg(feature = "wpe")]
@@ -4641,6 +4646,34 @@ impl Application for ClearEmailApp {
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
+        }
+    }
+
+    /// Hand the rendered message back to a replacement renderer.
+    ///
+    /// The detail pane draws the WPE page as an image id, and an id belongs to
+    /// a renderer, not to the process: `cce-ui`'s `window_runner` repairs a
+    /// lost Wayland transport by opening a new session around the same
+    /// `Application`, which rebuilds the renderer and with it the image table.
+    /// A draw for an unknown id is skipped rather than reported, and the
+    /// webview only re-uploads when WPE produces a new frame — which a
+    /// finished page never does. So a reconnect left the message list and the
+    /// headers intact beside an empty body pane.
+    ///
+    /// `reupload_frame` replays the pixels the webview already holds, so the
+    /// page comes back on the next frame with no reload and no refetch of
+    /// remote content.
+    ///
+    /// Not on the first renderer: nothing has been uploaded yet, and the
+    /// webview has not rendered a frame.
+    fn renderer_init(&mut self, _renderer: &mut cce_ui::vk::VkRenderer) {
+        if !std::mem::replace(&mut self.seen_renderer, true) {
+            return;
+        }
+        #[cfg(feature = "wpe")]
+        if self.webview.reupload_frame() {
+            eprintln!("cce-mail: renderer replaced; re-uploaded the rendered message");
+            self.needs_rebuild = true;
         }
     }
 

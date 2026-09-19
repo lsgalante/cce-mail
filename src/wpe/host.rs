@@ -99,7 +99,12 @@ pub struct MailWebView {
     images_allowed: bool,
     /// Last uploaded frame in the image registry: (id, w px, h px).
     image: Option<(u32, u32, u32)>,
-    /// Retained so the headless example can assert on rendered output.
+    /// The pixels behind [`image`], kept so the frame can be handed to a
+    /// replacement renderer after a reconnect (see [`reupload_frame`]) — and
+    /// so the headless example can assert on rendered output.
+    ///
+    /// [`image`]: MailWebView::image
+    /// [`reupload_frame`]: MailWebView::reupload_frame
     last_frame: Option<(Vec<u8>, u32, u32)>,
 }
 
@@ -402,6 +407,34 @@ impl MailWebView {
     /// The current frame in the image registry: (id, w px, h px).
     pub fn image(&self) -> Option<(u32, u32, u32)> {
         self.image
+    }
+
+    /// Hand the last frame to a renderer that has just replaced the one it
+    /// was uploaded to. Returns true when the pane should repaint.
+    ///
+    /// An image id belongs to a **renderer**, and a renderer does not outlive
+    /// its session: `cce-ui`'s `window_runner` repairs a lost Wayland
+    /// transport by opening a new session around the same `Application`,
+    /// which rebuilds the renderer and with it the image table. A draw for an
+    /// unknown id is skipped rather than reported, and `self.image` is only
+    /// replaced when WPE produces a NEW frame — so a message that had
+    /// finished loading (the normal case: a page is painted once and then sits
+    /// there) would show an empty detail pane until something forced a
+    /// reload.
+    ///
+    /// Re-uploading the pixels beats re-rendering: no WPE round trip, no
+    /// refetch of remote content, and the pane comes back on the very next
+    /// frame. The new id is written to `self.image`, the field `pump` owns, so
+    /// the next real frame still frees the right one.
+    pub fn reupload_frame(&mut self) -> bool {
+        if let Some((old, ..)) = self.image.take() {
+            // A free for an id the new renderer never had is a no-op, and ids
+            // are process-unique, so this cannot reach a live image.
+            cce_ui::vk::free_image(old);
+        }
+        let Some((px, w, h)) = self.last_frame.clone() else { return false };
+        self.image = Some((cce_ui::vk::upload_rgba(px, w, h), w, h));
+        true
     }
 
     /// A pixel of the last frame, for tests asserting on rendered output
