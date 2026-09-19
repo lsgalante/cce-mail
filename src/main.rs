@@ -4688,19 +4688,11 @@ impl Application for ClearEmailApp {
         // 1. General window background (deep slate blue)
         quads.push((0.0, 0.0, w_f32, h_f32, [0.05, 0.05, 0.07, 1.0]));
 
-        // Bar chrome (was MenuBar's recessed paint): the bar is a plateau one
-        // step down from the plate, flush with its top-left, so its only wall
-        // is the bottom one facing the content — the other three sides are the
-        // plate's own rolled edge.
-        {
-            let depth = cce_ui::layout::bar_wall_width().min(MENUBAR_H * 0.6);
-            quads.pc.recess_edges(
-                cce_ui::scene::layout::Rect { x: 0.0, y: 0.0, width: w_f32, height: MENUBAR_H },
-                (0.0, 0.0, 0.0, 0.0),
-                depth,
-                (false, false, true, false),
-            );
-        }
+        // The bar carries no chrome of its own: it is flush with the root
+        // plate, the same face as the content below it, and its widgets are
+        // the only thing marking the band. It used to be a plateau one step
+        // down, carved with a single bottom wall (`recess_edges`, the
+        // inherited MenuBar paint) — that wall is gone.
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.mail_button, &mut *quads.pc);
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.folder_dropdown, &mut *quads.pc);
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.account_dropdown, &mut *quads.pc);
