@@ -618,18 +618,6 @@ const BAR_ITEM_H: f32 = 26.0;
 /// elements, and compare with the gap between the panes.
 const OPTICAL_TRIM: f32 = 1.0;
 
-/// The same for a flush control plate's carved groove, which bites less deep
-/// than the root plate's roll. Measured the same way: with the bar's rects on
-/// [`OPTICAL_TRIM`] its gaps read 11 against the panes' 12, and on 0 they read
-/// 14, so the groove is worth about half a pixel a side.
-const CARVE_TRIM: f32 = 0.5;
-
-/// And one more for the bar's TOP edge alone. Under the DE's top-left light
-/// the groove along a control's upper edge reads a pixel deeper than the one
-/// down its side, so an item placed on the same inset as the window's left and
-/// right left 13px of plate above it against 12 beside it. The band height
-/// below follows it, or the gap it opens at the top just moves underneath.
-const TOP_TRIM: f32 = 1.0;
 
 /// The menubar band's height. One padding above its items, which then sit
 /// flush with the band's bottom edge, so the gap from an item down to the
@@ -637,19 +625,7 @@ const TOP_TRIM: f32 = 1.0;
 /// what makes every vertical gap in the window one number: window rim to
 /// items, items to plates, plates to rim.
 fn menubar_h() -> f32 {
-    // The items' rects run CARVE_TRIM past the box they appear to fill, so the
-    // band has to clear that or the plates below sit a pixel too close; and it
-    // follows TOP_TRIM up, so raising the items does not just move the extra
-    // pixel from above them to below.
-    window_pad() - TOP_TRIM + BAR_ITEM_H + CARVE_TRIM
-}
-
-/// A bar item's widget rect, from the box its plate should appear to fill:
-/// outset by the groove's bite so the gap beside it reads like the panes'.
-/// See [`CARVE_TRIM`].
-fn bar_item_rect(x: f32, y: f32, w: f32) -> (f32, f32, f32, f32) {
-    let t = CARVE_TRIM;
-    (x - t, y - t, w + 2.0 * t, BAR_ITEM_H + 2.0 * t)
+    window_pad() + BAR_ITEM_H
 }
 
 /// Widths of the two switchers in the bar; their heights and every gap
@@ -690,15 +666,7 @@ fn pane_fill() -> [f32; 4] {
     c
 }
 
-/// The same material as a face for a CONTROL plate: the panes' colour and
-/// translucency, but positive alpha. A control plate lays its face through
-/// `inset_plate`, which emits a stroke prim rather than a quad, and the
-/// blur-behind sentinel only reaches quads — so a bar item shares the panes'
-/// colour and see-through-ness, and takes its relief from the control rung
-/// instead of a frost it cannot carry.
-fn bar_item_face() -> [f32; 4] {
-    cce_ui::color::list_bg_color()
-}
+
 
 /// The padding INSIDE a pane plate, between its rim and its content
 /// (`style.surface.plate.padding`, DE-wide — the pane rung's own value, 20
@@ -3870,19 +3838,19 @@ impl Application for ClearEmailApp {
         // unambiguous. The recessed bar chrome itself is carved in
         // display_list.
         let bar_font = cce_ui::layout::parse_font_string(&cce_ui::layout::menubar_font()).0;
-        // A plate at the control rung, faced with the panes' own material:
-        // `with_raised` puts the button on a control plate instead of the
-        // plateless border idiom it drew before.
+        // The bar's items are plates of the panes' material, in the same
+        // stance: flat, so the face is a quad and carries the frost, and the
+        // silhouette is the rect so they line up with the panes.
         let mail_button = Button::new_icon("mail", "Mail", 0.0, 0.0, BAR_ITEM_H, BAR_ITEM_H)
-            .with_raised(true)
-            .with_bg(bar_item_face());
+            .with_flat(true)
+            .with_bg(pane_fill());
         let folder_dropdown = Dropdown::new(
             vec!["Inbox".to_string()],
             0,
         )
         .with_font_family(&bar_font)
-        .with_raised(true)
-        .with_face(bar_item_face());
+        .with_flat(true)
+        .with_face(pane_fill());
 
         let mut search_box = TextBox::new(String::new())
             .with_multiline(false)
@@ -3917,8 +3885,8 @@ impl Application for ClearEmailApp {
             selected_account_idx,
         )
         .with_font_family(&bar_font)
-        .with_raised(true)
-        .with_face(bar_item_face());
+        .with_flat(true)
+        .with_face(pane_fill());
 
         let mut detail_body = TextBox::new(String::new()).with_multiline(true).with_draw_bg_border(false);
         detail_body.font_size = 12.0;
@@ -4786,17 +4754,14 @@ impl Application for ClearEmailApp {
             // the case `root_plate_gap` names as "control rows"). The items
             // hang from the band's top padding, so their bottoms are flush
             // with it and the plates below clear them by one padding.
-            // Placed by where each PLATE should land; `bar_item_rect` converts
-            // that to the rect the widget needs so the carve does not push the
-            // silhouette off the grid the panes sit on.
+            // Flat plates, so each rect IS its silhouette and the bar sits on
+            // the same grid as the panes with no compensation at all.
             let (edge, gap) = (window_pad(), pane_gap());
-            let (rx, ry, rw, rh) = bar_item_rect(edge, edge - TOP_TRIM, BAR_ITEM_H);
-            self.mail_button.set_rect(rx, ry, rw, rh);
+            self.mail_button.set_rect(edge, edge, BAR_ITEM_H, BAR_ITEM_H);
             let folder_x = w_f32 - edge - FOLDER_W;
-            let (rx, ry, rw, rh) = bar_item_rect(folder_x, edge - TOP_TRIM, FOLDER_W);
-            self.folder_dropdown.set_rect(rx, ry, rw, rh);
-            let (rx, ry, rw, rh) = bar_item_rect(folder_x - gap - ACCOUNT_W, edge - TOP_TRIM, ACCOUNT_W);
-            self.account_dropdown.set_rect(rx, ry, rw, rh);
+            self.folder_dropdown.set_rect(folder_x, edge, FOLDER_W, BAR_ITEM_H);
+            self.account_dropdown
+                .set_rect(folder_x - gap - ACCOUNT_W, edge, ACCOUNT_W, BAR_ITEM_H);
 
             cce_ui::scale::set_scale_factor(scale as f32);
 
