@@ -120,7 +120,19 @@ enum AppMessage {
     /// A failure a user must not miss: shown as a sticky red toast (no
     /// timer) where [`AppMessage::Status`] is a green 4-second one.
     StatusError(String),
+    /// One mailbox's pass, folded in the moment it lands. Sent per folder
+    /// rather than once per pass: the inbox answers in about a second while
+    /// `[Gmail]/All Mail`'s `UID SEARCH ALL` walks the whole account, and
+    /// holding the inbox's result until that finished is what made a sync
+    /// look like it had done nothing.
     EmailsSynced(String, Vec<FolderSync>),
+    /// The sync worker has left — every exit, including the ones that never
+    /// reached a mailbox (no session, no password, mock account). Clears
+    /// `sync_in_flight`, so a failed pass can't wedge the app against ever
+    /// syncing again. Carries the pass's generation: one presumed lost and
+    /// replaced (see [`SYNC_STUCK_AFTER`]) must not hand back a wire that now
+    /// belongs to its replacement.
+    SyncFinished(u64),
     UpdateAccountTokens(String, Option<String>, Option<u64>),
     /// GLib has work (or produced a frame): pump the embedded webview.
     #[cfg(feature = "wpe")]
@@ -335,6 +347,27 @@ struct ClearEmailApp {
     /// backfill pass at this instant. Cleared once the server holds nothing
     /// the cache is missing.
     backfill_at: Option<std::time::Instant>,
+    /// The pass currently out on the wire, and what it covers. Nothing starts
+    /// a second one while this is set — two passes race, and the loser is
+    /// whichever finishes LAST: each carries its own `UID SEARCH` snapshot,
+    /// and a pass that searched before a message arrived deletes it again
+    /// through [`merge_sync`]'s deleted-elsewhere sweep. That is what made
+    /// mail need a second Sync Now: the first press fetched it and a passing
+    /// straggler threw it away.
+    sync_in_flight: Option<SyncScope>,
+    /// Generation of the last pass started, bumped per `start_sync`.
+    sync_generation: u64,
+    /// A sync that had to be turned away because one was already out, and
+    /// which the running pass does not cover — a different account, or a
+    /// folder outside its `want_tags`. Run once the wire is free, so
+    /// switching account mid-sync still ends up synced instead of silently
+    /// skipped.
+    resync_pending: bool,
+    /// Whether any folder in the pass now running still had history to come.
+    /// Accumulated across the per-folder results and read once the worker
+    /// leaves, because a later folder reporting nothing outstanding must not
+    /// cancel an earlier one that did.
+    backfill_pending: bool,
     status_message: Option<StatusToast>,
     sender: calloop::channel::Sender<AppMessage>,
 
@@ -1531,6 +1564,31 @@ fn open_imap_session(
 /// Namespaces sent-folder ids away from inbox sequence numbers (both are
 /// fetch-time seq numbers; ids must stay unique across the merged list).
 
+/// What the pass on the wire covers: whose mail, and which folders. A second
+/// sync request is only worth queueing when it falls outside this.
+#[derive(Debug, Clone)]
+struct SyncScope {
+    /// Which pass this is. Only the worker holding the current generation
+    /// may declare the wire free.
+    generation: u64,
+    account: String,
+    tags: Vec<String>,
+    /// When the worker left. The IMAP session carries no read timeout, so a
+    /// pass that stalls on a dead socket would otherwise hold the wire — and
+    /// the user's Sync Now — for as long as the kernel takes to give up on
+    /// the connection. Past [`SYNC_STUCK_AFTER`] the pass is presumed lost
+    /// and a new one may go out over it.
+    started: std::time::Instant,
+}
+
+/// How long a pass may hold the wire before a forced sync overrides it. Well
+/// past a slow real pass (a full `[Gmail]/All Mail` walk runs half a minute),
+/// short enough that a wedged one costs a wait rather than a restart. A
+/// straggler that wakes up afterwards cannot damage what the new pass fetched
+/// — [`merge_sync`] refuses to delete mail newer than the straggler's own
+/// search.
+const SYNC_STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// One mailbox's outcome for a single sync pass.
 ///
 /// `server_uids` is the whole mailbox, not just what was fetched: the merge
@@ -2108,8 +2166,21 @@ fn merge_sync(prior: Vec<Email>, folders: &[FolderSync]) -> Vec<Email> {
         // Deleted from another client. Scoped to this folder and to mail that
         // came from the server: locally-created rows (uid None) and anything
         // the user moved elsewhere (trash, drafts) are not this pass's business.
+        //
+        // And scoped in time, by `server_max`. A pass reports the mailbox as
+        // its own `UID SEARCH` saw it, which is a snapshot from before the
+        // fetch that followed; mail that arrived after that search is absent
+        // from `server` for the innocent reason that it did not exist yet.
+        // Treating that as "deleted elsewhere" is how a slow pass used to
+        // wipe the message a quick one had just brought in — the mail was
+        // fetched, merged, saved, and then thrown out again by a straggler,
+        // so it took another Sync Now to reappear. UIDs only ever increase
+        // within a mailbox (RFC 3501 §2.3.1.1), so anything above everything
+        // this pass saw postdates the pass and is not its business either.
+        let server_max = f.server_uids.iter().copied().max().unwrap_or(0);
         out.retain(|e| {
-            e.folder != f.folder || e.uid.is_none_or(|u| server.contains(&u))
+            e.folder != f.folder
+                || e.uid.is_none_or(|u| u > server_max || server.contains(&u))
         });
 
         // Read elsewhere. Local "read" still wins over server "unread": the
@@ -2197,9 +2268,22 @@ fn sync_imap(
     mut account: AccountInfo,
     known: std::collections::HashMap<String, std::collections::HashSet<u32>>,
     want_tags: Vec<String>,
+    generation: u64,
     sender: calloop::channel::Sender<AppMessage>,
 ) {
+    /// Hands `sync_in_flight` back however the worker leaves — the early
+    /// returns below, or a panic unwinding through them. A flag cleared only
+    /// on the success path is a flag that eventually sticks, and a stuck one
+    /// here means the app never syncs again until it is restarted.
+    struct Finish(u64, calloop::channel::Sender<AppMessage>);
+    impl Drop for Finish {
+        fn drop(&mut self) {
+            let _ = self.1.send(AppMessage::SyncFinished(self.0));
+        }
+    }
+
     std::thread::spawn(move || {
+        let _finish = Finish(generation, sender.clone());
         if is_mock_account(&account) {
             return;
         }
@@ -2227,7 +2311,6 @@ fn sync_imap(
         };
 
         let empty = std::collections::HashSet::new();
-        let mut folders = Vec::new();
 
         for tag in &want_tags {
             let Some(info) = discovered.iter().find(|f| &f.tag == tag) else {
@@ -2250,11 +2333,19 @@ fn sync_imap(
                 known.get(&info.tag).unwrap_or(&empty),
                 verbose,
             ) {
-                folders.push(synced);
+                // Straight out, not into a batch collected for the end of the
+                // pass. `want_tags` puts the inbox first and it answers in
+                // about a second, while `[Gmail]/All Mail` behind it searches
+                // the entire account; batching meant new mail sat finished in
+                // this thread for the half-minute that took, which reads as a
+                // sync that did nothing.
+                let _ = sender.send(AppMessage::EmailsSynced(
+                    account.email.clone(),
+                    vec![synced],
+                ));
             }
         }
 
-        let _ = sender.send(AppMessage::EmailsSynced(account.email.clone(), folders));
         let _ = sender.send(AppMessage::Status("Sync Complete".to_string()));
         let _ = session.logout();
     });
@@ -2963,6 +3054,44 @@ impl ClearEmailApp {
         if !force && self.last_sync_start.is_some_and(|t| t.elapsed() < MIN_SYNC_GAP) {
             return;
         }
+        // One pass at a time, forced or not. Two overlapping passes do not
+        // merely duplicate the work: each took its own `UID SEARCH` snapshot,
+        // and the one that finishes LAST decides what the cache holds, so a
+        // straggler that searched before a message arrived deletes it out
+        // from under the pass that just fetched it (see `merge_sync`). A
+        // press while a pass is out says so rather than silently stacking a
+        // second session — the whole "press Sync twice" symptom was this.
+        //
+        // Turning a request away is not the same as dropping it: a pass
+        // already on the wire is fetching the wrong account's mail as far as
+        // an account switch is concerned, and knows nothing about a folder
+        // opened since it left. Those are queued for the moment it lands —
+        // only a request the running pass already covers is answered with
+        // "it is happening".
+        if let Some(scope) = self.sync_in_flight.as_ref().filter(|s| {
+            let stuck = s.started.elapsed() >= SYNC_STUCK_AFTER;
+            if stuck {
+                eprintln!(
+                    "cce-mail: the sync started {}s ago has not reported back; starting another",
+                    s.started.elapsed().as_secs()
+                );
+            }
+            !stuck
+        }) {
+            let covered = self
+                .accounts
+                .get(self.selected_account_idx)
+                .is_some_and(|a| a.email == scope.account)
+                && scope.tags.contains(&self.current_folder);
+            if covered {
+                if force {
+                    self.status_message = Some(StatusToast::info("Already syncing...", 2.0));
+                }
+            } else {
+                self.resync_pending = true;
+            }
+            return;
+        }
         self.refresh_account_secret(self.selected_account_idx);
 
         let Some((email, is_oauth, no_password, mock)) = self
@@ -3017,7 +3146,18 @@ impl ClearEmailApp {
         }
 
         let account = self.accounts[self.selected_account_idx].clone();
-        sync_imap(account, known, want_tags, self.sender.clone());
+        // Cleared by `AppMessage::SyncFinished`, which the worker sends from
+        // a drop guard — so every early return and every panic still hands
+        // the wire back.
+        self.sync_generation = self.sync_generation.wrapping_add(1);
+        self.sync_in_flight = Some(SyncScope {
+            generation: self.sync_generation,
+            account: account.email.clone(),
+            tags: want_tags.clone(),
+            started: std::time::Instant::now(),
+        });
+        self.backfill_pending = false;
+        sync_imap(account, known, want_tags, self.sync_generation, self.sender.clone());
         self.last_sync_start = Some(std::time::Instant::now());
     }
 
@@ -3947,6 +4087,10 @@ impl Application for ClearEmailApp {
             secret_retry_at: None,
             secret_missing_reported: false,
             backfill_at: None,
+            sync_in_flight: None,
+            sync_generation: 0,
+            backfill_pending: false,
+            resync_pending: false,
             keys: EmailKeys::load(),
             mail_button,
             folder_dropdown,
@@ -4522,22 +4666,48 @@ impl Application for ClearEmailApp {
 
                 // Keep pulling while history is still coming down. Each pass
                 // is already saved, so this can stop at any point without
-                // losing what arrived.
+                // losing what arrived. The decision is deferred to
+                // `SyncFinished`: results arrive one folder at a time now, and
+                // scheduling from here would start the next pass on top of the
+                // one still walking the folders behind this message — exactly
+                // the overlap `sync_in_flight` exists to prevent. A folder
+                // with nothing outstanding must not clear the flag either; the
+                // inbox being current says nothing about All Mail's history.
                 if remaining > 0 {
-                    self.backfill_at = Some(
-                        std::time::Instant::now()
-                            + std::time::Duration::from_secs(BACKFILL_DELAY_SECS),
-                    );
+                    self.backfill_pending = true;
                     self.status_message = Some(StatusToast::info(
                         format!("Fetched {} — {} older messages still to come...", fetched, remaining),
                         4.0,
                     ));
-                } else {
-                    self.backfill_at = None;
                 }
 
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
+            }
+            AppMessage::SyncFinished(generation) => {
+                // A pass presumed lost, reporting back after its replacement
+                // went out: it has nothing to hand over.
+                if self.sync_in_flight.as_ref().is_none_or(|s| s.generation != generation) {
+                    return;
+                }
+                self.sync_in_flight = None;
+                // Now that the wire is free: a sync turned away while this
+                // one was out goes first — it is there because the user
+                // changed account or opened a folder this pass never covered,
+                // and it supersedes backfilling history nobody asked for.
+                // `start_sync` cannot be turned away twice, the flag having
+                // just been cleared.
+                if std::mem::take(&mut self.resync_pending) {
+                    self.backfill_pending = false;
+                    self.start_sync(true);
+                    *needs_rebuild = true;
+                    self.needs_rebuild = true;
+                } else {
+                    self.backfill_at = std::mem::take(&mut self.backfill_pending).then(|| {
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs(BACKFILL_DELAY_SECS)
+                    });
+                }
             }
             AppMessage::UpdateAccountTokens(email, access_token, expiry) => {
                 if let Some(acc) = self.accounts.iter_mut().find(|a| a.email == email) {
@@ -4643,8 +4813,14 @@ impl Application for ClearEmailApp {
         }
 
         // Next backfill pass. Same reasoning on the redraw: the pass repaints
-        // when its results land, so nothing is requested here.
-        if self.backfill_at.is_some_and(|t| std::time::Instant::now() >= t) {
+        // when its results land, so nothing is requested here. Held back
+        // while a pass is out rather than put to `start_sync`: history that
+        // waits a few seconds longer costs nothing, where a forced call it
+        // would only turn away announces "Already syncing..." over whatever
+        // the user is reading — and this one is the app's idea, not theirs.
+        if self.sync_in_flight.is_none()
+            && self.backfill_at.is_some_and(|t| std::time::Instant::now() >= t)
+        {
             self.backfill_at = None;
             self.start_sync(true);
         }
@@ -6659,6 +6835,40 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), out.len(), "ids must stay unique across the cache");
         assert!(ids.iter().all(|&i| i != 0), "every message gets a real id");
+    }
+
+    #[test]
+    fn merge_keeps_mail_that_postdates_a_stale_pass() {
+        // The "press Sync twice" bug. Two passes overlap: the quick one
+        // fetches uid 102 that has just arrived, the slow one searched before
+        // it existed and reports the mailbox as {100, 101}. Finishing last
+        // used to make the straggler authoritative, and 102 was deleted again
+        // — fetched, merged, saved, gone, until another Sync Now went out.
+        let prior = vec![
+            msg(1, Some(100), "inbox", "old", true),
+            msg(2, Some(102), "inbox", "just arrived", false),
+        ];
+        let stale = folder_sync("inbox", vec![], vec![100, 101]);
+        let out = merge_sync(prior, &[stale]);
+        assert!(
+            out.iter().any(|e| e.subject == "just arrived"),
+            "a pass cannot delete mail newer than anything its search saw"
+        );
+        assert!(out.iter().any(|e| e.subject == "old"));
+    }
+
+    #[test]
+    fn merge_still_drops_a_gap_below_what_the_pass_saw() {
+        // The guard above is a ceiling, not an amnesty: a uid the pass could
+        // have seen and did not is genuinely gone, and must still go.
+        let prior = vec![
+            msg(1, Some(100), "inbox", "gone", true),
+            msg(2, Some(103), "inbox", "kept", true),
+        ];
+        let f = folder_sync("inbox", vec![], vec![101, 103]);
+        let out = merge_sync(prior, &[f]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].subject, "kept");
     }
 
     #[test]
