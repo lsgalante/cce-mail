@@ -3980,7 +3980,7 @@ impl Application for ClearEmailApp {
         )
         .with_font_family(&bar_font)
         .with_flat(true)
-        .with_face(pane_fill());
+        .with_face(cce_ui::scene::Material::from_fill(pane_fill()));
 
         let mut search_box = TextBox::new(String::new())
             .with_multiline(false)
@@ -4016,7 +4016,7 @@ impl Application for ClearEmailApp {
         )
         .with_font_family(&bar_font)
         .with_flat(true)
-        .with_face(pane_fill());
+        .with_face(cce_ui::scene::Material::from_fill(pane_fill()));
 
         let mut detail_body = TextBox::new(String::new()).with_multiline(true).with_draw_bg_border(false);
         detail_body.font_size = 12.0;
