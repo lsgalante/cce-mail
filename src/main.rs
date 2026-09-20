@@ -1334,8 +1334,6 @@ fn parse_mailto(arg: &str) -> Option<MailtoPrefill> {
     Some(prefill)
 }
 
-const GOOGLE_CLIENT_ID: &str = "946029775684-m4u4mme60a6a0qj3p5m5jvea8d2987o9.apps.googleusercontent.com";
-const GOOGLE_CLIENT_SECRET: &str = "GOCSPX-dummysecret";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct GoogleClientConfig {
@@ -1343,32 +1341,21 @@ struct GoogleClientConfig {
     client_secret: String,
 }
 
+/// The Google OAuth client, from google_client.json, which the System
+/// Interface's Accounts page writes when the user pastes their own client's
+/// ID and secret. There is no built-in default any more: a placeholder ID
+/// and secret used to be compiled in here and written to that file when it
+/// was missing, which is one hardcoded credential away from the mistake
+/// cce-system-interface made. Missing or unreadable means "not set up", and
+/// the token refresh says so instead of sending empty strings to Google.
 fn load_google_client_config() -> GoogleClientConfig {
     let p = cce_ui::config::cce_config_dir().join("google_client.json");
-    if p.exists() {
-        if let Ok(content) = std::fs::read_to_string(&p) {
-            if let Ok(config) = serde_json::from_str::<GoogleClientConfig>(&content) {
-                return config;
-            }
+    if let Ok(content) = std::fs::read_to_string(&p) {
+        if let Ok(config) = serde_json::from_str::<GoogleClientConfig>(&content) {
+            return config;
         }
     }
-    let default_config = GoogleClientConfig {
-        client_id: GOOGLE_CLIENT_ID.to_string(),
-        client_secret: GOOGLE_CLIENT_SECRET.to_string(),
-    };
-    if let Ok(content) = serde_json::to_string_pretty(&default_config) {
-        let _ = std::fs::write(&p, content);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = std::fs::metadata(&p) {
-                let mut perms = metadata.permissions();
-                perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(&p, perms);
-            }
-        }
-    }
-    default_config
+    GoogleClientConfig { client_id: String::new(), client_secret: String::new() }
 }
 
 async fn refresh_access_token(account: &mut AccountInfo) -> Result<String, String> {
@@ -1396,6 +1383,9 @@ async fn refresh_access_token(account: &mut AccountInfo) -> Result<String, Strin
     let client_config = load_google_client_config();
     let client_id = account.client_id.as_deref().unwrap_or(&client_config.client_id);
     let client_secret = account.client_secret.as_deref().unwrap_or(&client_config.client_secret);
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err("Google client not configured: set the client ID and secret in System Interface > Accounts".to_string());
+    }
 
     let client = reqwest::Client::new();
     let params = [
