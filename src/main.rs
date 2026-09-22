@@ -3438,16 +3438,25 @@ impl ClearEmailApp {
     /// toolkit's own `context_menu::mouse_input` is deliberately NOT used —
     /// it dispatches labels through a fixed map into the target widget,
     /// where "Delete" means DeleteKey, not this app's message.
+    ///
+    /// A menu with NO app actions behind it is the toolkit's own — the
+    /// Cut / Copy / Paste menu a text box opens — and that one dispatches
+    /// through `context_menu::mouse_input`, or its rows paint and do
+    /// nothing (which is what they did until 2026-09-22).
     fn context_menu_press(&mut self, px: f32, py: f32) -> Option<AppMessage> {
-        let mx = cce_ui::widget::context_menu::x();
-        let my = cce_ui::widget::context_menu::y();
-        let mw = cce_ui::widget::context_menu::w();
-        let mh = cce_ui::widget::context_menu::h();
-        let mut msg = None;
-        if px >= mx && px <= mx + mw && py >= my && py <= my + mh {
-            let row = ((py - my) / CONTEXT_ROW_H) as usize;
-            msg = self.context_menu_actions.get(row).cloned().flatten();
+        if self.context_menu_actions.is_empty() {
+            cce_ui::widget::context_menu::mouse_input(
+                MouseButton::Left,
+                ElementState::Pressed,
+                px,
+                py,
+                Some(&mut self.ui_context),
+            );
+            cce_ui::widget::context_menu::hide();
+            return None;
         }
+        let msg = cce_ui::widget::context_menu::row_at(px, py)
+            .and_then(|row| self.context_menu_actions.get(row).cloned().flatten());
         cce_ui::widget::context_menu::hide();
         self.context_menu_actions.clear();
         msg
@@ -5373,38 +5382,10 @@ impl Application for ClearEmailApp {
         // bounds EXACTLY equal to the menu rect: the engine's popover
         // occlusion clamp exempts only an exact match, and pushes this same
         // rect as an overlay so the row text underneath is clamped away.
-        if cce_ui::widget::context_menu::is_visible() {
-            let (mx, my) = (
-                cce_ui::widget::context_menu::x(),
-                cce_ui::widget::context_menu::y(),
-            );
-            let (mw, mh) = (
-                cce_ui::widget::context_menu::w(),
-                cce_ui::widget::context_menu::h(),
-            );
-            let menu_bounds = Some([mx, my, mx + mw, my + mh]);
-            for (qx, qy, qw, qh, qc) in cce_ui::widget::context_menu::extra_quads() {
-                __pc.quad(
-                    cce_ui::scene::layout::Rect { x: qx, y: qy, width: qw, height: qh },
-                    qc,
-                );
-            }
-            // The menu font's family: a TextLabel carries only a size, so
-            // `None` here drew the menu in the default sans while the labels
-            // had been laid out in the configured face.
-            let (menu_family, _) = cce_ui::widget::context_menu::label_font();
-            for label in cce_ui::widget::context_menu::text_labels() {
-                __pc.text_with(
-                    label.text.clone(),
-                    label.x,
-                    label.y,
-                    label.font_size,
-                    label.color,
-                    Some(menu_family.clone()),
-                    menu_bounds,
-                );
-            }
-        }
+        // The lit plate and the menu font in one call — the flat
+        // `extra_quads` look this drew was the pre-frost menu every other
+        // app has moved off.
+        cce_ui::widget::context_menu::paint_with_labels(&mut __pc);
 
         Some(__pc.finish())
     }
