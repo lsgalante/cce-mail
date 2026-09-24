@@ -623,34 +623,27 @@ fn save_emails_for_account(email: &str, emails: &[Email]) {
 }
 
 /// Inset from the WINDOW's outer edge to anything standing on the root
-/// plate. The plate's rolled rim eats the first `bevel_width` before its face
-/// even begins, so a bare [`pane_pad`] leaves a visibly thinner gap at the
-/// window's edges than between two things on the face — measured at 4px
-/// against 12px. Adding the roll makes every gap in the window read the same.
+/// plate. The same value as [`pane_pad`], deliberately: this window's base
+/// is a flat fill with no rolled rim (it paints a plain quad, not a root
+/// `PlateSpec` the way cce-files does), so the run of untouched plate at a
+/// window edge is exactly what the layout says, and one number makes every
+/// gap in the window read the same — rim to bar items, items to plates,
+/// plates to rim, and the split between the panes.
+///
+/// It used to add `bevel_width` (less a measured 1px optical trim) to make
+/// up for a rolled rim eating the first 9.3px, which was true of the window
+/// on 2026-09-19 and no longer is: with the roll gone the compensation
+/// alone was the discrepancy, 20px at the edges against 12 between the
+/// panes. If the window grows a rolled rim again, this is the one place to
+/// put the roll back — measured, not derived: screenshot, count columns of
+/// untouched plate, and compare with the gap between the panes.
 fn window_pad() -> f32 {
-    cce_ui::layout::bevel_width() + pane_pad() - OPTICAL_TRIM
+    pane_pad()
 }
 
 /// VISIBLE height of one menubar control — what you see, not the rect it is
 /// given. See [`bar_item_carve`].
 const BAR_ITEM_H: f32 = 26.0;
-
-/// How much an edge treatment optically eats out of the gap beside it.
-///
-/// A pane is a flat rounded rect: its silhouette IS its rect, so a gap between
-/// two of them measures exactly what the layout says. Every other edge here
-/// fades rather than stops — the root plate's rolled rim, and the carved
-/// groove a flush control plate cuts inside its own footprint — so the run of
-/// untouched plate beside one comes up short of the number that placed it.
-/// Laying all of them out on the same value therefore does NOT make the gaps
-/// look the same: measured against 12px between the panes, the window's edges
-/// read 13 and every gap touching a bar item read 14.
-///
-/// One pixel each, at this config's relief width. It is a measurement, not a
-/// derivation: screenshot, count columns of untouched plate between two
-/// elements, and compare with the gap between the panes.
-const OPTICAL_TRIM: f32 = 1.0;
-
 
 /// The menubar band's height. One padding above its items, which then sit
 /// flush with the band's bottom edge, so the gap from an item down to the
