@@ -1155,6 +1155,34 @@ fn ellipsize(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Ellipsize `s` so its estimated rendered width at `font_size` fits in
+/// `max_w` px. [`ellipsize`] budgets by CHARACTER count, which is fine for
+/// list rows that are also clipped to their viewport, but the detail pane's
+/// header lines were emitted with no bounds and no budget at all, so a long
+/// subject ran straight off the plate. The estimate is the same heuristic the
+/// date column and the empty-pane placeholder already lay out by; callers
+/// still clip at the plate edge so an under-estimate is cut, not overflowed.
+fn ellipsize_to_width(s: &str, font_size: f32, max_w: f32) -> String {
+    if TextLabel::estimate_width(s, font_size) <= max_w {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    // Largest prefix whose width, plus the ellipsis, still fits. Widths are
+    // monotone in prefix length, so a binary search over the count is exact.
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let candidate: String = chars[..mid].iter().collect::<String>() + "...";
+        if TextLabel::estimate_width(&candidate, font_size) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let head: String = chars[..lo].iter().collect();
+    format!("{}...", head.trim_end())
+}
+
 /// Display form of the From address: "Name <addr>", falling back through the
 /// parts. mail-parser has already decoded any RFC 2047 encoded-words.
 fn format_from(msg: &mail_parser::Message) -> String {
@@ -3831,19 +3859,36 @@ impl ClearEmailApp {
         if modal_open {
         } else if let Some(selected_id) = self.selected_email_id {
             if let Some(email) = self.emails.iter().find(|e| e.id == selected_id) {
-                // Subject Header
-                labels.push(TextLabel {
-                    text: email.subject.clone(),
-                    x: detail_x,
-                    y: self.detail_origin_y() + DETAIL_SUBJECT_Y,
-                    font_size: 15.0,
-                    color: [0xff, 0xff, 0xff],
-                });
-
-                // Metadata
-                labels.push(TextLabel { text: format!("From: {}", email.from), x: detail_x, y: self.detail_origin_y() + DETAIL_FROM_Y, font_size: 11.0, color: [0xb0, 0xb0, 0xb8] });
-                labels.push(TextLabel { text: format!("To:   {}", email.to), x: detail_x, y: self.detail_origin_y() + DETAIL_TO_Y, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-                labels.push(TextLabel { text: format!("Date: {}", email.date), x: detail_x, y: self.detail_origin_y() + DETAIL_DATE_Y, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                // Subject header and metadata lines: single-line, so a long
+                // subject (or address list) is ellipsized to the pane's text
+                // column, and the label is clipped to the plate's content rect
+                // as the backstop for the width estimate — these used to ride
+                // the boundless `labels` drain and ran off the plate.
+                let content_w = self.detail_content_w();
+                let (plate_x, plate_y, plate_w, plate_h) = self.detail_pane_geom();
+                let header_bounds = Some([
+                    plate_x + pane_inner_pad(),
+                    plate_y,
+                    plate_x + plate_w - pane_inner_pad(),
+                    plate_y + plate_h,
+                ]);
+                let header_lines: [(String, f32, f32, [u8; 3]); 4] = [
+                    (email.subject.clone(), DETAIL_SUBJECT_Y, 15.0, [0xff, 0xff, 0xff]),
+                    (format!("From: {}", email.from), DETAIL_FROM_Y, 11.0, [0xb0, 0xb0, 0xb8]),
+                    (format!("To:   {}", email.to), DETAIL_TO_Y, 11.0, [0x83, 0x83, 0x8a]),
+                    (format!("Date: {}", email.date), DETAIL_DATE_Y, 11.0, [0x83, 0x83, 0x8a]),
+                ];
+                for (text, dy, font_size, color) in header_lines {
+                    pc.text_with(
+                        ellipsize_to_width(&text, font_size, content_w),
+                        detail_x,
+                        self.detail_origin_y() + dy,
+                        font_size,
+                        color,
+                        None,
+                        header_bounds,
+                    );
+                }
 
                 // Server-attachment chip labels (quads paint in display_list;
                 // both sides lay out via detail_chip_rects).
@@ -6217,6 +6262,21 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ellipsize_to_width_fits_the_column() {
+        let long = "Re: A very long subject line that certainly will not fit in a narrow detail pane column";
+        let fitted = ellipsize_to_width(long, 15.0, 200.0);
+        assert!(fitted.ends_with("..."));
+        assert!(TextLabel::estimate_width(&fitted, 15.0) <= 200.0, "{fitted}");
+        // One more char would not have fit: the prefix is maximal.
+        let head_len = fitted.trim_end_matches("...").chars().count();
+        let longer: String = long.chars().take(head_len + 2).collect::<String>() + "...";
+        assert!(TextLabel::estimate_width(&longer, 15.0) > 200.0);
+        // Short text is untouched, and a hopeless width degrades to the ellipsis alone.
+        assert_eq!(ellipsize_to_width("Hi", 15.0, 200.0), "Hi");
+        assert_eq!(ellipsize_to_width("Hello world", 15.0, 1.0), "...");
+    }
+
     use super::*;
 
     #[test]
