@@ -746,19 +746,86 @@ const DETAIL_BODY_Y: f32 = 110.0;
 // derive from these — the old duplicated 500.0/420.0 literals meant growing
 // the dialog required finding every site by hand.
 const COMPOSE_W: f32 = 500.0;
-const COMPOSE_H: f32 = 520.0;
+// The dialog's SIZES — what is not spacing. Every inset and gap in it is
+// the pane rung of the DE spacing ladder (`pane_inner_pad`, `plate_gap`),
+// and the dialog's height falls out of the stack rather than being a
+// number of its own.
+const COMPOSE_TITLE_H: f32 = 22.0;
+const COMPOSE_LABEL_W: f32 = 65.0;
+const COMPOSE_FIELD_H: f32 = 26.0;
+const COMPOSE_BODY_H: f32 = 195.0;
+const COMPOSE_CHIP_H: f32 = 24.0;
+const COMPOSE_BTN_H: f32 = 28.0;
+const COMPOSE_BTN_W: f32 = 75.0;
+const COMPOSE_ATTACH_W: f32 = 80.0;
+
+/// The compose dialog laid out: one source for paint, the labels, the
+/// widget rects and every hit-test. A raised popover plate on the root
+/// plate, its content inset by the pane padding, its rows a pane gap apart.
+struct ComposeLayout {
+    x: f32,
+    pad: f32,
+    gap: f32,
+    title_y: f32,
+    label_x: f32,
+    field_x: f32,
+    field_w: f32,
+    /// To, Cc, Bcc, Subject — the top of each field.
+    rows_y: [f32; 4],
+    body: (f32, f32, f32, f32),
+    chips_y: f32,
+    buttons_y: f32,
+    attach_x: f32,
+    send_x: f32,
+    cancel_x: f32,
+}
+
+fn compose_layout(modal_x: f32, modal_y: f32) -> ComposeLayout {
+    let pad = pane_inner_pad();
+    let gap = cce_ui::layout::plate_gap();
+    let title_y = modal_y + pad;
+    let rows0 = title_y + COMPOSE_TITLE_H + gap;
+    let pitch = COMPOSE_FIELD_H + gap;
+    let body_y = rows0 + 4.0 * pitch;
+    let chips_y = body_y + COMPOSE_BODY_H + gap;
+    let buttons_y = chips_y + COMPOSE_CHIP_H + gap;
+    let cancel_x = modal_x + COMPOSE_W - pad - COMPOSE_BTN_W;
+    ComposeLayout {
+        x: modal_x,
+        pad,
+        gap,
+        title_y,
+        label_x: modal_x + pad,
+        field_x: modal_x + pad + COMPOSE_LABEL_W,
+        field_w: COMPOSE_W - 2.0 * pad - COMPOSE_LABEL_W,
+        rows_y: [rows0, rows0 + pitch, rows0 + 2.0 * pitch, rows0 + 3.0 * pitch],
+        body: (modal_x + pad, body_y, COMPOSE_W - 2.0 * pad, COMPOSE_BODY_H),
+        chips_y,
+        buttons_y,
+        attach_x: modal_x + pad,
+        send_x: cancel_x - gap - COMPOSE_BTN_W,
+        cancel_x,
+    }
+}
+
+/// The dialog's height: the bottom of its button row plus the padding.
+fn compose_h() -> f32 {
+    let l = compose_layout(0.0, 0.0);
+    l.buttons_y + COMPOSE_BTN_H + l.pad
+}
 
 fn compose_modal_origin(w: f32, h: f32) -> (f32, f32) {
-    (((w - COMPOSE_W) / 2.0).max(0.0), ((h - COMPOSE_H) / 2.0).max(0.0))
+    (((w - COMPOSE_W) / 2.0).max(0.0), ((h - compose_h()) / 2.0).max(0.0))
 }
 
 /// Rects of the attachment chips (one per queued file), in the row between
 /// the body and the buttons. Paint and hit-test both call this, so a click
 /// lands exactly on what was drawn.
 fn compose_chip_rects(attachments: &[String], modal_x: f32, modal_y: f32) -> Vec<(f32, f32, f32, f32)> {
+    let l = compose_layout(modal_x, modal_y);
     let mut rects = Vec::with_capacity(attachments.len());
-    let mut x = modal_x + 15.0;
-    let y = modal_y + 413.0;
+    let mut x = l.x + l.pad;
+    let y = l.chips_y;
     for path in attachments {
         let name = std::path::Path::new(path)
             .file_name()
@@ -768,9 +835,9 @@ fn compose_chip_rects(attachments: &[String], modal_x: f32, modal_y: f32) -> Vec
         // Estimated glyph advance at font_size 10 — the chip is a painted
         // quad, not a widget, so an estimate only has to be consistent
         // between paint and hit-test (it is: both use this fn).
-        let w = shown.chars().count() as f32 * 6.0 + 26.0;
-        rects.push((x, y, w, 24.0));
-        x += w + 8.0;
+        let w = shown.chars().count() as f32 * 6.0 + 2.0 * cce_ui::layout::CONTROL_TEXT_INSET + 10.0;
+        rects.push((x, y, w, COMPOSE_CHIP_H));
+        x += w + l.gap;
     }
     rects
 }
@@ -795,9 +862,9 @@ fn detail_chip_rects(atts: &[RemoteAttachment], detail_x: f32, origin_y: f32) ->
     let mut x = detail_x;
     let y = origin_y + DETAIL_CHIPS_Y;
     for att in atts {
-        let w = detail_chip_label(att).chars().count() as f32 * 6.0 + 16.0;
+        let w = detail_chip_label(att).chars().count() as f32 * 6.0 + 2.0 * cce_ui::layout::CONTROL_TEXT_INSET;
         rects.push((x, y, w, 22.0));
-        x += w + 8.0;
+        x += w + cce_ui::layout::plate_gap();
     }
     rects
 }
@@ -3801,7 +3868,7 @@ impl ClearEmailApp {
                     };
                     pc.text_with(
                         ellipsize(&row_head, fit(21.0)),
-                        list_x + 20.0,
+                        list_x + pane_inner_pad(),
                         draw_y + 6.0,
                         11.0,
                         if !email.read { [0xff, 0xff, 0xff] } else { [0xb0, 0xb0, 0xb8] },
@@ -3813,7 +3880,7 @@ impl ClearEmailApp {
                     let date_w = TextLabel::estimate_width(&email.date, 9.0);
                     pc.text_with(
                         email.date.clone(),
-                        list_x + list_w - 14.0 - date_w,
+                        list_x + list_w - pane_inner_pad() - date_w,
                         draw_y + 7.0,
                         9.0,
                         [0x70, 0x70, 0x75],
@@ -3824,7 +3891,7 @@ impl ClearEmailApp {
                     // Subject
                     pc.text_with(
                         ellipsize(&email.subject, fit(29.0)),
-                        list_x + 20.0,
+                        list_x + pane_inner_pad(),
                         draw_y + 20.0,
                         10.0,
                         if !email.read { [0x3a, 0x9a, 0xff] } else { [0x83, 0x83, 0x8a] },
@@ -3839,7 +3906,7 @@ impl ClearEmailApp {
                     let snippet = ellipsize(&snippet_raw, fit(37.0));
                     pc.text_with(
                         snippet,
-                        list_x + 20.0,
+                        list_x + pane_inner_pad(),
                         draw_y + 34.0,
                         9.0,
                         [0x60, 0x60, 0x65],
@@ -3894,7 +3961,7 @@ impl ClearEmailApp {
                 {
                     labels.push(TextLabel {
                         text: detail_chip_label(att),
-                        x: cx + 8.0,
+                        x: cx + cce_ui::layout::CONTROL_TEXT_INSET,
                         y: cy + 5.0,
                         font_size: 10.0,
                         color: [0xc8, 0xc8, 0xd2],
@@ -3907,7 +3974,7 @@ impl ClearEmailApp {
                 for (text, _, (cx, cy, _, _)) in self.html_chip_specs() {
                     labels.push(TextLabel {
                         text,
-                        x: cx + 8.0,
+                        x: cx + cce_ui::layout::CONTROL_TEXT_INSET,
                         y: cy + 5.0,
                         font_size: 10.0,
                         color: [0xc8, 0xc8, 0xd2],
@@ -3947,19 +4014,20 @@ impl ClearEmailApp {
         // 6. Compose Dialog Content
         if self.compose_open {
             let (modal_x, modal_y) = compose_modal_origin(w_f32, h_f32);
+            let l = compose_layout(modal_x, modal_y);
 
             labels.push(TextLabel {
                 text: self.compose_title.clone(),
-                x: modal_x + 15.0,
-                y: modal_y + 16.0,
+                x: l.label_x,
+                y: l.title_y,
                 font_size: 13.0,
                 color: [0xff, 0xff, 0xff],
             });
 
-            labels.push(TextLabel { text: "To:".to_string(), x: modal_x + 15.0, y: modal_y + 54.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-            labels.push(TextLabel { text: "Cc:".to_string(), x: modal_x + 15.0, y: modal_y + 94.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-            labels.push(TextLabel { text: "Bcc:".to_string(), x: modal_x + 15.0, y: modal_y + 134.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
-            labels.push(TextLabel { text: "Subject:".to_string(), x: modal_x + 15.0, y: modal_y + 174.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+            for (name, row_y) in ["To:", "Cc:", "Bcc:", "Subject:"].iter().zip(l.rows_y) {
+                // The label's baseline sits on the field's: 4px below its top at this size.
+                labels.push(TextLabel { text: name.to_string(), x: l.label_x, y: row_y + 4.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+            }
 
             // Attachment chips: name + "×", clickable to remove (hit-test in
             // handle_mouse_input via the same compose_chip_rects).
@@ -3974,7 +4042,7 @@ impl ClearEmailApp {
                     .unwrap_or("attachment");
                 labels.push(TextLabel {
                     text: format!("{} \u{00d7}", ellipsize(name, 22)),
-                    x: cx + 8.0,
+                    x: cx + cce_ui::layout::CONTROL_TEXT_INSET,
                     y: cy + 6.0,
                     font_size: 10.0,
                     color: [0xc8, 0xc8, 0xd2],
@@ -5251,16 +5319,18 @@ impl Application for ClearEmailApp {
             // Compose inputs layout
             if self.compose_open {
                 let (modal_x, modal_y) = compose_modal_origin(w_f32, h_f32);
+                let l = compose_layout(modal_x, modal_y);
 
-                self.compose_to.set_rect(modal_x + 80.0, modal_y + 50.0, 400.0, 26.0);
-                self.compose_cc.set_rect(modal_x + 80.0, modal_y + 90.0, 400.0, 26.0);
-                self.compose_bcc.set_rect(modal_x + 80.0, modal_y + 130.0, 400.0, 26.0);
-                self.compose_subject.set_rect(modal_x + 80.0, modal_y + 170.0, 400.0, 26.0);
-                self.compose_body.set_rect(modal_x + 15.0, modal_y + 210.0, 470.0, 195.0);
+                self.compose_to.set_rect(l.field_x, l.rows_y[0], l.field_w, COMPOSE_FIELD_H);
+                self.compose_cc.set_rect(l.field_x, l.rows_y[1], l.field_w, COMPOSE_FIELD_H);
+                self.compose_bcc.set_rect(l.field_x, l.rows_y[2], l.field_w, COMPOSE_FIELD_H);
+                self.compose_subject.set_rect(l.field_x, l.rows_y[3], l.field_w, COMPOSE_FIELD_H);
+                let (bx, by, bw, bh) = l.body;
+                self.compose_body.set_rect(bx, by, bw, bh);
 
-                self.btn_compose_attach.set_rect(modal_x + 15.0, modal_y + 452.0, 80.0, 28.0);
-                self.btn_compose_send.set_rect(modal_x + 320.0, modal_y + 452.0, 75.0, 28.0);
-                self.btn_compose_cancel.set_rect(modal_x + 410.0, modal_y + 452.0, 75.0, 28.0);
+                self.btn_compose_attach.set_rect(l.attach_x, l.buttons_y, COMPOSE_ATTACH_W, COMPOSE_BTN_H);
+                self.btn_compose_send.set_rect(l.send_x, l.buttons_y, COMPOSE_BTN_W, COMPOSE_BTN_H);
+                self.btn_compose_cancel.set_rect(l.cancel_x, l.buttons_y, COMPOSE_BTN_W, COMPOSE_BTN_H);
             }
 
 
@@ -5380,7 +5450,7 @@ impl Application for ClearEmailApp {
                 // Blue dot/unread indicator for this row
                 if !filtered[idx].read {
                     if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                        quads.push((list_x + 8.0, draw_y + 12.0, 6.0, 6.0, [0.20, 0.45, 0.85, 1.0]));
+                        quads.push((list_x + (pane_inner_pad() - 6.0) / 2.0, draw_y + 12.0, 6.0, 6.0, [0.20, 0.45, 0.85, 1.0]));
                     }
                 }
             }
@@ -5525,21 +5595,29 @@ impl Application for ClearEmailApp {
             // Semitransparent modal backdrop
             quads.push((0.0, 0.0, w_f32, h_f32, [0.0, 0.0, 0.0, 0.6]));
 
-            // Modal dialog container
-            quads.push((modal_x, modal_y, COMPOSE_W, COMPOSE_H, [0.08, 0.08, 0.12, 1.0]));
-            quads.push((modal_x, modal_y, COMPOSE_W, 1.0, [0.25, 0.35, 0.50, 0.40]));
-            quads.push((modal_x, modal_y + COMPOSE_H - 1.0, COMPOSE_W, 1.0, [0.25, 0.35, 0.50, 0.40]));
-            quads.push((modal_x, modal_y, 1.0, COMPOSE_H, [0.25, 0.35, 0.50, 0.40]));
-            quads.push((modal_x + COMPOSE_W - 1.0, modal_y, 1.0, COMPOSE_H, [0.25, 0.35, 0.50, 0.40]));
+            // The dialog: a raised popover plate (the menu material, frosted
+            // over the scrim) at the menu radius — the toolkit's own raised
+            // popover idiom, in place of an opaque quad with four hairlines.
+            {
+                let r = cce_ui::layout::menu_corner_radius();
+                quads.pc.plate(
+                    cce_ui::scene::layout::Rect { x: modal_x, y: modal_y, width: COMPOSE_W, height: compose_h() },
+                    (r, r, r, r),
+                    &cce_ui::scene::Material::popover(cce_ui::color::page_low_color()),
+                    cce_ui::layout::bevel_width(),
+                );
+            }
 
-            // Attachment chips: quads here, labels in the labels pass — both
-            // laid out by compose_chip_rects.
+            // Attachment chips: control plates here, labels in the labels
+            // pass — both laid out by compose_chip_rects.
             for (cx, cy, cw, ch) in compose_chip_rects(&self.compose_attachments, modal_x, modal_y) {
-                quads.push((cx, cy, cw, ch, [0.14, 0.14, 0.20, 1.0]));
-                quads.push((cx, cy, cw, 1.0, [0.25, 0.35, 0.50, 0.40]));
-                quads.push((cx, cy + ch - 1.0, cw, 1.0, [0.25, 0.35, 0.50, 0.40]));
-                quads.push((cx, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
-                quads.push((cx + cw - 1.0, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
+                let r = cce_ui::layout::control_corner_radius();
+                quads.pc.bevel(
+                    cce_ui::scene::layout::Rect { x: cx, y: cy, width: cw, height: ch },
+                    (r, r, r, r),
+                    &cce_ui::scene::Material::control(),
+                    cce_ui::layout::bevel_width().min(ch * 0.2),
+                );
             }
 
             self.compose_to.prepare_text(&mut self.font_system);
@@ -5983,7 +6061,7 @@ impl Application for ClearEmailApp {
                 let h_f32 = self.height as f32;
                 let (modal_x, modal_y) = compose_modal_origin(w_f32, h_f32);
 
-                if px < modal_x || px > modal_x + COMPOSE_W || py < modal_y || py > modal_y + COMPOSE_H {
+                if px < modal_x || px > modal_x + COMPOSE_W || py < modal_y || py > modal_y + compose_h() {
                     ctx.clear_focus();
                     self.compose_to.unfocus();
                     self.compose_cc.unfocus();
