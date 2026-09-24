@@ -627,22 +627,20 @@ fn save_emails_for_account(email: &str, emails: &[Email]) {
 }
 
 /// Inset from the WINDOW's outer edge to anything standing on the root
-/// plate. The same value as [`pane_pad`], deliberately: this window's base
-/// is a flat fill with no rolled rim (it paints a plain quad, not a root
-/// `PlateSpec` the way cce-files does), so the run of untouched plate at a
-/// window edge is exactly what the layout says, and one number makes every
-/// gap in the window read the same — rim to bar items, items to plates,
-/// plates to rim, and the split between the panes.
+/// plate: the toolkit's [`cce_ui::layout::root_plate_inset`], the plate's
+/// rolled rim plus one [`pane_pad`]. The padding is a run of flat plate
+/// face — the same run [`pane_gap`] leaves between the two panes — and the
+/// face only begins where the roll ends, so measured from the window edge
+/// the inset carries the roll too. That is what makes every gap in the
+/// window read the same: rim to bar items, items to plates, plates to rim,
+/// and the split between the panes.
 ///
-/// It used to add `bevel_width` (less a measured 1px optical trim) to make
-/// up for a rolled rim eating the first 9.3px, which was true of the window
-/// on 2026-09-19 and no longer is: with the roll gone the compensation
-/// alone was the discrepancy, 20px at the edges against 12 between the
-/// panes. If the window grows a rolled rim again, this is the one place to
-/// put the roll back — measured, not derived: screenshot, count columns of
-/// untouched plate, and compare with the gap between the panes.
+/// History: while this window's base was a flat quad with no rim (until
+/// 2026-09-24) the roll compensation alone was a 20-against-12 discrepancy,
+/// and the inset was briefly the bare padding. The base is the standard
+/// root plate now, and the roll is real again.
 fn window_pad() -> f32 {
-    pane_pad()
+    cce_ui::layout::root_plate_inset()
 }
 
 /// VISIBLE height of one menubar control — what you see, not the rect it is
@@ -5288,8 +5286,10 @@ impl Application for ClearEmailApp {
                 .collect()
         };
 
-        // 1. General window background (deep slate blue)
-        quads.push((0.0, 0.0, w_f32, h_f32, [0.05, 0.05, 0.07, 1.0]));
+        // 1. The standard root plate (cce-ui `PlateSpec::window`): the DE root
+        // material at its opacity, the shared silhouette arc, the rolled rim.
+        // Replaces a hardcoded deep-slate quad of this app's own.
+        quads.pc.root_plate(w_f32, h_f32);
 
         // Anything that must show THROUGH a frosted plate has to exist before
         // the FIRST blur plate in the frame: that one takes the backdrop
