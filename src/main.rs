@@ -1,5 +1,6 @@
 /// Embedded WPE WebKit for the HTML mail view — see src/wpe/mod.rs.
 #[cfg(feature = "wpe")]
+mod ipc;
 mod wpe;
 use cce_ui::widget::ScrollRegion;
 use wayland_client::QueueHandle;
@@ -115,6 +116,9 @@ enum AppMessage {
     /// default/OAuth all live there now; this app only reads accounts.json.
     ManageAccounts,
     SyncNow,
+    /// One line from the control socket (`cce-mail ctl …`), answered from
+    /// the app's live state and written back on the request's own stream.
+    Ipc(ipc::Request),
     Quit,
     Status(String),
     /// A failure a user must not miss: shown as a sticky red toast (no
@@ -3998,6 +4002,188 @@ impl<'a> __EmailQuadSink<'a> {
     }
 }
 
+/// The control socket's commands (src/ipc.rs parses and renders; this is
+/// the half that touches state). Actions go through `update` with the same
+/// messages the widgets send, so a driven window behaves exactly as a
+/// clicked one — including the side effects (`open` marks read, switching
+/// folders may start a sync).
+impl ClearEmailApp {
+    /// A folder named the way the switcher shows it or by its tag,
+    /// case-insensitively.
+    fn folder_by_name(&self, name: &str) -> Option<&FolderInfo> {
+        let n = name.trim().to_lowercase();
+        self.folders
+            .iter()
+            .find(|f| f.tag.to_lowercase() == n || f.label.to_lowercase() == n)
+    }
+
+    /// Set one message's read flag, mirrored to the server for inbox mail
+    /// (only inbox uids are known to be the INBOX's). False when no message
+    /// has that id.
+    fn set_read(&mut self, id: usize, read: bool) -> bool {
+        let mut push = None;
+        let Some(email) = self.emails.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+        if email.read != read {
+            email.read = read;
+            if email.folder == TAG_INBOX {
+                push = email.uid.map(|u| (u, read));
+            }
+        }
+        if let Some((uid, seen)) = push {
+            if let Some(acc) = self.accounts.get(self.selected_account_idx) {
+                set_seen_on_server(acc.clone(), uid, seen, self.sender.clone());
+            }
+        }
+        self.save_emails();
+        true
+    }
+
+    /// Open the compose dialog with a mailto:'s fields filled in.
+    fn prefill_compose(&mut self, m: &MailtoPrefill) {
+        self.clear_compose();
+        for (tb, v) in [
+            (&mut self.compose_to, &m.to),
+            (&mut self.compose_cc, &m.cc),
+            (&mut self.compose_bcc, &m.bcc),
+            (&mut self.compose_subject, &m.subject),
+            (&mut self.compose_body, &m.body),
+        ] {
+            tb.text = v.clone();
+            tb.edit_buffer = v.clone();
+        }
+        self.compose_title = "New Message".to_string();
+        self.compose_open = true;
+        self.needs_rebuild = true;
+    }
+
+    fn handle_ipc(&mut self, line: &str, needs_rebuild: &mut bool, exit: &mut bool) -> String {
+        use ipc::Command;
+        let ipc::Parsed { command, json } = match ipc::parse(line) {
+            Ok(p) => p,
+            Err(e) => return ipc::error(&e),
+        };
+        match command {
+            Command::Help => ipc::HELP.to_string(),
+            Command::Status => {
+                let folder_label = self
+                    .folders
+                    .iter()
+                    .find(|f| f.tag == self.current_folder)
+                    .map(|f| f.label.clone())
+                    .unwrap_or_default();
+                let in_folder = self.emails.iter().filter(|e| e.folder == self.current_folder);
+                let info = ipc::StatusInfo {
+                    account: self.accounts.get(self.selected_account_idx).map(|a| a.email.clone()),
+                    accounts: self.accounts.len(),
+                    folder_tag: self.current_folder.clone(),
+                    folder_label,
+                    cached: self.emails.len(),
+                    in_folder: in_folder.clone().count(),
+                    unread_in_folder: in_folder.filter(|e| !e.read).count(),
+                    selected: self.selected_email_id,
+                    syncing: self.sync_in_flight.is_some(),
+                    last_sync_secs_ago: self.last_sync_start.map(|t| t.elapsed().as_secs()),
+                };
+                ipc::render_status(&info, json)
+            }
+            Command::Accounts => ipc::render_accounts(&self.accounts, self.selected_account_idx, json),
+            Command::Folders => ipc::render_folders(&self.folders, &self.emails, &self.current_folder, json),
+            Command::List { folder, limit, unread } => {
+                let tag = match folder {
+                    None => self.current_folder.clone(),
+                    Some(name) => match self.folder_by_name(&name) {
+                        Some(f) => f.tag.clone(),
+                        None => return ipc::error(&format!("no folder {name:?} (see `folders`)")),
+                    },
+                };
+                let rows: Vec<&Email> = self
+                    .emails
+                    .iter()
+                    .filter(|e| e.folder == tag && (!unread || !e.read))
+                    .take(limit)
+                    .collect();
+                ipc::render_rows(&rows, json)
+            }
+            Command::Search { query, limit } => {
+                // Same match as the window's search box, across every folder.
+                let q = query.to_lowercase();
+                let rows: Vec<&Email> = self
+                    .emails
+                    .iter()
+                    .filter(|e| {
+                        e.from.to_lowercase().contains(&q)
+                            || e.subject.to_lowercase().contains(&q)
+                            || e.body.to_lowercase().contains(&q)
+                    })
+                    .take(limit)
+                    .collect();
+                ipc::render_rows(&rows, json)
+            }
+            Command::Get(id) => match self.emails.iter().find(|e| e.id == id) {
+                Some(e) => ipc::render_email(e, json),
+                None => ipc::error(&format!("no message with id {id}")),
+            },
+            Command::Open(id) => {
+                let Some(folder) = self.emails.iter().find(|e| e.id == id).map(|e| e.folder.clone()) else {
+                    return ipc::error(&format!("no message with id {id}"));
+                };
+                if folder != self.current_folder {
+                    self.update(AppMessage::SwitchFolder(folder), needs_rebuild, exit);
+                }
+                self.update(AppMessage::SelectEmail(id), needs_rebuild, exit);
+                ipc::ok(&format!("opened {id}"), json)
+            }
+            Command::MarkRead(id, read) => {
+                if !self.set_read(id, read) {
+                    return ipc::error(&format!("no message with id {id}"));
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+                ipc::ok(&format!("{id} marked {}", if read { "read" } else { "unread" }), json)
+            }
+            Command::SelectAccount(email) => {
+                let wanted = email.to_lowercase();
+                match self.accounts.iter().position(|a| a.email.to_lowercase() == wanted) {
+                    Some(idx) => {
+                        self.update(AppMessage::SelectAccount(idx), needs_rebuild, exit);
+                        ipc::ok(&format!("selected {}", self.accounts[idx].email), json)
+                    }
+                    None => ipc::error(&format!("no account {email:?} (see `accounts`)")),
+                }
+            }
+            Command::SwitchFolder(name) => match self.folder_by_name(&name).map(|f| f.tag.clone()) {
+                Some(tag) => {
+                    self.update(AppMessage::SwitchFolder(tag.clone()), needs_rebuild, exit);
+                    ipc::ok(&format!("switched to {tag}"), json)
+                }
+                None => ipc::error(&format!("no folder {name:?} (see `folders`)")),
+            },
+            Command::Sync => {
+                self.update(AppMessage::SyncNow, needs_rebuild, exit);
+                ipc::ok("sync started", json)
+            }
+            Command::Compose(None) => {
+                self.update(AppMessage::ComposeNew, needs_rebuild, exit);
+                ipc::ok("compose opened", json)
+            }
+            Command::Compose(Some(url)) => match parse_mailto(&url) {
+                Some(m) => {
+                    self.prefill_compose(&m);
+                    *needs_rebuild = true;
+                    ipc::ok("compose opened", json)
+                }
+                None => ipc::error(&format!("{url:?} is not a mailto: URL")),
+            },
+            Command::Quit => {
+                *exit = true;
+                ipc::ok("quitting", json)
+            }
+        }
+    }
+}
+
 impl Application for ClearEmailApp {
     type Message = AppMessage;
 
@@ -4007,6 +4193,7 @@ impl Application for ClearEmailApp {
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
         cce_ui::scale::set_scale_factor(1.0);
+        ipc::spawn_listener(_sender.clone());
 
         // The bar: the mail-icon app-menu button (its commands pop as a
         // context menu, see `open_mail_menu`) and two selection dropdowns
@@ -4091,22 +4278,6 @@ impl Application for ClearEmailApp {
         // editing flag selects, so a box left untouched must agree with one
         // the user clicked into.
         let mailto = std::env::args().nth(1).and_then(|a| parse_mailto(&a));
-        let (compose_open, compose_title) = match &mailto {
-            Some(m) => {
-                compose_to.text = m.to.clone();
-                compose_to.edit_buffer = m.to.clone();
-                compose_cc.text = m.cc.clone();
-                compose_cc.edit_buffer = m.cc.clone();
-                compose_bcc.text = m.bcc.clone();
-                compose_bcc.edit_buffer = m.bcc.clone();
-                compose_subject.text = m.subject.clone();
-                compose_subject.edit_buffer = m.subject.clone();
-                compose_body.text = m.body.clone();
-                compose_body.edit_buffer = m.body.clone();
-                (true, "New Message".to_string())
-            }
-            None => (false, String::new()),
-        };
 
 
         let emails = if let Some(acc) = accounts.get(selected_account_idx) {
@@ -4178,8 +4349,8 @@ impl Application for ClearEmailApp {
             split_dragging: false,
             context_menu_actions: Vec::new(),
             search_open: false,
-            compose_open,
-            compose_title,
+            compose_open: false,
+            compose_title: String::new(),
             status_message: None,
             sender: _sender.clone(),
             width: 1000,
@@ -4189,6 +4360,12 @@ impl Application for ClearEmailApp {
             needs_rebuild: true,
             ui_context: UiContext::new(),
         };
+
+        // A mailto: launch opens the compose dialog prefilled — the same
+        // path `compose <url>` on the control socket takes at runtime.
+        if let Some(m) = &mailto {
+            app.prefill_compose(m);
+        }
 
         // The first sync goes through start_sync like every other one, so it
         // gets the same keyring refresh and missing-password guard. It used to
@@ -4599,19 +4776,9 @@ impl Application for ClearEmailApp {
             }
             AppMessage::ToggleUnread => {
                 if let Some(id) = self.selected_email_id {
-                    let mut push = None;
-                    if let Some(email) = self.emails.iter_mut().find(|e| e.id == id) {
-                        email.read = !email.read;
-                        if email.folder == "inbox" {
-                            push = email.uid.map(|u| (u, email.read));
-                        }
+                    if let Some(read) = self.emails.iter().find(|e| e.id == id).map(|e| !e.read) {
+                        self.set_read(id, read);
                     }
-                    if let Some((uid, seen)) = push {
-                        if let Some(acc) = self.accounts.get(self.selected_account_idx) {
-                            set_seen_on_server(acc.clone(), uid, seen, self.sender.clone());
-                        }
-                    }
-                    self.save_emails();
                 }
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
@@ -4645,6 +4812,10 @@ impl Application for ClearEmailApp {
             }
             AppMessage::SyncNow => {
                 self.start_sync(true);
+            }
+            AppMessage::Ipc(req) => {
+                let reply = self.handle_ipc(&req.line, needs_rebuild, exit);
+                req.respond(&reply);
             }
             AppMessage::Quit => {
                 *exit = true;
@@ -6247,10 +6418,18 @@ impl Application for ClearEmailApp {
 }
 
 fn main() {
+    // `cce-mail ctl <command…>` talks to the running window over its
+    // control socket and exits; see src/ipc.rs for the command list.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("ctl") {
+        std::process::exit(ipc::run_client(&args[1..]));
+    }
+
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let _guard = rt.enter();
 
     cce_ui::engine::run::<ClearEmailApp>();
+    ipc::cleanup();
 }
 
 #[cfg(test)]
