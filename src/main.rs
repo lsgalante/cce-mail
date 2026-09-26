@@ -192,16 +192,6 @@ impl StatusToast {
     }
 }
 
-/// The two painted chips of the HTML view (detail header band, right side).
-#[cfg(feature = "wpe")]
-#[derive(Clone, Copy)]
-enum HtmlChip {
-    /// Switch between the rendered HTML and the text body.
-    ToggleView,
-    /// Lift/restore the remote-content block for this message.
-    ToggleImages,
-}
-
 /// App shortcuts, resolved once at startup from input.kdl
 /// (`cce-mail` domain → `cce-ui` domain), defaulting to the historical keys.
 struct EmailKeys {
@@ -315,6 +305,12 @@ struct ClearEmailApp {
     /// The user asked for the text body of the current message.
     #[cfg(feature = "wpe")]
     show_text: bool,
+    /// HTML-view toggles in the detail header band (text/HTML, remote
+    /// images); laid out each frame by `layout_html_buttons`.
+    #[cfg(feature = "wpe")]
+    btn_html_view: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    #[cfg(feature = "wpe")]
+    btn_html_images: cce_ui::widget::Adapted<cce_ui::widget::Button>,
     /// Where the page was last drawn (logical px), for routing input to it.
     #[cfg(feature = "wpe")]
     webview_rect: (f32, f32, f32, f32),
@@ -3089,6 +3085,11 @@ impl ClearEmailApp {
         self.ui_context.register_widget(id, ptr);
         let (id, ptr) = (self.btn_compose_attach.id(), self.btn_compose_attach.as_ptr_mut());
         self.ui_context.register_widget(id, ptr);
+        #[cfg(feature = "wpe")]
+        for btn in [&mut self.btn_html_view, &mut self.btn_html_images] {
+            let (id, ptr) = (btn.id(), btn.as_ptr_mut());
+            self.ui_context.register_widget(id, ptr);
+        }
         for btn in self.email_buttons.iter_mut() {
             let (id, ptr) = (btn.id(), btn.as_ptr_mut());
             self.ui_context.register_widget(id, ptr);
@@ -3585,41 +3586,39 @@ impl ClearEmailApp {
         ((px - x) * s, (py - y) * s)
     }
 
-    /// The HTML-view chips in the detail header band, right-aligned so they
-    /// never collide with the attachment chips growing from the left. Paint
-    /// and hit-test both call this — the detail_chip_rects convention.
+    /// Place the HTML-view buttons in the detail header band, right-aligned
+    /// so they never collide with the attachment chips growing from the
+    /// left. A button that does not apply is parked off-screen (the
+    /// email_buttons convention), which keeps it out of hit-testing too.
+    /// Runs before every paint, so events hit the rects on screen.
     #[cfg(feature = "wpe")]
-    fn html_chip_specs(&self) -> Vec<(String, HtmlChip, (f32, f32, f32, f32))> {
-        let Some(id) = self.selected_email_id else { return Vec::new() };
-        if self.compose_open || self.html_loaded != Some(id) {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
+    fn layout_html_buttons(&mut self) {
+        let shown = !self.compose_open
+            && self.selected_email_id.is_some()
+            && self.html_loaded == self.selected_email_id;
         let y = self.detail_origin_y() + DETAIL_CHIPS_Y;
         let (px, _, pw, _) = self.detail_pane_geom();
         let mut right = px + pw - pane_inner_pad();
-        let mut add = |label: String, chip: HtmlChip| {
-            let w = label.chars().count() as f32 * 6.0 + 16.0;
-            right -= w;
-            out.push((label, chip, (right, y, w, 22.0)));
-            right -= 8.0;
-        };
+        let view_label = if self.show_text { "View: Text" } else { "View: HTML" };
+        let images_label = if self.webview.images_allowed() { "Images: On" } else { "Load Images" };
+        let images_shown = shown && !self.show_text;
         // Built right-to-left: the view toggle holds the corner.
-        add(
-            if self.show_text { "View: Text".to_string() } else { "View: HTML".to_string() },
-            HtmlChip::ToggleView,
-        );
-        if !self.show_text {
-            add(
-                if self.webview.images_allowed() {
-                    "Images: On".to_string()
-                } else {
-                    "Load Images".to_string()
-                },
-                HtmlChip::ToggleImages,
-            );
+        for (btn, label, visible) in [
+            (&mut self.btn_html_view, view_label, shown),
+            (&mut self.btn_html_images, images_label, images_shown),
+        ] {
+            if !visible {
+                btn.set_rect(-9999.0, -9999.0, 0.0, 0.0);
+                continue;
+            }
+            btn.set_label(label);
+            // The compose buttons' size, so every button in the app matches
+            // (the floor also stops the toggles jittering between labels).
+            let w = btn.intrinsic_size().map_or(0.0, |s| s.width).max(COMPOSE_BTN_W);
+            right -= w;
+            btn.set_rect(right, y, w, COMPOSE_BTN_H);
+            right -= cce_ui::layout::plate_gap();
         }
-        out
     }
 
     /// Show `id`'s HTML: from the cache immediately, else a background
@@ -3961,19 +3960,6 @@ impl ClearEmailApp {
                 {
                     labels.push(TextLabel {
                         text: detail_chip_label(att),
-                        x: cx + cce_ui::layout::CONTROL_TEXT_INSET,
-                        y: cy + 5.0,
-                        font_size: 10.0,
-                        color: [0xc8, 0xc8, 0xd2],
-                    });
-                }
-
-                // HTML-view chip labels (quads paint in display_list; both
-                // sides lay out via html_chip_specs).
-                #[cfg(feature = "wpe")]
-                for (text, _, (cx, cy, _, _)) in self.html_chip_specs() {
-                    labels.push(TextLabel {
-                        text,
                         x: cx + cce_ui::layout::CONTROL_TEXT_INSET,
                         y: cy + 5.0,
                         font_size: 10.0,
@@ -4407,6 +4393,10 @@ impl Application for ClearEmailApp {
             html_cache: std::collections::HashMap::new(),
             #[cfg(feature = "wpe")]
             show_text: false,
+            #[cfg(feature = "wpe")]
+            btn_html_view: Button::new(-9999.0, -9999.0, 0.0, 0.0).with_label("View: HTML"),
+            #[cfg(feature = "wpe")]
+            btn_html_images: Button::new(-9999.0, -9999.0, 0.0, 0.0).with_label("Load Images"),
             #[cfg(feature = "wpe")]
             webview_rect: (0.0, 0.0, 0.0, 0.0),
             #[cfg(feature = "wpe")]
@@ -5337,6 +5327,10 @@ impl Application for ClearEmailApp {
 
             self.needs_rebuild = false;
         }
+        // Outside the rebuild gate: the labels follow webview state (the
+        // images toggle) that does not always raise needs_rebuild.
+        #[cfg(feature = "wpe")]
+        self.layout_html_buttons();
 
         // Now compute `filtered` only for rendering (immutable borrow of self)
         let filtered: Vec<&Email> = {
@@ -5484,15 +5478,12 @@ impl Application for ClearEmailApp {
                             quads.push((cx + cw - 1.0, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
                         }
 
-                        // HTML-view chips, right-aligned in the same band
-                        // (labels ride in the labels pass; same rect fn).
+                        // HTML-view buttons, right-aligned in the same band
+                        // (placed by layout_html_buttons; parked ones paint
+                        // off-screen).
                         #[cfg(feature = "wpe")]
-                        for (_, _, (cx, cy, cw, ch)) in self.html_chip_specs() {
-                            quads.push((cx, cy, cw, ch, [0.14, 0.14, 0.20, 1.0]));
-                            quads.push((cx, cy, cw, 1.0, [0.25, 0.35, 0.50, 0.40]));
-                            quads.push((cx, cy + ch - 1.0, cw, 1.0, [0.25, 0.35, 0.50, 0.40]));
-                            quads.push((cx, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
-                            quads.push((cx + cw - 1.0, cy, 1.0, ch, [0.25, 0.35, 0.50, 0.40]));
+                        for btn in [&self.btn_html_view, &self.btn_html_images] {
+                            cce_ui::scene::painter::paint_root_into(&self.ui_context, btn, &mut *quads.pc);
                         }
 
                         let body_w = self.detail_content_w();
@@ -5781,7 +5772,13 @@ impl Application for ClearEmailApp {
                 }
             }
 
-            // Detail pane: no widget hover routing — but the rendered HTML
+            #[cfg(feature = "wpe")]
+            {
+                if ctx.propagate_event(&mv, self.btn_html_view.id()) { changed = true; }
+                if ctx.propagate_event(&mv, self.btn_html_images.id()) { changed = true; }
+            }
+
+            // Detail pane: the HTML-view buttons above — and the rendered HTML
             // page tracks the pointer (hover states, drag selection). While
             // a press is held the page keeps the pointer even outside the
             // rect, so selections drag naturally.
@@ -5889,20 +5886,6 @@ impl Application for ClearEmailApp {
                                 msg_out = Some(AppMessage::OpenAttachment(email.id, i));
                                 changed = true;
                             }
-                        }
-                    }
-                    // HTML-view chips: same convention, right side of the band.
-                    #[cfg(feature = "wpe")]
-                    for (_, chip, (cx, cy, cw, ch)) in self.html_chip_specs() {
-                        if px >= cx && px <= cx + cw && py >= cy && py <= cy + ch {
-                            match chip {
-                                HtmlChip::ToggleView => self.show_text = !self.show_text,
-                                HtmlChip::ToggleImages => {
-                                    let lift = !self.webview.images_allowed();
-                                    self.webview.set_images_allowed(lift);
-                                }
-                            }
-                            changed = true;
                         }
                     }
                 }
@@ -6148,8 +6131,27 @@ impl Application for ClearEmailApp {
                 }
             }
 
-            // The detail pane takes no widget events — but the rendered HTML
-            // page does take raw pointer input (text selection, link
+            // HTML-view buttons (a release commits the click; parked ones
+            // never take a press).
+            #[cfg(feature = "wpe")]
+            {
+                if ctx.propagate_event(&ev, self.btn_html_view.id()) {
+                    changed = true;
+                    if state == ElementState::Released && self.btn_html_view.take_click() {
+                        self.show_text = !self.show_text;
+                    }
+                }
+                if ctx.propagate_event(&ev, self.btn_html_images.id()) {
+                    changed = true;
+                    if state == ElementState::Released && self.btn_html_images.take_click() {
+                        let lift = !self.webview.images_allowed();
+                        self.webview.set_images_allowed(lift);
+                    }
+                }
+            }
+
+            // The detail pane takes no widget events besides those — but the
+            // rendered HTML page does take raw pointer input (text selection, link
             // clicks). Presses reach here only after every overlay (card
             // menu, bar dropdowns) had its chance and returned; the release
             // follows the press wherever the pointer went, so a drag out of
