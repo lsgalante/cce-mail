@@ -4072,32 +4072,43 @@ impl ClearEmailApp {
                     plate_x + plate_w - pane_inner_pad(),
                     plate_y + plate_h,
                 ]);
-                let header_lines: [(String, f32, f32, [u8; 3]); 4] = [
-                    (email.subject.clone(), DETAIL_SUBJECT_Y, 15.0, [0xff, 0xff, 0xff]),
-                    (format!("From: {}", email.from), DETAIL_FROM_Y, 11.0, [0xb0, 0xb0, 0xb8]),
-                    (format!("To:   {}", email.to), DETAIL_TO_Y, 11.0, [0x83, 0x83, 0x8a]),
-                    (format!("Date: {}", email.date), DETAIL_DATE_Y, 11.0, [0x83, 0x83, 0x8a]),
+                // (text, y, size, color, ellipsized). The To line is drawn
+                // in full — an address list is read end to end, and an
+                // ellipsis in the middle of one hides exactly the part that
+                // tells recipients apart — so only its clip rect bounds it.
+                let header_lines: [(String, f32, f32, [u8; 3], bool); 4] = [
+                    (email.subject.clone(), DETAIL_SUBJECT_Y, 15.0, [0xff, 0xff, 0xff], true),
+                    (format!("From: {}", email.from), DETAIL_FROM_Y, 11.0, [0xb0, 0xb0, 0xb8], true),
+                    (format!("To:   {}", email.to), DETAIL_TO_Y, 11.0, [0x83, 0x83, 0x8a], false),
+                    (format!("Date: {}", email.date), DETAIL_DATE_Y, 11.0, [0x83, 0x83, 0x8a], true),
                 ];
                 // The buttons stand on the date line at the right edge, so
                 // any line whose box reaches into their band stops short of
-                // them; the subject and From above stay full width.
+                // them — ellipsized to fit, or for the full-length To line
+                // clipped there; the subject and From above stay full width.
                 let buttons_left = self.html_buttons_left();
-                for (text, dy, font_size, color) in header_lines {
+                for (text, dy, font_size, color, ellipsized) in header_lines {
                     let mut w = content_w;
+                    let mut bounds = header_bounds;
                     if let Some(bl) = buttons_left {
                         let buttons_top = DETAIL_LINES_BOTTOM - COMPOSE_BTN_H;
                         if dy + DETAIL_LINE_H > buttons_top {
-                            w = w.min(bl - cce_ui::layout::plate_gap() - detail_x);
+                            let right = bl - cce_ui::layout::plate_gap();
+                            w = w.min(right - detail_x);
+                            if let Some(b) = bounds.as_mut() {
+                                b[2] = b[2].min(right);
+                            }
                         }
                     }
+                    let shown = if ellipsized { ellipsize_to_width(&text, font_size, w) } else { text };
                     pc.text_with(
-                        ellipsize_to_width(&text, font_size, w),
+                        shown,
                         detail_x,
                         self.detail_origin_y() + dy,
                         font_size,
                         color,
                         None,
-                        header_bounds,
+                        bounds,
                     );
                 }
 
