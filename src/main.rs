@@ -767,21 +767,21 @@ const CONTEXT_ROW_H: f32 = 24.0;
 // to the list, so `list_geom` is the single source for where the rows start.
 const SEARCH_ROW_H: f32 = 26.0;
 
-// Detail-pane vertical layout, every offset measured from the pane plate's
+// Detail header layout, every offset measured from the HEADER plate's
 // top-left of its CONTENT — the plate's rim taken in by `pane_inner_pad`
-// (`detail_origin_y`). They were measured from the menubar back when the pane
-// had no plate of its own, and carried the padding baked into each value;
-// the subject now sits at 0 because the origin already is the padded corner.
-// These were literals scattered across paint, layout, the scrollbar geometry
-// and three input handlers; the 170/190 pair in particular had to move in
-// lockstep or the scrollbar detached from the text it scrolls, so the body
-// pair lives behind `detail_body_geom` as one source.
+// (`detail_origin_y`). The header (subject, From/To/Date, attachment chips
+// and the HTML-view buttons) is a plate of its own above the preview
+// plate, so the body no longer has an offset in this list: it starts one
+// padding inside the preview plate (`detail_body_geom`). The chips and the
+// buttons share the last row, and the header plate's height falls out of
+// that row's bottom (`DETAIL_HEADER_CONTENT_H`) rather than being a number
+// of its own.
 const DETAIL_SUBJECT_Y: f32 = 0.0;
 const DETAIL_FROM_Y: f32 = 25.0;
 const DETAIL_TO_Y: f32 = 45.0;
 const DETAIL_DATE_Y: f32 = 65.0;
 const DETAIL_CHIPS_Y: f32 = 80.0;
-const DETAIL_BODY_Y: f32 = 110.0;
+const DETAIL_HEADER_CONTENT_H: f32 = DETAIL_CHIPS_Y + COMPOSE_BTN_H;
 
 // Compose modal geometry. One source of truth: the background quads, the
 // input rects, the labels, the chip row and the outside-click test all
@@ -3322,22 +3322,43 @@ impl ClearEmailApp {
         (top, (self.height as f32 - top - window_pad()).max(50.0))
     }
 
-    /// The detail pane's plate: (x, y, w, h). It shares the list's vertical
-    /// band, and mirrors the list's inset from the window's left edge on the
-    /// right — two plates either side of the separator, which the equal gaps
-    /// leave centred between them.
-    fn detail_pane_geom(&self) -> (f32, f32, f32, f32) {
+    /// The detail column: (x, w), the list's vertical band's right-hand
+    /// side. It mirrors the list's inset from the window's left edge on
+    /// the right — plates either side of the separator, which the equal
+    /// gaps leave centred between them.
+    fn detail_column(&self) -> (f32, f32) {
         let (lw, _, _) = self.split_geom();
-        let (top, h) = self.list_geom();
         let x = window_pad() + lw + pane_gap();
         let w = ((self.width as f32 - window_pad()) - x).max(DETAIL_W_MIN);
-        (x, top, w, h)
+        (x, w)
     }
 
-    /// The y the pane's own offsets are measured from: the top of its content,
-    /// which is its plate's top edge taken in by the plate padding.
+    /// The header plate: (x, y, w, h), at the top of the detail column. It
+    /// holds the subject, the address lines, the attachment chips and the
+    /// HTML-view buttons — everything about the message that is not the
+    /// message — and is exactly as tall as that content plus its padding.
+    fn detail_header_geom(&self) -> (f32, f32, f32, f32) {
+        let (x, w) = self.detail_column();
+        let (top, _) = self.list_geom();
+        (x, top, w, DETAIL_HEADER_CONTENT_H + 2.0 * pane_inner_pad())
+    }
+
+    /// The preview plate: (x, y, w, h), the rest of the detail column below
+    /// the header plate and one pane gap — the seam between the two is the
+    /// same as the seam between the list and them.
+    fn detail_pane_geom(&self) -> (f32, f32, f32, f32) {
+        let (x, w) = self.detail_column();
+        let (top, h) = self.list_geom();
+        let (_, hy, _, hh) = self.detail_header_geom();
+        let y = hy + hh + pane_gap();
+        (x, y, w, (top + h - y).max(50.0))
+    }
+
+    /// The y the header's own offsets are measured from: the top of its
+    /// content, which is the header plate's top edge taken in by the plate
+    /// padding.
     fn detail_origin_y(&self) -> f32 {
-        self.detail_pane_geom().1 + pane_inner_pad()
+        self.detail_header_geom().1 + pane_inner_pad()
     }
 
     /// The body scrollbar's lane: (x, width), on the plate's CENTRE line, as
@@ -3795,12 +3816,12 @@ impl ClearEmailApp {
     #[cfg(not(feature = "wpe"))]
     fn reset_html(&mut self) {}
 
-    /// The detail-pane body box: (top y, height). Paint, layout, the
-    /// scrollbar and the scroll clamps all derive from this one pair.
+    /// The preview body box: (top y, height) — the preview plate taken in by
+    /// its padding top and bottom. Paint, layout, the scrollbar and the
+    /// scroll clamps all derive from this one pair.
     fn detail_body_geom(&self) -> (f32, f32) {
-        let top = self.detail_origin_y() + DETAIL_BODY_Y;
         let (_, py, _, ph) = self.detail_pane_geom();
-        // The body stops short of the plate's bottom edge, not the window's.
+        let top = py + pane_inner_pad();
         let h = ((py + ph - pane_inner_pad()) - top).max(100.0);
         (top, h)
     }
@@ -4007,7 +4028,7 @@ impl ClearEmailApp {
                 // as the backstop for the width estimate — these used to ride
                 // the boundless `labels` drain and ran off the plate.
                 let content_w = self.detail_content_w();
-                let (plate_x, plate_y, plate_w, plate_h) = self.detail_pane_geom();
+                let (plate_x, plate_y, plate_w, plate_h) = self.detail_header_geom();
                 let header_bounds = Some([
                     plate_x + pane_inner_pad(),
                     plate_y,
@@ -5459,16 +5480,18 @@ impl Application for ClearEmailApp {
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.folder_dropdown, &mut *quads.pc);
         cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.account_dropdown, &mut *quads.pc);
 
-        // 3. The detail pane's plate. Same fill and same radius as the list:
-        // the two panes are one pair, and the gap between them is the seam —
-        // there is no drawn separator line. The split is still draggable in
-        // that gap; `cursor_icon` puts resize arrows over the grab band, which
-        // is what advertises it now that nothing is painted there.
-        // Nothing here reaches the plate's corners (the body carries its own
+        // 3. The detail column's two plates: the header above, the preview
+        // below. Same fill and same radius as the list: the three are one
+        // set, and the gaps between them are the seams — there is no drawn
+        // separator line. The split is still draggable in the vertical gap;
+        // `cursor_icon` puts resize arrows over the grab band, which is what
+        // advertises it now that nothing is painted there. Both are drawn
+        // whether or not a message is on show, so the layout does not jump
+        // on the first selection.
+        // Nothing here reaches the plates' corners (the body carries its own
         // text bounds), so this needs no rounded clip the way the list — whose
         // cards span its full width — does.
-        {
-            let (px, py, pw, ph) = self.detail_pane_geom();
+        for (px, py, pw, ph) in [self.detail_header_geom(), self.detail_pane_geom()] {
             quads.pc.rounded_rect(
                 cce_ui::scene::layout::Rect { x: px, y: py, width: pw, height: ph },
                 cce_ui::layout::list_corner_radius(),
