@@ -4064,7 +4064,6 @@ impl ClearEmailApp {
                 // column, and the label is clipped to the plate's content rect
                 // as the backstop for the width estimate — these used to ride
                 // the boundless `labels` drain and ran off the plate.
-                let content_w = self.detail_content_w();
                 let (plate_x, plate_y, plate_w, plate_h) = self.detail_header_geom();
                 let header_bounds = Some([
                     plate_x + pane_inner_pad(),
@@ -4072,38 +4071,32 @@ impl ClearEmailApp {
                     plate_x + plate_w - pane_inner_pad(),
                     plate_y + plate_h,
                 ]);
-                // (text, y, size, color, ellipsized). The subject and the
-                // address lines are drawn in full — each is read end to
-                // end, and an ellipsis in the middle hides exactly the part
-                // that tells one apart from another — so only their clip
-                // rects bound them. The Date alone keeps its ellipsis.
-                let header_lines: [(String, f32, f32, [u8; 3], bool); 4] = [
-                    (email.subject.clone(), DETAIL_SUBJECT_Y, 15.0, [0xff, 0xff, 0xff], false),
-                    (format!("From: {}", email.from), DETAIL_FROM_Y, 11.0, [0xb0, 0xb0, 0xb8], false),
-                    (format!("To:   {}", email.to), DETAIL_TO_Y, 11.0, [0x83, 0x83, 0x8a], false),
-                    (format!("Date: {}", email.date), DETAIL_DATE_Y, 11.0, [0x83, 0x83, 0x8a], true),
+                // Every line is drawn in full — a subject or an address is
+                // read end to end, and an ellipsis in the middle hides
+                // exactly the part that tells one apart from another — so
+                // only the clip rect bounds a line: the plate's content
+                // edge, or the HTML-view buttons' left edge for a line whose
+                // box reaches into their band (they stand on the date line
+                // at the right edge).
+                let header_lines: [(String, f32, f32, [u8; 3]); 4] = [
+                    (email.subject.clone(), DETAIL_SUBJECT_Y, 15.0, [0xff, 0xff, 0xff]),
+                    (format!("From: {}", email.from), DETAIL_FROM_Y, 11.0, [0xb0, 0xb0, 0xb8]),
+                    (format!("To:   {}", email.to), DETAIL_TO_Y, 11.0, [0x83, 0x83, 0x8a]),
+                    (format!("Date: {}", email.date), DETAIL_DATE_Y, 11.0, [0x83, 0x83, 0x8a]),
                 ];
-                // The buttons stand on the date line at the right edge, so
-                // any line whose box reaches into their band stops short of
-                // them — ellipsized to fit, or for the full-length To line
-                // clipped there; the subject and From above stay full width.
                 let buttons_left = self.html_buttons_left();
-                for (text, dy, font_size, color, ellipsized) in header_lines {
-                    let mut w = content_w;
+                for (text, dy, font_size, color) in header_lines {
                     let mut bounds = header_bounds;
                     if let Some(bl) = buttons_left {
                         let buttons_top = DETAIL_LINES_BOTTOM - COMPOSE_BTN_H;
                         if dy + DETAIL_LINE_H > buttons_top {
-                            let right = bl - cce_ui::layout::plate_gap();
-                            w = w.min(right - detail_x);
                             if let Some(b) = bounds.as_mut() {
-                                b[2] = b[2].min(right);
+                                b[2] = b[2].min(bl - cce_ui::layout::plate_gap());
                             }
                         }
                     }
-                    let shown = if ellipsized { ellipsize_to_width(&text, font_size, w) } else { text };
                     pc.text_with(
-                        shown,
+                        text,
                         detail_x,
                         self.detail_origin_y() + dy,
                         font_size,
