@@ -772,16 +772,21 @@ const SEARCH_ROW_H: f32 = 26.0;
 // (`detail_origin_y`). The header (subject, From/To/Date, attachment chips
 // and the HTML-view buttons) is a plate of its own above the preview
 // plate, so the body no longer has an offset in this list: it starts one
-// padding inside the preview plate (`detail_body_geom`). The chips and the
-// buttons share the last row, and the header plate's height falls out of
-// that row's bottom (`DETAIL_HEADER_CONTENT_H`) rather than being a number
-// of its own.
+// padding inside the preview plate (`detail_body_geom`). The plate is as
+// tall as what it holds (`detail_header_content_h`): the date line's
+// bottom, or the chip row's when the message has attachments. The
+// HTML-view buttons add no height — they ride the right edge with their
+// bottoms on the date line.
 const DETAIL_SUBJECT_Y: f32 = 0.0;
 const DETAIL_FROM_Y: f32 = 25.0;
 const DETAIL_TO_Y: f32 = 45.0;
 const DETAIL_DATE_Y: f32 = 65.0;
+/// The 11px metadata lines' box height: where the date line's bottom is,
+/// which the buttons align to and the plate ends at without chips.
+const DETAIL_LINE_H: f32 = 14.0;
+const DETAIL_LINES_BOTTOM: f32 = DETAIL_DATE_Y + DETAIL_LINE_H;
 const DETAIL_CHIPS_Y: f32 = 80.0;
-const DETAIL_HEADER_CONTENT_H: f32 = DETAIL_CHIPS_Y + COMPOSE_BTN_H;
+const DETAIL_CHIP_H: f32 = 22.0;
 
 // Compose modal geometry. One source of truth: the background quads, the
 // input rects, the labels, the chip row and the outside-click test all
@@ -905,7 +910,7 @@ fn detail_chip_rects(atts: &[RemoteAttachment], detail_x: f32, origin_y: f32) ->
     let y = origin_y + DETAIL_CHIPS_Y;
     for att in atts {
         let w = detail_chip_label(att).chars().count() as f32 * 6.0 + 2.0 * cce_ui::layout::CONTROL_TEXT_INSET;
-        rects.push((x, y, w, 22.0));
+        rects.push((x, y, w, DETAIL_CHIP_H));
         x += w + cce_ui::layout::plate_gap();
     }
     rects
@@ -3333,14 +3338,45 @@ impl ClearEmailApp {
         (x, w)
     }
 
+    /// Height of the header plate's content: down to the date line, or to
+    /// the chip row when the message on show has server attachments. The
+    /// buttons never add to it — they sit within the lines' band.
+    fn detail_header_content_h(&self) -> f32 {
+        let chips = self
+            .selected_email_id
+            .and_then(|id| self.emails.iter().find(|e| e.id == id))
+            .is_some_and(|e| !e.remote_attachments.is_empty());
+        if chips {
+            DETAIL_CHIPS_Y + DETAIL_CHIP_H
+        } else {
+            DETAIL_LINES_BOTTOM
+        }
+    }
+
     /// The header plate: (x, y, w, h), at the top of the detail column. It
     /// holds the subject, the address lines, the attachment chips and the
     /// HTML-view buttons — everything about the message that is not the
-    /// message — and is exactly as tall as that content plus its padding.
+    /// message — and is exactly as tall as that content plus its padding,
+    /// so it shrinks when there are no chips.
     fn detail_header_geom(&self) -> (f32, f32, f32, f32) {
         let (x, w) = self.detail_column();
         let (top, _) = self.list_geom();
-        (x, top, w, DETAIL_HEADER_CONTENT_H + 2.0 * pane_inner_pad())
+        (x, top, w, self.detail_header_content_h() + 2.0 * pane_inner_pad())
+    }
+
+    /// The left edge of the HTML-view buttons on show, if any — the header
+    /// lines sharing their band are ellipsized short of it.
+    #[cfg(feature = "wpe")]
+    fn html_buttons_left(&self) -> Option<f32> {
+        [&self.btn_html_view, &self.btn_html_images]
+            .into_iter()
+            .map(|b| b.rect().0)
+            .filter(|x| *x > -9000.0)
+            .min_by(|a, b| a.total_cmp(b))
+    }
+    #[cfg(not(feature = "wpe"))]
+    fn html_buttons_left(&self) -> Option<f32> {
+        None
     }
 
     /// The preview plate: (x, y, w, h), the rest of the detail column below
@@ -3688,17 +3724,18 @@ impl ClearEmailApp {
         ((px - x) * s, (py - y) * s)
     }
 
-    /// Place the HTML-view buttons in the detail header band, right-aligned
-    /// so they never collide with the attachment chips growing from the
-    /// left. A button that does not apply is parked off-screen (the
-    /// email_buttons convention), which keeps it out of hit-testing too.
-    /// Runs before every paint, so events hit the rects on screen.
+    /// Place the HTML-view buttons in the header plate, right-aligned with
+    /// their bottoms on the date line, so they never collide with the
+    /// attachment chips growing from the left below. A button that does not
+    /// apply is parked off-screen (the email_buttons convention), which
+    /// keeps it out of hit-testing too. Runs before every paint, so events
+    /// hit the rects on screen.
     #[cfg(feature = "wpe")]
     fn layout_html_buttons(&mut self) {
         let shown = !self.compose_open
             && self.selected_email_id.is_some()
             && self.html_loaded == self.selected_email_id;
-        let y = self.detail_origin_y() + DETAIL_CHIPS_Y;
+        let y = self.detail_origin_y() + DETAIL_LINES_BOTTOM - COMPOSE_BTN_H;
         let (px, _, pw, _) = self.detail_pane_geom();
         let mut right = px + pw - pane_inner_pad();
         let view_label = if self.show_text { "View: Text" } else { "View: HTML" };
@@ -4041,9 +4078,20 @@ impl ClearEmailApp {
                     (format!("To:   {}", email.to), DETAIL_TO_Y, 11.0, [0x83, 0x83, 0x8a]),
                     (format!("Date: {}", email.date), DETAIL_DATE_Y, 11.0, [0x83, 0x83, 0x8a]),
                 ];
+                // The buttons stand on the date line at the right edge, so
+                // any line whose box reaches into their band stops short of
+                // them; the subject and From above stay full width.
+                let buttons_left = self.html_buttons_left();
                 for (text, dy, font_size, color) in header_lines {
+                    let mut w = content_w;
+                    if let Some(bl) = buttons_left {
+                        let buttons_top = DETAIL_LINES_BOTTOM - COMPOSE_BTN_H;
+                        if dy + DETAIL_LINE_H > buttons_top {
+                            w = w.min(bl - cce_ui::layout::plate_gap() - detail_x);
+                        }
+                    }
                     pc.text_with(
-                        ellipsize_to_width(&text, font_size, content_w),
+                        ellipsize_to_width(&text, font_size, w),
                         detail_x,
                         self.detail_origin_y() + dy,
                         font_size,
