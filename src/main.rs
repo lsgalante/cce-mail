@@ -197,6 +197,13 @@ impl StatusToast {
 struct EmailKeys {
     compose: String,
     open_search: String,
+    /// Pane focus, under the toolkit's own names (`focus_next_group` /
+    /// `focus_prev_group`, the chords the runner would claim for plate
+    /// navigation if this app opted in): rebinding them DE-wide in the
+    /// `cce-ui` domain rebinds them here too, and a `cce-mail` entry still
+    /// overrides that.
+    focus_next_pane: String,
+    focus_prev_pane: String,
 }
 
 impl EmailKeys {
@@ -204,6 +211,29 @@ impl EmailKeys {
         Self {
             compose: cce_ui::input::app_chord("compose", "ctrl+n"),
             open_search: cce_ui::input::app_chord("open_search", "/"),
+            focus_next_pane: cce_ui::input::app_chord("focus_next_group", "ctrl+tab"),
+            focus_prev_pane: cce_ui::input::app_chord("focus_prev_group", "ctrl+shift+tab"),
+        }
+    }
+}
+
+/// The two pane plates keyboard focus walks between (cce-designer's
+/// `focused_pane`, at this app's scale): the message list on the left and
+/// the preview on the right. Ctrl+Tab cycles, `h` / `l` jump, and `j` / `k`
+/// act inside whichever holds it — the selection in the list, the body
+/// scroll in the preview. Up/Down and Delete stay global: they moved the
+/// selection from anywhere before there was a focused pane, and still do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pane {
+    List,
+    Detail,
+}
+
+impl Pane {
+    fn other(self) -> Self {
+        match self {
+            Pane::List => Pane::Detail,
+            Pane::Detail => Pane::List,
         }
     }
 }
@@ -322,6 +352,10 @@ struct ClearEmailApp {
     /// un-clobbered — [`Self::split_geom`] clamps at use, not here.
     list_w: f32,
     split_dragging: bool,
+    /// Which pane plate keyboard focus is on — see [`Pane`]. Set by the
+    /// chords and by a left press inside either plate; drawn as the plate's
+    /// highlight ring.
+    focused_pane: Pane,
     /// Message per row of the open card context menu, built beside its
     /// labels — index 0 is the inert subject header, hence Option.
     context_menu_actions: Vec<Option<AppMessage>>,
@@ -378,6 +412,18 @@ struct ClearEmailApp {
     font_system: FontSystem,
     needs_rebuild: bool,
     ui_context: UiContext,
+}
+
+/// Spawn `cmd` and reap it from a background thread, so a viewer or the
+/// settings app launched from here never lingers as a zombie. This was
+/// `cce_ui::process::spawn_detached` until the toolkit dropped that module
+/// (cce-ui 4e94236) as caller-less — it had three callers here.
+fn spawn_detached(mut cmd: std::process::Command) -> std::io::Result<()> {
+    let mut child = cmd.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 fn get_accounts_path() -> std::path::PathBuf {
@@ -3386,6 +3432,41 @@ impl ClearEmailApp {
         }
     }
 
+    /// One line of preview scroll, `j` / `k` with the preview focused. The
+    /// text body glides a wheel notch the way the list's own arrows do; the
+    /// HTML page gets the equivalent arrow key, since the engine owns that
+    /// scroll (press and release both, so no key is left held in WebKit).
+    /// `body_h` is the text body's visible height, read by the caller
+    /// before any borrow of the context.
+    fn step_body(&mut self, down: bool, body_h: f32) {
+        #[cfg(feature = "wpe")]
+        if self.html_on_show() {
+            use cce_ui::widget::NamedKey;
+            let key = Key::Named(if down { NamedKey::ArrowDown } else { NamedKey::ArrowUp });
+            for state in [ElementState::Pressed, ElementState::Released] {
+                self.webview.key_ui(&KeyEvent {
+                    state,
+                    logical_key: key.clone(),
+                    text: None,
+                    repeat: false,
+                    ctrl: false,
+                    shift: false,
+                    alt: false,
+                });
+            }
+            return;
+        }
+        if self.selected_email_id.is_none() {
+            return;
+        }
+        let max = (self.body_content_h - body_h).max(0.0);
+        let b = Bounds::max(max);
+        let s = cce_ui::widget::scroll_motion::scroll_settings();
+        self.body_motion.reconcile(0.0, self.body_scroll);
+        self.body_motion.y.wheel(if down { LINE_PX } else { -LINE_PX }, b, &s);
+        self.body_scroll = self.body_motion.y.pos();
+    }
+
     /// Scroll the list the least amount that puts row `idx` fully on screen.
     fn scroll_row_into_view(&mut self, idx: usize) {
         let (_, height) = self.list_geom();
@@ -4403,6 +4484,7 @@ impl Application for ClearEmailApp {
             webview_mouse_down: false,
             list_w: load_list_w().unwrap_or(LIST_W_DEFAULT),
             split_dragging: false,
+            focused_pane: Pane::List,
             context_menu_actions: Vec::new(),
             search_open: false,
             compose_open: false,
@@ -4649,7 +4731,7 @@ impl Application for ClearEmailApp {
                         // all of it before the handler even spawns.
                         let mut cmd = std::process::Command::new("gio");
                         cmd.arg("open").arg(&path);
-                        let _ = cce_ui::process::spawn_detached(cmd);
+                        let _ = spawn_detached(cmd);
                     }
                     Err(e) => {
                         self.status_message = Some(StatusToast::error(format!("Attachment: {}", e)));
@@ -4861,7 +4943,7 @@ impl Application for ClearEmailApp {
             AppMessage::ManageAccounts => {
                 let mut cmd = std::process::Command::new("cce-system-interface");
                 cmd.arg("accounts");
-                let _ = cce_ui::process::spawn_detached(cmd);
+                let _ = spawn_detached(cmd);
                 self.status_message = Some(StatusToast::info("Opening System Settings...", 4.0));
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
@@ -4997,7 +5079,7 @@ impl Application for ClearEmailApp {
                         // ~50ms of shell script on the click-to-tab path.
                         let mut cmd = std::process::Command::new("gio");
                         cmd.arg("open").arg(&uri);
-                        let _ = cce_ui::process::spawn_detached(cmd);
+                        let _ = spawn_detached(cmd);
                         self.status_message =
                             Some(StatusToast::info(format!("Opening {}", ellipsize(&uri, 60)), 4.0));
                         *needs_rebuild = true;
@@ -5456,6 +5538,28 @@ impl Application for ClearEmailApp {
         // colors, rather than the square quads the tuple path drew.
         self.email_list.push_prims(&mut *quads.pc);
 
+        // The focused pane's highlight ring: cce-designer's flat-style pane
+        // focus (`append_context_border`), at the plates' own radius. Both
+        // plates here are flat fills with no relief to tint, so the ring is
+        // the cue in either relief style. Over the cards, which span the
+        // list plate's full width and would otherwise cover it.
+        {
+            let (x, y, w, h) = match self.focused_pane {
+                Pane::List => (self.email_list.x, self.email_list.y, self.email_list.w, self.email_list.h),
+                Pane::Detail => self.detail_pane_geom(),
+            };
+            let mut color = cce_ui::colors::highlight_primary_color();
+            color[3] = 0.9;
+            let r = cce_ui::layout::list_corner_radius();
+            quads.pc.border(
+                cce_ui::scene::layout::Rect { x, y, width: w, height: h },
+                (r, r, r, r),
+                [0.0; 4],
+                color,
+                2.0,
+            );
+        }
+
         // 4. Detail View Area
         if let Some(selected_id) = self.selected_email_id {
             if self.emails.iter().any(|e| e.id == selected_id) {
@@ -5865,6 +5969,16 @@ impl Application for ClearEmailApp {
                         *needs_rebuild = true;
                         self.needs_rebuild = true;
                         return None;
+                    }
+                    // A press in either plate moves pane focus there, the
+                    // way a click focuses a designer pane; the bar above
+                    // the plates leaves it alone.
+                    if py > menubar_h() {
+                        let pane = if px < separator_x { Pane::List } else { Pane::Detail };
+                        if pane != self.focused_pane {
+                            self.focused_pane = pane;
+                            changed = true;
+                        }
                     }
                     if self.selected_email_id.is_some() && self.body_sb_press(px, py) {
                         changed = true;
@@ -6319,22 +6433,56 @@ impl Application for ClearEmailApp {
             && !self.search_box.editing
             && event.state == ElementState::Pressed
         {
-            match &event.logical_key {
-                Key::Named(cce_ui::widget::NamedKey::ArrowDown) => {
-                    msg_out = self.move_selection(1);
-                    handled = true;
-                }
-                Key::Named(cce_ui::widget::NamedKey::ArrowUp) => {
-                    msg_out = self.move_selection(-1);
-                    handled = true;
-                }
-                Key::Named(cce_ui::widget::NamedKey::Delete) => {
-                    if self.selected_email_id.is_some() {
-                        msg_out = Some(AppMessage::DeleteSelected);
+            // Pane focus first: the chords carry Ctrl, so they cannot be
+            // mistaken for the bare letters below, and with two panes next
+            // and previous are the same move.
+            if cce_ui::widget::match_key_shortcut(event, &self.keys.focus_next_pane)
+                || cce_ui::widget::match_key_shortcut(event, &self.keys.focus_prev_pane)
+            {
+                self.focused_pane = self.focused_pane.other();
+                handled = true;
+            }
+            if !handled {
+                match &event.logical_key {
+                    Key::Named(cce_ui::widget::NamedKey::ArrowDown) => {
+                        msg_out = self.move_selection(1);
                         handled = true;
                     }
+                    Key::Named(cce_ui::widget::NamedKey::ArrowUp) => {
+                        msg_out = self.move_selection(-1);
+                        handled = true;
+                    }
+                    Key::Named(cce_ui::widget::NamedKey::Delete) => {
+                        if self.selected_email_id.is_some() {
+                            msg_out = Some(AppMessage::DeleteSelected);
+                            handled = true;
+                        }
+                    }
+                    // Vim keys, bare only: a Ctrl or Alt chord on these
+                    // letters is somebody else's binding.
+                    Key::Character(c) if !event.ctrl && !event.alt => match c.as_str() {
+                        "h" => {
+                            self.focused_pane = Pane::List;
+                            handled = true;
+                        }
+                        "l" => {
+                            self.focused_pane = Pane::Detail;
+                            handled = true;
+                        }
+                        "j" | "k" => {
+                            let down = c == "j";
+                            match self.focused_pane {
+                                Pane::List => {
+                                    msg_out = self.move_selection(if down { 1 } else { -1 });
+                                }
+                                Pane::Detail => self.step_body(down, body_h),
+                            }
+                            handled = true;
+                        }
+                        _ => {}
+                    },
+                    _ => {}
                 }
-                _ => {}
             }
             if handled {
                 *needs_rebuild = true;
@@ -6412,7 +6560,7 @@ impl Application for ClearEmailApp {
             // with the list selection either way.
             #[cfg(feature = "wpe")]
             if !handled
-                && self.detail_hovered
+                && (self.detail_hovered || self.focused_pane == Pane::Detail)
                 && html_on_show
                 && !self.search_box.editing
                 && event.state == ElementState::Pressed
@@ -6435,9 +6583,10 @@ impl Application for ClearEmailApp {
                 }
             }
 
-            // Detail-pane body scroll, hover-scoped like ScrollRegion's keyboard path.
+            // Detail-pane body scroll: hover-scoped like ScrollRegion's
+            // keyboard path, and the focused pane counts as hovered.
             if !handled
-                && self.detail_hovered
+                && (self.detail_hovered || self.focused_pane == Pane::Detail)
                 && self.selected_email_id.is_some()
                 && !self.search_box.editing
                 && event.state == ElementState::Pressed
