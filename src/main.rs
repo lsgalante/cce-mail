@@ -3998,15 +3998,22 @@ impl ClearEmailApp {
                         list_bounds,
                     );
 
-                    // Subject
+                    // Subject — in full, as the header draws it: only the
+                    // clip bounds it, at the card's content edge rather
+                    // than the plate's, so a long one is cut clean of the
+                    // padding and the scrollbar strip instead of shortened.
+                    let subject_bounds = list_bounds.map(|mut b| {
+                        b[2] = list_x + list_w - pane_inner_pad();
+                        b
+                    });
                     pc.text_with(
-                        ellipsize(&email.subject, fit(29.0)),
+                        email.subject.clone(),
                         list_x + pane_inner_pad(),
                         draw_y + 20.0,
                         10.0,
                         if !email.read { [0x3a, 0x9a, 0xff] } else { [0x83, 0x83, 0x8a] },
                         None,
-                        list_bounds,
+                        subject_bounds,
                     );
 
                     // Snippet — collapse ALL whitespace: CRLF bodies leave bare '\r'
