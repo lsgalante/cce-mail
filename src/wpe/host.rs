@@ -263,18 +263,22 @@ impl MailWebView {
             return;
         }
         unsafe {
-            if self.images_allowed {
-                webkit_user_content_manager_remove_all_filters(self.ucm);
-            } else {
+            // Cleared before re-adding either way: the block branch runs
+            // on every message load, filter already installed or not.
+            webkit_user_content_manager_remove_all_filters(self.ucm);
+            if !self.images_allowed {
                 webkit_user_content_manager_add_filter(self.ucm, self.filter);
             }
         }
     }
 
     /// Show a message. Always re-arms the remote-content block: allowing
-    /// images is a per-message decision, never a sticky one.
+    /// images is a per-message decision, never a sticky one. The filter
+    /// goes back on here too — resetting the flag alone left the block
+    /// lifted for every message after the first "Load Images".
     pub fn load_html(&mut self, html: &str) {
         self.images_allowed = false;
+        self.apply_filter_policy();
         // NUL bytes would truncate the CString; they carry no meaning in
         // HTML, so strip rather than fail.
         let owned;
