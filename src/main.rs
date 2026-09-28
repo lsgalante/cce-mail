@@ -4072,13 +4072,13 @@ impl ClearEmailApp {
                     plate_x + plate_w - pane_inner_pad(),
                     plate_y + plate_h,
                 ]);
-                // (text, y, size, color, ellipsized). The address lines are
-                // drawn in full — an address is read end to end, and an
-                // ellipsis in the middle of one hides exactly the part that
-                // tells senders and recipients apart — so only their clip
-                // rects bound them.
+                // (text, y, size, color, ellipsized). The subject and the
+                // address lines are drawn in full — each is read end to
+                // end, and an ellipsis in the middle hides exactly the part
+                // that tells one apart from another — so only their clip
+                // rects bound them. The Date alone keeps its ellipsis.
                 let header_lines: [(String, f32, f32, [u8; 3], bool); 4] = [
-                    (email.subject.clone(), DETAIL_SUBJECT_Y, 15.0, [0xff, 0xff, 0xff], true),
+                    (email.subject.clone(), DETAIL_SUBJECT_Y, 15.0, [0xff, 0xff, 0xff], false),
                     (format!("From: {}", email.from), DETAIL_FROM_Y, 11.0, [0xb0, 0xb0, 0xb8], false),
                     (format!("To:   {}", email.to), DETAIL_TO_Y, 11.0, [0x83, 0x83, 0x8a], false),
                     (format!("Date: {}", email.date), DETAIL_DATE_Y, 11.0, [0x83, 0x83, 0x8a], true),
