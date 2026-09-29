@@ -3925,9 +3925,6 @@ impl ClearEmailApp {
 
         let list_x = window_pad();
         let (list_w, _separator_x, detail_x) = self.split_geom();
-        // Row-label char budgets scale with the band; the bases are the
-        // hand-tuned counts at the 300px default.
-        let fit = |base: f32| (base * list_w / LIST_W_DEFAULT) as usize;
 
         // Widget text rides along with chrome in display_list's paint_root_into
         // walk — only app-composed labels are emitted here.
@@ -4028,8 +4025,10 @@ impl ClearEmailApp {
                     // Snippet — collapse ALL whitespace: CRLF bodies leave bare '\r'
                     // after a plain '\n' replace, and the renderer treats it as a
                     // line break, bleeding preview lines into the next row.
-                    let snippet_raw = email.body.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let snippet = ellipsize(&snippet_raw, fit(37.0));
+                    // Drawn in full like the subject and clipped at the same
+                    // content edge; the cached body is a 1200-char preview,
+                    // so the one run is bounded either way.
+                    let snippet = email.body.split_whitespace().collect::<Vec<_>>().join(" ");
                     pc.text_with(
                         snippet,
                         list_x + pane_inner_pad(),
@@ -4037,7 +4036,7 @@ impl ClearEmailApp {
                         9.0,
                         [0x60, 0x60, 0x65],
                         None,
-                        list_bounds,
+                        subject_bounds,
                     );
                 }
             }
