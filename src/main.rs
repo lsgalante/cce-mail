@@ -3976,21 +3976,30 @@ impl ClearEmailApp {
                     } else {
                         email.from.clone()
                     };
+                    // The date is right-aligned on the same row, so the
+                    // sender — drawn in full, like the subject below and the
+                    // header's lines — is clipped one gap short of it rather
+                    // than at the card's edge.
+                    let date_w = TextLabel::estimate_width(&email.date, 9.0);
+                    let date_x = list_x + list_w - pane_inner_pad() - date_w;
+                    let head_bounds = list_bounds.map(|mut b| {
+                        b[2] = date_x - cce_ui::layout::plate_gap();
+                        b
+                    });
                     pc.text_with(
-                        ellipsize(&row_head, fit(21.0)),
+                        row_head,
                         list_x + pane_inner_pad(),
                         draw_y + 6.0,
                         11.0,
                         if !email.read { [0xff, 0xff, 0xff] } else { [0xb0, 0xb0, 0xb8] },
                         None,
-                        list_bounds,
+                        head_bounds,
                     );
 
                     // Date — right-aligned inside the row, clear of the scrollbar strip
-                    let date_w = TextLabel::estimate_width(&email.date, 9.0);
                     pc.text_with(
                         email.date.clone(),
-                        list_x + list_w - pane_inner_pad() - date_w,
+                        date_x,
                         draw_y + 7.0,
                         9.0,
                         [0x70, 0x70, 0x75],
