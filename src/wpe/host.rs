@@ -106,6 +106,14 @@ pub struct MailWebView {
     /// [`image`]: MailWebView::image
     /// [`reupload_frame`]: MailWebView::reupload_frame
     last_frame: Option<(Vec<u8>, u32, u32)>,
+    /// The pointer buttons the page is holding, as `WPE_MODIFIER_POINTER_*`
+    /// bits, stamped on every pointer event.
+    ///
+    /// WebKit reads a drag off the *move* event's own modifiers, not off the
+    /// press it saw earlier: a move reporting no held button is a hover, so
+    /// press-drag-release over a message selected nothing while every move
+    /// went out with an empty mask.
+    held_buttons: WPEModifiers::Type,
 }
 
 impl Drop for MailWebView {
@@ -185,6 +193,7 @@ impl MailWebView {
                 images_allowed: false,
                 image: None,
                 last_frame: None,
+                held_buttons: 0,
             }
         }
     }
@@ -478,7 +487,7 @@ impl MailWebView {
                 view,
                 WPEInputSource::WPE_INPUT_SOURCE_MOUSE,
                 input::now_ms(),
-                0,
+                self.held_buttons,
                 x,
                 y,
                 0.0,
@@ -503,6 +512,14 @@ impl MailWebView {
             } else {
                 0
             };
+            // The mask describes the state *after* this event, which is
+            // what a DOM `buttons` reads on mousedown and mouseup.
+            let bit = input::button_modifier(n);
+            if pressed {
+                self.held_buttons |= bit;
+            } else {
+                self.held_buttons &= !bit;
+            }
             let e = wpe_event_pointer_button_new(
                 if pressed {
                     WPEEventType::WPE_EVENT_POINTER_DOWN
@@ -512,7 +529,7 @@ impl MailWebView {
                 view,
                 WPEInputSource::WPE_INPUT_SOURCE_MOUSE,
                 time,
-                0,
+                self.held_buttons,
                 n,
                 x,
                 y,
