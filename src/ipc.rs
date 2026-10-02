@@ -16,7 +16,7 @@
 //! `error: …` on failure — and JSON with `--json`, for agents and scripts.
 //! Account rows never carry passwords or tokens.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -114,15 +114,13 @@ pub fn spawn_listener(sender: calloop::channel::Sender<AppMessage>) {
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(conn) = conn else { continue };
-            let _ = conn.set_read_timeout(Some(IO_TIMEOUT));
-            let mut reader = BufReader::new(conn);
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_err() {
+            let Some(line) = read_request_line(&conn, 64 * 1024, IO_TIMEOUT) else {
                 continue;
-            }
+            };
+            let _ = conn.set_read_timeout(Some(IO_TIMEOUT));
             let req = Request {
                 line: line.trim().to_string(),
-                stream: Arc::new(Mutex::new(Some(reader.into_inner()))),
+                stream: Arc::new(Mutex::new(Some(conn))),
             };
             if sender.send(AppMessage::Ipc(req)).is_err() {
                 return; // channel gone: the app is shutting down
@@ -623,4 +621,38 @@ mod tests {
             assert!(out.contains("me@x.y"));
         }
     }
+}
+
+/// One request line from a control-socket client, bounded in size and in
+/// TOTAL time. Until 2026-10-02 this was `BufReader::read_line` on a socket
+/// with a per-read timeout only, so a client that connected and said nothing (or trickled a
+/// byte at a time) held the listener thread as long as it kept trickling. None on EOF before any byte, timeout,
+/// overflow or a read error.
+fn read_request_line(conn: &std::os::unix::net::UnixStream, limit: usize, deadline: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    let until = std::time::Instant::now() + deadline;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut reader = conn;
+    loop {
+        let left = until.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero())?;
+        conn.set_read_timeout(Some(left)).ok()?;
+        let n = reader.read(&mut chunk).ok()?;
+        if n == 0 {
+            if buf.is_empty() {
+                return None;
+            }
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(end) = buf.iter().position(|&b| b == b'\n') {
+            buf.truncate(end + 1);
+            break;
+        }
+        if buf.len() > limit {
+            return None;
+        }
+    }
+    let _ = conn.set_read_timeout(None);
+    String::from_utf8(buf).ok()
 }
