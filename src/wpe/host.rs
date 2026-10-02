@@ -661,11 +661,8 @@ unsafe fn compile_block_filter() -> *mut WebKitUserContentFilter {
         slot.done.set(true);
     }
 
-    let dir = std::env::var_os("XDG_STATE_HOME")
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state")))
-        .map(|p| p.join("cce/mail/content-filters"));
+    // Absolute unless neither $XDG_STATE_HOME nor $HOME is set.
+    let dir = Some(cce_ui::config::cce_state_dir().join("mail/content-filters")).filter(|d| d.is_absolute());
     let Some(dir) = dir else {
         eprintln!("cce-mail: no HOME; remote-content filter disabled");
         return std::ptr::null_mut();
