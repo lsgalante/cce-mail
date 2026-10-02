@@ -2,6 +2,7 @@
 #[cfg(feature = "wpe")]
 mod ipc;
 mod wpe;
+mod accounts_file;
 use cce_ui::widget::ScrollRegion;
 use wayland_client::QueueHandle;
 use cce_ui::cosmic_text::FontSystem;
@@ -463,8 +464,8 @@ fn load_accounts() -> Vec<AccountInfo> {
             if let Ok(mut accounts) = serde_json::from_str::<Vec<AccountInfo>>(&content) {
                 if resolve_account_secrets(&mut accounts) {
                     // A plaintext password just moved into the keyring —
-                    // rewrite the file now so it stops living on disk.
-                    save_accounts(&accounts);
+                    // clear it from the file now so it stops living on disk.
+                    persist_keyring_migration(&accounts);
                 }
                 return accounts;
             }
@@ -547,31 +548,51 @@ fn legacy_keyring_password(email: &str) -> Option<String> {
         .ok()
 }
 
-fn save_accounts(accounts: &[AccountInfo]) {
-    // Keyring-backed passwords never go back to disk.
-    let redacted: Vec<AccountInfo> = accounts
+/// accounts.json belongs to cce-system-interface, so this app never writes
+/// its own list back — only the one change it means, re-read under the lock
+/// (`accounts_file`). Writing the list it loaded at startup is what deleted
+/// accounts added in Settings since, and revived ones removed there.
+///
+/// Passwords now in the keyring: blank the on-disk copy, but only where the
+/// file still holds the very password that was moved, so a password Settings
+/// has changed in the meantime is not touched.
+fn persist_keyring_migration(accounts: &[AccountInfo]) {
+    let moved: Vec<(&str, &str)> = accounts
         .iter()
-        .map(|a| {
-            let mut a = a.clone();
-            if a.keyring_backed {
-                a.password = String::new();
-            }
-            a
-        })
+        .filter(|a| a.keyring_backed && !a.password.is_empty())
+        .map(|a| (a.email.as_str(), a.password.as_str()))
         .collect();
-    let accounts = &redacted;
-    let path = get_accounts_path();
-    if let Ok(content) = serde_json::to_string_pretty(accounts) {
-        let _ = std::fs::write(&path, content);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                let mut perms = metadata.permissions();
-                perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(&path, perms);
+    if moved.is_empty() {
+        return;
+    }
+    let result = accounts_file::update::<serde_json::Value, _>(&get_accounts_path(), |on_disk| {
+        for acc in on_disk.iter_mut() {
+            let (Some(email), Some(password)) = (acc["email"].as_str(), acc["password"].as_str()) else {
+                continue;
+            };
+            if moved.contains(&(email, password)) {
+                acc["password"] = serde_json::Value::String(String::new());
             }
         }
+    });
+    if let Err(e) = result {
+        eprintln!("cce-mail: could not clear migrated passwords from accounts.json: {e}");
+    }
+}
+
+/// A refreshed OAuth token, written into that one account. An account no
+/// longer in the file was removed in Settings, and stays removed.
+fn persist_account_tokens(email: &str, access_token: Option<&str>, expiry: Option<u64>) {
+    let result = accounts_file::update::<serde_json::Value, _>(&get_accounts_path(), |on_disk| {
+        for acc in on_disk.iter_mut().filter(|a| a["email"] == email) {
+            if let Some(obj) = acc.as_object_mut() {
+                obj.insert("access_token".into(), serde_json::json!(access_token));
+                obj.insert("token_expiry".into(), serde_json::json!(expiry));
+            }
+        }
+    });
+    if let Err(e) = result {
+        eprintln!("cce-mail: could not save the refreshed token for {email}: {e}");
     }
 }
 
@@ -3149,7 +3170,7 @@ impl ClearEmailApp {
             eprintln!("cce-mail: recovered {} credentials from the keyring", email);
         }
         if migrated {
-            save_accounts(&self.accounts);
+            persist_keyring_migration(&self.accounts[idx..=idx]);
         }
     }
 
@@ -5118,9 +5139,9 @@ impl Application for ClearEmailApp {
             }
             AppMessage::UpdateAccountTokens(email, access_token, expiry) => {
                 if let Some(acc) = self.accounts.iter_mut().find(|a| a.email == email) {
+                    persist_account_tokens(&email, access_token.as_deref(), expiry);
                     acc.access_token = access_token;
                     acc.token_expiry = expiry;
-                    save_accounts(&self.accounts);
                 }
             }
             #[cfg(feature = "wpe")]
