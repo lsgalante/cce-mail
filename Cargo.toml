@@ -16,7 +16,7 @@ wpe = ["dep:rustix"]
 
 [dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }
-cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "823af6f966d5afb27daaa89a550ad2752206eaa9" }
+cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "32621051c8f1301a905abb0a2f5d7bcf77941e7a" }
 smithay-client-toolkit = "0.19.2"
 calloop = "0.13.0"
 calloop-wayland-source = "0.3.0"
