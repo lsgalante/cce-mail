@@ -842,9 +842,12 @@ fn window_pad() -> f32 {
     cce_ui::layout::root_plate_inset()
 }
 
-/// VISIBLE height of one menubar control — what you see, not the rect it is
-/// given. See [`bar_item_carve`].
-const BAR_ITEM_H: f32 = 26.0;
+/// Height of the menubar's row of controls: the toolkit's control height
+/// (the mail button at `button_height`, the switchers at `dropdown_height`;
+/// one number unless a config sets them apart).
+fn bar_item_h() -> f32 {
+    cce_ui::layout::button_height().max(cce_ui::layout::dropdown_height())
+}
 
 /// The menubar band's height. One padding above its items, which then sit
 /// flush with the band's bottom edge, so the gap from an item down to the
@@ -852,11 +855,11 @@ const BAR_ITEM_H: f32 = 26.0;
 /// what makes every vertical gap in the window one number: window rim to
 /// items, items to plates, plates to rim.
 fn menubar_h() -> f32 {
-    window_pad() + BAR_ITEM_H
+    window_pad() + bar_item_h()
 }
 
 /// Widths of the two switchers in the bar; their heights and every gap
-/// around them come from [`BAR_ITEM_H`] and the DE spacings.
+/// around them come from [`bar_item_h`] and the DE spacings.
 const FOLDER_W: f32 = 134.0;
 const ACCOUNT_W: f32 = 210.0;
 
@@ -924,7 +927,7 @@ const CONTEXT_ROW_H: f32 = 24.0;
 // The search band. It is not permanent chrome: the `open_search` chord
 // ("/" by default) reveals and focuses it, and closing hands its strip back
 // to the list, so `list_geom` is the single source for where the rows start.
-const SEARCH_ROW_H: f32 = 26.0;
+// Its height is the toolkit's `textbox_height`.
 
 // Detail header layout, every offset measured from the HEADER plate's
 // top-left of its CONTENT — the plate's rim taken in by `pane_inner_pad`
@@ -945,7 +948,6 @@ const DETAIL_DATE_Y: f32 = 65.0;
 const DETAIL_LINE_H: f32 = 14.0;
 const DETAIL_LINES_BOTTOM: f32 = DETAIL_DATE_Y + DETAIL_LINE_H;
 const DETAIL_CHIPS_Y: f32 = 80.0;
-const DETAIL_CHIP_H: f32 = 22.0;
 
 // Compose modal geometry. One source of truth: the background quads, the
 // input rects, the labels, the chip row and the outside-click test all
@@ -958,10 +960,7 @@ const COMPOSE_W: f32 = 500.0;
 // number of its own.
 const COMPOSE_TITLE_H: f32 = 22.0;
 const COMPOSE_LABEL_W: f32 = 65.0;
-const COMPOSE_FIELD_H: f32 = 26.0;
 const COMPOSE_BODY_H: f32 = 195.0;
-const COMPOSE_CHIP_H: f32 = 24.0;
-const COMPOSE_BTN_H: f32 = 28.0;
 const COMPOSE_BTN_W: f32 = 75.0;
 const COMPOSE_ATTACH_W: f32 = 80.0;
 
@@ -991,10 +990,10 @@ fn compose_layout(modal_x: f32, modal_y: f32) -> ComposeLayout {
     let gap = cce_ui::layout::plate_gap();
     let title_y = modal_y + pad;
     let rows0 = title_y + COMPOSE_TITLE_H + gap;
-    let pitch = COMPOSE_FIELD_H + gap;
+    let pitch = cce_ui::layout::textbox_height() + gap;
     let body_y = rows0 + 4.0 * pitch;
     let chips_y = body_y + COMPOSE_BODY_H + gap;
-    let buttons_y = chips_y + COMPOSE_CHIP_H + gap;
+    let buttons_y = chips_y + cce_ui::layout::button_height() + gap;
     let cancel_x = modal_x + COMPOSE_W - pad - COMPOSE_BTN_W;
     ComposeLayout {
         x: modal_x,
@@ -1017,7 +1016,7 @@ fn compose_layout(modal_x: f32, modal_y: f32) -> ComposeLayout {
 /// The dialog's height: the bottom of its button row plus the padding.
 fn compose_h() -> f32 {
     let l = compose_layout(0.0, 0.0);
-    l.buttons_y + COMPOSE_BTN_H + l.pad
+    l.buttons_y + cce_ui::layout::button_height() + l.pad
 }
 
 fn compose_modal_origin(w: f32, h: f32) -> (f32, f32) {
@@ -1043,7 +1042,7 @@ fn compose_chip_rects(attachments: &[String], modal_x: f32, modal_y: f32) -> Vec
         // between paint and hit-test (it is: both use this fn). The 10 past
         // the name is the room the remove mark (the `x` glyph) is drawn in.
         let w = shown.chars().count() as f32 * 6.0 + 2.0 * cce_ui::layout::CONTROL_TEXT_INSET + 10.0;
-        rects.push((x, y, w, COMPOSE_CHIP_H));
+        rects.push((x, y, w, cce_ui::layout::button_height()));
         x += w + l.gap;
     }
     rects
@@ -1070,7 +1069,7 @@ fn detail_chip_rects(atts: &[RemoteAttachment], detail_x: f32, origin_y: f32) ->
     let y = origin_y + DETAIL_CHIPS_Y;
     for att in atts {
         let w = detail_chip_label(att).chars().count() as f32 * 6.0 + 2.0 * cce_ui::layout::CONTROL_TEXT_INSET;
-        rects.push((x, y, w, DETAIL_CHIP_H));
+        rects.push((x, y, w, cce_ui::layout::button_height()));
         x += w + cce_ui::layout::plate_gap();
     }
     rects
@@ -3468,7 +3467,7 @@ impl ClearEmailApp {
         // One padding below the bar's items (an interior gap); the open search
         // band and its own gap push the plate further down. The bottom is a
         // WINDOW edge, so it clears the plate's roll as well.
-        let band = if self.search_open { SEARCH_ROW_H + pane_gap() } else { 0.0 };
+        let band = if self.search_open { cce_ui::layout::textbox_height() + pane_gap() } else { 0.0 };
         let top = menubar_h() + pane_pad() + band;
         (top, (self.height as f32 - top - window_pad()).max(50.0))
     }
@@ -3493,7 +3492,7 @@ impl ClearEmailApp {
             .and_then(|id| self.emails.iter().find(|e| e.id == id))
             .is_some_and(|e| !e.remote_attachments.is_empty());
         if chips {
-            DETAIL_CHIPS_Y + DETAIL_CHIP_H
+            DETAIL_CHIPS_Y + cce_ui::layout::button_height()
         } else {
             DETAIL_LINES_BOTTOM
         }
@@ -3869,7 +3868,8 @@ impl ClearEmailApp {
         let shown = !self.compose_open
             && self.selected_email_id.is_some()
             && self.html_loaded == self.selected_email_id;
-        let y = self.detail_origin_y() + DETAIL_LINES_BOTTOM - COMPOSE_BTN_H;
+        let btn_h = cce_ui::layout::button_height();
+        let y = self.detail_origin_y() + DETAIL_LINES_BOTTOM - btn_h;
         let (px, _, pw, _) = self.detail_pane_geom();
         let mut right = px + pw - pane_inner_pad();
         let view_label = if self.show_text { "View: Text" } else { "View: HTML" };
@@ -3889,7 +3889,7 @@ impl ClearEmailApp {
             // (the floor also stops the toggles jittering between labels).
             let w = btn.intrinsic_size().map_or(0.0, |s| s.width).max(COMPOSE_BTN_W);
             right -= w;
-            btn.set_rect(right, y, w, COMPOSE_BTN_H);
+            btn.set_rect(right, y, w, btn_h);
             right -= cce_ui::layout::plate_gap();
         }
     }
@@ -4223,7 +4223,7 @@ impl ClearEmailApp {
                 for (text, dy, font_size, color) in header_lines {
                     let mut bounds = header_bounds;
                     if let Some(bl) = buttons_left {
-                        let buttons_top = DETAIL_LINES_BOTTOM - COMPOSE_BTN_H;
+                        let buttons_top = DETAIL_LINES_BOTTOM - cce_ui::layout::button_height();
                         if dy + DETAIL_LINE_H > buttons_top {
                             if let Some(b) = bounds.as_mut() {
                                 b[2] = b[2].min(bl - cce_ui::layout::plate_gap());
@@ -4243,7 +4243,7 @@ impl ClearEmailApp {
 
                 // Server-attachment chip labels (quads paint in display_list;
                 // both sides lay out via detail_chip_rects).
-                for (att, (cx, cy, _, _)) in email
+                for (att, (cx, cy, _, ch)) in email
                     .remote_attachments
                     .iter()
                     .zip(detail_chip_rects(&email.remote_attachments, detail_x, self.detail_origin_y()))
@@ -4251,7 +4251,7 @@ impl ClearEmailApp {
                     labels.push(TextLabel {
                         text: detail_chip_label(att),
                         x: cx + cce_ui::layout::CONTROL_TEXT_INSET,
-                        y: cy + 5.0,
+                        y: cy + (ch - 12.0) / 2.0,
                         font_size: 10.0,
                         color: [0xc8, 0xc8, 0xd2],
                     });
@@ -4301,14 +4301,16 @@ impl ClearEmailApp {
             });
 
             for (name, row_y) in ["To:", "Cc:", "Bcc:", "Subject:"].iter().zip(l.rows_y) {
-                // The label's baseline sits on the field's: 4px below its top at this size.
-                labels.push(TextLabel { text: name.to_string(), x: l.label_x, y: row_y + 4.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
+                // The label's baseline sits on the field's (the field centres
+                // its text): 4px below its top at a 26px field and this size.
+                let label_y = row_y + (cce_ui::layout::textbox_height() - 18.0) / 2.0;
+                labels.push(TextLabel { text: name.to_string(), x: l.label_x, y: label_y, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
             }
 
             // Attachment chips: the name (its `x` glyph is drawn with the
             // chip's plate), clickable to remove (hit-test in
             // handle_mouse_input via the same compose_chip_rects).
-            for (path, (cx, cy, _cw, _ch)) in self
+            for (path, (cx, cy, _cw, ch)) in self
                 .compose_attachments
                 .iter()
                 .zip(compose_chip_rects(&self.compose_attachments, modal_x, modal_y))
@@ -4320,7 +4322,7 @@ impl ClearEmailApp {
                 labels.push(TextLabel {
                     text: ellipsize(name, 22),
                     x: cx + cce_ui::layout::CONTROL_TEXT_INSET,
-                    y: cy + 6.0,
+                    y: cy + (ch - 12.0) / 2.0,
                     font_size: 10.0,
                     color: [0xc8, 0xc8, 0xd2],
                 });
@@ -4549,7 +4551,7 @@ impl Application for ClearEmailApp {
         // The bar's items are plates of the panes' material, in the same
         // stance: flat, so the face is a quad and carries the frost, and the
         // silhouette is the rect so they line up with the panes.
-        let mail_button = Button::new_icon("mail", "Mail", 0.0, 0.0, BAR_ITEM_H, BAR_ITEM_H)
+        let mail_button = Button::new_icon("mail", "Mail", 0.0, 0.0, bar_item_h(), bar_item_h())
             .with_flat(true)
             .with_bg(pane_fill());
         let folder_dropdown = Dropdown::new(
@@ -4611,9 +4613,10 @@ impl Application for ClearEmailApp {
         compose_body.font_size = 12.0;
         compose_body.font_family = "sans-serif".to_string();
 
-        let btn_compose_send = Button::new(0.0, 0.0, 75.0, 28.0).with_label("Send");
-        let btn_compose_cancel = Button::new_reset(0.0, 0.0, 75.0, 28.0).with_label("Cancel");
-        let btn_compose_attach = Button::new(0.0, 0.0, 80.0, 28.0).with_label("Attach...");
+        let btn_h = cce_ui::layout::button_height();
+        let btn_compose_send = Button::new(0.0, 0.0, COMPOSE_BTN_W, btn_h).with_label("Send");
+        let btn_compose_cancel = Button::new_reset(0.0, 0.0, COMPOSE_BTN_W, btn_h).with_label("Cancel");
+        let btn_compose_attach = Button::new(0.0, 0.0, COMPOSE_ATTACH_W, btn_h).with_label("Attach...");
 
         // A mailto: argv (this is the x-scheme-handler/mailto handler) opens
         // the compose dialog prefilled. Both text and edit_buffer are set,
@@ -5522,11 +5525,14 @@ impl Application for ClearEmailApp {
             // Flat plates, so each rect IS its silhouette and the bar sits on
             // the same grid as the panes with no compensation at all.
             let (edge, gap) = (window_pad(), pane_gap());
-            self.mail_button.set_rect(edge, edge, BAR_ITEM_H, BAR_ITEM_H);
+            // Bottoms on the band's, should button and dropdown heights differ.
+            let (btn_h, dd_h) = (cce_ui::layout::button_height(), cce_ui::layout::dropdown_height());
+            let bottom = edge + bar_item_h();
+            self.mail_button.set_rect(edge, bottom - btn_h, btn_h, btn_h);
             let folder_x = w_f32 - edge - FOLDER_W;
-            self.folder_dropdown.set_rect(folder_x, edge, FOLDER_W, BAR_ITEM_H);
+            self.folder_dropdown.set_rect(folder_x, bottom - dd_h, FOLDER_W, dd_h);
             self.account_dropdown
-                .set_rect(folder_x - gap - ACCOUNT_W, edge, ACCOUNT_W, BAR_ITEM_H);
+                .set_rect(folder_x - gap - ACCOUNT_W, bottom - dd_h, ACCOUNT_W, dd_h);
 
             cce_ui::scale::set_scale_factor(scale as f32);
 
@@ -5534,7 +5540,7 @@ impl Application for ClearEmailApp {
             // when closed so a stale rect can't be hit by anything that still
             // routes to it.
             if self.search_open {
-                self.search_box.set_rect(list_x, menubar_h() + pane_pad(), list_w, SEARCH_ROW_H);
+                self.search_box.set_rect(list_x, menubar_h() + pane_pad(), list_w, cce_ui::layout::textbox_height());
             } else {
                 self.search_box.set_rect(-9999.0, -9999.0, 0.0, 0.0);
             }
@@ -5605,16 +5611,18 @@ impl Application for ClearEmailApp {
                 let (modal_x, modal_y) = compose_modal_origin(w_f32, h_f32);
                 let l = compose_layout(modal_x, modal_y);
 
-                self.compose_to.set_rect(l.field_x, l.rows_y[0], l.field_w, COMPOSE_FIELD_H);
-                self.compose_cc.set_rect(l.field_x, l.rows_y[1], l.field_w, COMPOSE_FIELD_H);
-                self.compose_bcc.set_rect(l.field_x, l.rows_y[2], l.field_w, COMPOSE_FIELD_H);
-                self.compose_subject.set_rect(l.field_x, l.rows_y[3], l.field_w, COMPOSE_FIELD_H);
+                let field_h = cce_ui::layout::textbox_height();
+                self.compose_to.set_rect(l.field_x, l.rows_y[0], l.field_w, field_h);
+                self.compose_cc.set_rect(l.field_x, l.rows_y[1], l.field_w, field_h);
+                self.compose_bcc.set_rect(l.field_x, l.rows_y[2], l.field_w, field_h);
+                self.compose_subject.set_rect(l.field_x, l.rows_y[3], l.field_w, field_h);
                 let (bx, by, bw, bh) = l.body;
                 self.compose_body.set_rect(bx, by, bw, bh);
 
-                self.btn_compose_attach.set_rect(l.attach_x, l.buttons_y, COMPOSE_ATTACH_W, COMPOSE_BTN_H);
-                self.btn_compose_send.set_rect(l.send_x, l.buttons_y, COMPOSE_BTN_W, COMPOSE_BTN_H);
-                self.btn_compose_cancel.set_rect(l.cancel_x, l.buttons_y, COMPOSE_BTN_W, COMPOSE_BTN_H);
+                let btn_h = cce_ui::layout::button_height();
+                self.btn_compose_attach.set_rect(l.attach_x, l.buttons_y, COMPOSE_ATTACH_W, btn_h);
+                self.btn_compose_send.set_rect(l.send_x, l.buttons_y, COMPOSE_BTN_W, btn_h);
+                self.btn_compose_cancel.set_rect(l.cancel_x, l.buttons_y, COMPOSE_BTN_W, btn_h);
             }
 
 
