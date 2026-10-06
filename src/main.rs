@@ -241,6 +241,17 @@ impl Pane {
 
 struct ClearEmailApp {
     keys: EmailKeys,
+    /// When the active account's cache first changed since its last save;
+    /// `None` when it is saved. See `save_emails`.
+    emails_dirty_since: Option<std::time::Instant>,
+    /// Bumped wherever `emails` is changed; the key of `filter_cache`.
+    emails_rev: u64,
+    /// `filtered_emails`' last answer, as indices into `emails`, with the
+    /// (revision, folder, search) it was computed for. The list asks for it
+    /// several times a frame, and each ask lowercased every message's sender,
+    /// subject and BODY to match the search — the whole 13.5 MB cache per
+    /// ask, per frame, while a query was typed.
+    filter_cache: std::cell::RefCell<Option<(u64, String, String, Vec<usize>)>>,
 
     // Navigation / Sidebar (MenuBar retired): a mail-icon button on the
     // left whose click pops the app menu (New Message / Sync Now / Quit)
@@ -658,6 +669,41 @@ fn save_folders(email: &str, folders: &[FolderInfo]) {
     }
 }
 
+/// The body of `ClearEmailApp::filtered_emails`, over the fields it reads, so
+/// a caller that also borrows other fields mutably can call it. The answer
+/// is cached under (`rev`, folder, search) — see `filter_cache`.
+fn filtered_from<'a>(
+    emails: &'a [Email],
+    rev: u64,
+    folder: &str,
+    search: &str,
+    cache: &std::cell::RefCell<Option<(u64, String, String, Vec<usize>)>>,
+) -> Vec<&'a Email> {
+    let mut cache = cache.borrow_mut();
+    let fresh = cache.as_ref().is_some_and(|(r, f, q, _)| *r == rev && f == folder && q == search);
+    if !fresh {
+        let search_lower = search.to_lowercase();
+        let idx = emails
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.folder == folder)
+            .filter(|(_, e)| {
+                search_lower.is_empty()
+                    || e.from.to_lowercase().contains(&search_lower)
+                    || e.subject.to_lowercase().contains(&search_lower)
+                    || e.body.to_lowercase().contains(&search_lower)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        *cache = Some((rev, folder.to_string(), search.to_string(), idx));
+    }
+    let (_, _, _, idx) = cache.as_ref().unwrap();
+    idx.iter().filter_map(|&i| emails.get(i)).collect()
+}
+
+/// How long after a change the active account's cache is saved.
+const EMAILS_SAVE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn get_account_emails_path(email: &str) -> std::path::PathBuf {
     let p = cce_ui::config::cce_config_dir();
     if !p.exists() {
@@ -669,6 +715,10 @@ fn get_account_emails_path(email: &str) -> std::path::PathBuf {
 
 fn load_emails_for_account(email: &str) -> Vec<Email> {
     let path = get_account_emails_path(email);
+    // A save still on its way to disk is the newest copy.
+    if let Some(pending) = email_store::pending(&path) {
+        return pending;
+    }
     if path.exists() {
         if let Ok(content) = std::fs::read_to_string(&path) {
             if let Ok(emails) = serde_json::from_str(&content) {
@@ -682,10 +732,96 @@ fn load_emails_for_account(email: &str) -> Vec<Email> {
     Vec::new()
 }
 
-fn save_emails_for_account(email: &str, emails: &[Email]) {
-    let path = get_account_emails_path(email);
-    if let Ok(content) = serde_json::to_string_pretty(emails) {
-        let _ = std::fs::write(&path, content);
+/// Hand `emails` to the background writer (`email_store`). Until
+/// 2026-10-05 this pretty-printed and wrote the whole cache on the UI thread
+/// — 13.5 MB for the Gmail account — on every unread open, flag toggle,
+/// delete and synced folder.
+fn save_emails_for_account(email: &str, emails: Vec<Email>) {
+    email_store::save(get_account_emails_path(email), emails);
+}
+
+/// The per-account mail caches, written off the UI thread.
+///
+/// A save lands in `PENDING` and a writer thread takes it from there:
+/// compact JSON (the reader takes either form) to `<file>.tmp`, renamed
+/// over the cache so a crash cannot truncate it. A later save of the same
+/// file replaces a pending one, so a burst costs one write. A load consults
+/// `PENDING` first ([`pending`]), so nothing reads a cache older than the
+/// newest save; [`flush`] waits for the writer to finish, for the exit.
+mod email_store {
+    use super::Email;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+    struct Store {
+        pending: Mutex<HashMap<PathBuf, Arc<Vec<Email>>>>,
+        /// Signalled when something is pending, and when a write finishes.
+        changed: Condvar,
+    }
+
+    fn store() -> &'static Store {
+        static STORE: OnceLock<&'static Store> = OnceLock::new();
+        STORE.get_or_init(|| {
+            let store: &'static Store =
+                Box::leak(Box::new(Store { pending: Mutex::new(HashMap::new()), changed: Condvar::new() }));
+            std::thread::Builder::new()
+                .name("mail-cache-writer".into())
+                .spawn(move || writer(store))
+                .expect("mail cache writer thread");
+            store
+        })
+    }
+
+    pub fn save(path: PathBuf, emails: Vec<Email>) {
+        let s = store();
+        s.pending.lock().unwrap().insert(path, Arc::new(emails));
+        s.changed.notify_all();
+    }
+
+    pub fn pending(path: &PathBuf) -> Option<Vec<Email>> {
+        let s = store();
+        let pending = s.pending.lock().unwrap();
+        pending.get(path).map(|e| (**e).clone())
+    }
+
+    /// Block until every pending save is on disk.
+    pub fn flush() {
+        let s = store();
+        let mut pending = s.pending.lock().unwrap();
+        while !pending.is_empty() {
+            pending = s.changed.wait(pending).unwrap();
+        }
+    }
+
+    fn writer(s: &'static Store) {
+        loop {
+            let batch: Vec<(PathBuf, Arc<Vec<Email>>)> = {
+                let mut pending = s.pending.lock().unwrap();
+                while pending.is_empty() {
+                    pending = s.changed.wait(pending).unwrap();
+                }
+                pending.iter().map(|(p, e)| (p.clone(), Arc::clone(e))).collect()
+            };
+            for (path, emails) in batch {
+                write(&path, &emails);
+                // Done with it unless a newer save replaced it meanwhile.
+                let mut pending = s.pending.lock().unwrap();
+                if pending.get(&path).is_some_and(|cur| Arc::ptr_eq(cur, &emails)) {
+                    pending.remove(&path);
+                }
+            }
+            s.changed.notify_all();
+        }
+    }
+
+    fn write(path: &PathBuf, emails: &[Email]) {
+        let Ok(bytes) = serde_json::to_vec(emails) else { return };
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, path)) {
+            eprintln!("[cce-mail] mail cache {}: {e}", path.display());
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 
@@ -3076,6 +3212,7 @@ impl ClearEmailApp {
     /// no uid and a folder the retention filters don't touch).
     fn file_as_draft(&mut self, mail: &OutgoingMail) {
         let new_id = self.emails.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        self.emails_rev = self.emails_rev.wrapping_add(1);
         self.emails.push(Email {
             id: new_id,
             from: self
@@ -3289,9 +3426,22 @@ impl ClearEmailApp {
         self.last_sync_start = Some(std::time::Instant::now());
     }
 
-    fn save_emails(&self) {
+    /// The active account's cache changed: save it shortly. A run of
+    /// changes (a sync's folders, a burst of flag toggles) is one save,
+    /// [`EMAILS_SAVE_DELAY`] after the first; `tick` makes it.
+    fn save_emails(&mut self) {
+        if self.emails_dirty_since.is_none() {
+            self.emails_dirty_since = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Hand the active account's cache to the writer now, if it changed.
+    fn flush_emails(&mut self) {
+        if self.emails_dirty_since.take().is_none() {
+            return;
+        }
         if let Some(acc) = self.accounts.get(self.selected_account_idx) {
-            save_emails_for_account(&acc.email, &self.emails);
+            save_emails_for_account(&acc.email, self.emails.clone());
         }
     }
 
@@ -3552,23 +3702,12 @@ impl ClearEmailApp {
     /// filter plus the search box. A row index means nothing without this:
     /// it is what maps the card under the pointer to its message.
     fn filtered_emails(&self) -> Vec<&Email> {
-        let current_folder_str = self.current_folder.clone();
         let search_text = if self.search_box.editing {
             &self.search_box.edit_buffer
         } else {
             &self.search_box.text
         };
-        let search_lower = search_text.to_lowercase();
-        self.emails
-            .iter()
-            .filter(|e| e.folder == current_folder_str)
-            .filter(|e| {
-                search_lower.is_empty()
-                    || e.from.to_lowercase().contains(&search_lower)
-                    || e.subject.to_lowercase().contains(&search_lower)
-                    || e.body.to_lowercase().contains(&search_lower)
-            })
-            .collect()
+        filtered_from(&self.emails, self.emails_rev, &self.current_folder, search_text, &self.filter_cache)
     }
 
     /// The app menu, hung off the bottom of the bar under the mail-icon
@@ -3960,21 +4099,7 @@ impl ClearEmailApp {
         let modal_open = self.compose_open;
         if modal_open {
         } else {
-            let current_folder_str = self.current_folder.clone();
-            let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
-            let search_lower = search_text.to_lowercase();
-            let filtered: Vec<&Email> = self.emails.iter()
-                .filter(|e| e.folder == current_folder_str)
-                .filter(|e| {
-                    if search_lower.is_empty() {
-                        true
-                    } else {
-                        e.from.to_lowercase().contains(&search_lower) ||
-                        e.subject.to_lowercase().contains(&search_lower) ||
-                        e.body.to_lowercase().contains(&search_lower)
-                    }
-                })
-                .collect();
+            let filtered: Vec<&Email> = self.filtered_emails();
 
             // Row labels carry the list-viewport bounds, unlike the other
             // hand-emitted labels: `get_item_draw_y` returns PARTIALLY visible
@@ -4241,6 +4366,7 @@ impl ClearEmailApp {
     /// has that id.
     fn set_read(&mut self, id: usize, read: bool) -> bool {
         let mut push = None;
+        self.emails_rev = self.emails_rev.wrapping_add(1);
         let Some(email) = self.emails.iter_mut().find(|e| e.id == id) else {
             return false;
         };
@@ -4538,6 +4664,9 @@ impl Application for ClearEmailApp {
             accounts,
             selected_account_idx,
             emails,
+            emails_dirty_since: None,
+            emails_rev: 0,
+            filter_cache: std::cell::RefCell::new(None),
             current_folder: TAG_INBOX.to_string(),
             folders: initial_folders,
             synced_tags: std::collections::HashSet::new(),
@@ -4672,6 +4801,7 @@ impl Application for ClearEmailApp {
                 // compose dialog and leaves the folder (Cancel re-files it,
                 // Send delivers it, a send failure re-files it too).
                 if let Some(pos) = self.emails.iter().position(|e| e.id == id && e.folder == "drafts") {
+                    self.emails_rev = self.emails_rev.wrapping_add(1);
                     let draft = self.emails.remove(pos);
                     self.save_emails();
                     self.clear_compose();
@@ -4697,6 +4827,7 @@ impl Application for ClearEmailApp {
                 self.body_scroll = 0.0;
                 self.request_html(id);
                 let mut push_seen_uid = None;
+                self.emails_rev = self.emails_rev.wrapping_add(1);
                 if let Some(email) = self.emails.iter_mut().find(|e| e.id == id) {
                     if !email.read {
                         email.read = true;
@@ -4835,6 +4966,7 @@ impl Application for ClearEmailApp {
                     .unwrap_or_default();
                 match outcome {
                     None => {
+                        self.emails_rev = self.emails_rev.wrapping_add(1);
                         self.emails.push(Email {
                             id: new_id,
                             from,
@@ -4910,6 +5042,7 @@ impl Application for ClearEmailApp {
                     let mut permanently_deleted = false;
                     // (mailbox tag, uid, permanent)
                     let mut server_op: Option<(String, u32, bool)> = None;
+                    self.emails_rev = self.emails_rev.wrapping_add(1);
                     if let Some(email) = self.emails.iter_mut().find(|e| e.id == id) {
                         if email.folder == "trash" {
                             // Already in the local Trash: this is the second
@@ -4961,6 +5094,7 @@ impl Application for ClearEmailApp {
                         }
                     }
                     if permanently_deleted {
+                        self.emails_rev = self.emails_rev.wrapping_add(1);
                         self.emails.retain(|e| e.id != id);
                     }
                     self.save_emails();
@@ -5008,13 +5142,17 @@ impl Application for ClearEmailApp {
                 self.needs_rebuild = true;
             }
             AppMessage::SelectAccount(idx) => {
+                // The outgoing account's unsaved changes go first.
+                self.flush_emails();
                 self.selected_account_idx = idx;
                 self.account_dropdown.selected = idx.min(self.accounts.len().saturating_sub(1));
                 if let Some(email) = self.accounts.get(idx).map(|a| a.email.clone()) {
+                    self.emails_rev = self.emails_rev.wrapping_add(1);
                     self.emails = load_emails_for_account(&email);
                     save_selected_account_email(&email);
                     self.start_sync(true);
                 } else {
+                    self.emails_rev = self.emails_rev.wrapping_add(1);
                     self.emails = Vec::new();
                 }
                 self.selected_email_id = None;
@@ -5082,18 +5220,25 @@ impl Application for ClearEmailApp {
                     .map(|a| a.email.clone());
 
                 if active.as_deref() == Some(email.as_str()) {
+                    self.emails_rev = self.emails_rev.wrapping_add(1);
                     let prior = std::mem::take(&mut self.emails);
                     self.emails = merge_sync(prior, &folders);
-                    save_emails_for_account(&email, &self.emails);
+                    self.save_emails();
                     // The merge can re-key ids, so id-keyed HTML is no
                     // longer trustworthy. The loaded view stays (the user
                     // is reading it); a re-open refetches.
                     #[cfg(feature = "wpe")]
                     self.html_cache.clear();
                 } else if active.is_some() {
-                    // A background account: fold into its cache on disk only.
-                    let prior = load_emails_for_account(&email);
-                    save_emails_for_account(&email, &merge_sync(prior, &folders));
+                    // A background account: fold into its cache on disk only,
+                    // off the UI thread — the read and parse are the whole
+                    // cache.
+                    let folders = folders.clone();
+                    let email = email.clone();
+                    std::thread::spawn(move || {
+                        let prior = load_emails_for_account(&email);
+                        save_emails_for_account(&email, merge_sync(prior, &folders));
+                    });
                 }
 
                 // Keep pulling while history is still coming down. Each pass
@@ -5199,11 +5344,27 @@ impl Application for ClearEmailApp {
     /// default idle sleep and retire the toast up to a second late. Poll
     /// while one is up; the scheduled backfill is happy with the default.
     fn idle_poll_interval(&self) -> Option<std::time::Duration> {
-        matches!(self.status_message, Some(StatusToast::Info { .. }))
-            .then(|| std::time::Duration::from_millis(100))
+        let toast = matches!(self.status_message, Some(StatusToast::Info { .. }))
+            .then(|| std::time::Duration::from_millis(100));
+        // A pending cache save is due EMAILS_SAVE_DELAY after it was marked.
+        let save = self
+            .emails_dirty_since
+            .map(|t| EMAILS_SAVE_DELAY.saturating_sub(t.elapsed()).max(std::time::Duration::from_millis(10)));
+        match (toast, save) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn on_exit(&mut self) {
+        self.flush_emails();
+        email_store::flush();
     }
 
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
+        if self.emails_dirty_since.is_some_and(|t| t.elapsed() >= EMAILS_SAVE_DELAY) {
+            self.flush_emails();
+        }
         // Pump the widget tick walk: animating widgets (dropdown menus'
         // expand/contract) register as tick receivers and report changed
         // until their transition lands — without this a closing menu freezes
@@ -5314,8 +5475,6 @@ impl Application for ClearEmailApp {
         let w_f32 = self.width as f32;
         let h_f32 = self.height as f32;
 
-        let current_folder_str = self.current_folder.clone();
-
         let list_x = window_pad();
         let (list_w, _separator_x, detail_x) = self.split_geom();
 
@@ -5383,20 +5542,7 @@ impl Application for ClearEmailApp {
             }
 
             // Get filtered emails count for bounds setup
-            let list_count = self.emails.iter()
-                .filter(|e| e.folder == current_folder_str)
-                .filter(|e| {
-                    let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
-                    let search_lower = search_text.to_lowercase();
-                    if search_lower.is_empty() {
-                        true
-                    } else {
-                        e.from.to_lowercase().contains(&search_lower) ||
-                        e.subject.to_lowercase().contains(&search_lower) ||
-                        e.body.to_lowercase().contains(&search_lower)
-                    }
-                })
-                .count();
+            let list_count = self.filtered_emails().len();
 
             let (list_top, list_h) = self.list_geom();
             self.email_list.set_rect(list_x, list_top, list_w, list_h);
@@ -5439,23 +5585,11 @@ impl Application for ClearEmailApp {
             };
 
             // Get filtered email IDs and selection states
-            let filtered_email_ids: Vec<(usize, bool)> = {
-                let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
-                let search_lower = search_text.to_lowercase();
-                self.emails.iter()
-                    .filter(|e| e.folder == current_folder_str)
-                    .filter(|e| {
-                        if search_lower.is_empty() {
-                            true
-                        } else {
-                            e.from.to_lowercase().contains(&search_lower) ||
-                            e.subject.to_lowercase().contains(&search_lower) ||
-                            e.body.to_lowercase().contains(&search_lower)
-                        }
-                    })
-                    .map(|e| (e.id, Some(e.id) == self.selected_email_id))
-                    .collect()
-            };
+            let filtered_email_ids: Vec<(usize, bool)> = self
+                .filtered_emails()
+                .iter()
+                .map(|e| (e.id, Some(e.id) == self.selected_email_id))
+                .collect();
 
             for (idx, &(_email_id, is_selected)) in filtered_email_ids.iter().enumerate() {
                 self.email_buttons[idx].selected = is_selected;
@@ -5503,19 +5637,7 @@ impl Application for ClearEmailApp {
         // Now compute `filtered` only for rendering (immutable borrow of self)
         let filtered: Vec<&Email> = {
             let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
-            let search_lower = search_text.to_lowercase();
-            self.emails.iter()
-                .filter(|e| e.folder == current_folder_str)
-                .filter(|e| {
-                    if search_lower.is_empty() {
-                        true
-                    } else {
-                        e.from.to_lowercase().contains(&search_lower) ||
-                        e.subject.to_lowercase().contains(&search_lower) ||
-                        e.body.to_lowercase().contains(&search_lower)
-                    }
-                })
-                .collect()
+            filtered_from(&self.emails, self.emails_rev, &self.current_folder, search_text, &self.filter_cache)
         };
 
         // 1. The standard root plate (cce-ui `PlateSpec::window`): the DE root
@@ -6325,21 +6447,9 @@ impl Application for ClearEmailApp {
                 // email a row click lands on. No wildcard: a new folder
                 // absorbed into "inbox" here routes clicks to the wrong list
                 // (Drafts was, briefly).
-                let current_folder_str = self.current_folder.clone();
                 let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
-                let search_lower = search_text.to_lowercase();
-                let filtered: Vec<&Email> = self.emails.iter()
-                    .filter(|e| e.folder == current_folder_str)
-                    .filter(|e| {
-                        if search_lower.is_empty() {
-                            true
-                        } else {
-                            e.from.to_lowercase().contains(&search_lower) ||
-                            e.subject.to_lowercase().contains(&search_lower) ||
-                            e.body.to_lowercase().contains(&search_lower)
-                        }
-                    })
-                    .collect();
+                let filtered: Vec<&Email> =
+                    filtered_from(&self.emails, self.emails_rev, &self.current_folder, search_text, &self.filter_cache);
 
                 for (idx, email) in filtered.iter().enumerate() {
                     if idx < self.email_buttons.len() {
@@ -7671,5 +7781,95 @@ mod tests {
         assert_eq!(out[0].subject, "just written");
         assert_eq!(out[1].subject, "newer");
         assert_eq!(out[2].subject, "older");
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn mail(id: usize, folder: &str, body: &str) -> Email {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "from": format!("sender{id}@example.org"), "to": "me@example.org",
+            "subject": format!("Subject {id}"), "body": body, "date": "", "read": false,
+            "folder": folder,
+        }))
+        .unwrap()
+    }
+
+    /// The filter answer is reused only while revision, folder and search
+    /// are all unchanged, and recomputed when any one moves.
+    #[test]
+    fn filter_cache_tracks_rev_folder_and_search() {
+        let cache = std::cell::RefCell::new(None);
+        let mut emails = vec![mail(1, "inbox", "alpha"), mail(2, "inbox", "beta"), mail(3, "trash", "alpha")];
+        let ids = |v: Vec<&Email>| v.iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids(filtered_from(&emails, 0, "inbox", "", &cache)), [1, 2]);
+        assert_eq!(ids(filtered_from(&emails, 0, "inbox", "ALPHA", &cache)), [1]);
+        assert_eq!(ids(filtered_from(&emails, 0, "trash", "alpha", &cache)), [3]);
+        // An in-place move to trash is only seen with the revision bumped.
+        emails[0].folder = "trash".into();
+        assert_eq!(ids(filtered_from(&emails, 1, "trash", "alpha", &cache)), [1, 3]);
+    }
+
+    /// A save is readable before it reaches disk, lands there whole, and
+    /// `flush` waits for it.
+    #[test]
+    fn store_saves_off_thread_and_flushes() {
+        let dir = std::env::temp_dir().join(format!("cce-mail-store-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("emails_x.json");
+        email_store::save(path.clone(), vec![mail(7, "inbox", "hello")]);
+        assert_eq!(email_store::pending(&path).map(|v| v.len()).unwrap_or(1), 1);
+        email_store::flush();
+        assert!(email_store::pending(&path).is_none());
+        let back: Vec<Email> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(back[0].id, 7);
+        assert!(!dir.join("emails_x.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Not a correctness check: what the per-frame filter and the per-change
+    /// save cost on a cache the size of the live Gmail one (~10k messages).
+    /// `cargo test --release timings -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn timings() {
+        let body = "lorem ipsum dolor sit amet ".repeat(48);
+        let emails: Vec<Email> = (0..10_000).map(|i| mail(i, if i % 3 == 0 { "trash" } else { "inbox" }, &body)).collect();
+        let t = std::time::Instant::now();
+        let old: usize = (0..4)
+            .map(|_| {
+                emails.iter().filter(|e| e.folder == "inbox")
+                    .filter(|e| e.from.to_lowercase().contains("zz") || e.subject.to_lowercase().contains("zz") || e.body.to_lowercase().contains("zz"))
+                    .count()
+            })
+            .sum();
+        let old_filter = t.elapsed();
+        let cache = std::cell::RefCell::new(None);
+        filtered_from(&emails, 0, "inbox", "zz", &cache);
+        let t = std::time::Instant::now();
+        let new: usize = (0..4).map(|_| filtered_from(&emails, 0, "inbox", "zz", &cache).len()).sum();
+        let new_filter = t.elapsed();
+        assert_eq!(old, new);
+        let t = std::time::Instant::now();
+        let pretty = serde_json::to_string_pretty(&emails).unwrap();
+        let old_save = t.elapsed();
+        let tmp = std::env::temp_dir().join(format!("cce-mail-timing-{}.json", std::process::id()));
+        let t = std::time::Instant::now();
+        std::fs::write(&tmp, &pretty).unwrap();
+        let old_write = t.elapsed();
+        let _ = std::fs::remove_file(&tmp);
+        let t = std::time::Instant::now();
+        let parsed: Vec<Email> = serde_json::from_str(&pretty).unwrap();
+        let old_bg_load = t.elapsed();
+        drop(parsed);
+        println!("old UI-thread write: {old_write:?}; a background account's load+parse (also on the UI thread before): {old_bg_load:?}");
+        let t = std::time::Instant::now();
+        let copy = emails.clone();
+        let handoff = t.elapsed();
+        drop(copy);
+        println!("4 filters/frame with a query: {old_filter:?} -> {new_filter:?} (cached)");
+        println!("save on the UI thread: {old_save:?} pretty serialize ({} MB, before the write) -> {handoff:?} clone handed to the writer", pretty.len() / 1_000_000);
     }
 }
