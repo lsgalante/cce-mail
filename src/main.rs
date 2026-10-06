@@ -767,6 +767,8 @@ fn pane_fill() -> [f32; 4] {
 fn pane_inner_pad() -> f32 {
     cce_ui::layout::plate_padding()
 }
+/// The unread mark on a list row (the `circle` glyph), linear like a prim.
+const UNREAD_DOT: [f32; 4] = [0.20, 0.45, 0.85, 1.0];
 const LIST_W_DEFAULT: f32 = 300.0;
 const LIST_W_MIN: f32 = 180.0;
 /// The detail pane never gets squeezed below this by a drag or a narrow window.
@@ -902,7 +904,8 @@ fn compose_chip_rects(attachments: &[String], modal_x: f32, modal_y: f32) -> Vec
         let shown = ellipsize(name, 22);
         // Estimated glyph advance at font_size 10 — the chip is a painted
         // quad, not a widget, so an estimate only has to be consistent
-        // between paint and hit-test (it is: both use this fn).
+        // between paint and hit-test (it is: both use this fn). The 10 past
+        // the name is the room the remove mark (the `x` glyph) is drawn in.
         let w = shown.chars().count() as f32 * 6.0 + 2.0 * cce_ui::layout::CONTROL_TEXT_INSET + 10.0;
         rects.push((x, y, w, COMPOSE_CHIP_H));
         x += w + l.gap;
@@ -4178,7 +4181,8 @@ impl ClearEmailApp {
                 labels.push(TextLabel { text: name.to_string(), x: l.label_x, y: row_y + 4.0, font_size: 11.0, color: [0x83, 0x83, 0x8a] });
             }
 
-            // Attachment chips: name + "×", clickable to remove (hit-test in
+            // Attachment chips: the name (its `x` glyph is drawn with the
+            // chip's plate), clickable to remove (hit-test in
             // handle_mouse_input via the same compose_chip_rects).
             for (path, (cx, cy, _cw, _ch)) in self
                 .compose_attachments
@@ -4190,7 +4194,7 @@ impl ClearEmailApp {
                     .and_then(|n| n.to_str())
                     .unwrap_or("attachment");
                 labels.push(TextLabel {
-                    text: format!("{} \u{00d7}", ellipsize(name, 22)),
+                    text: ellipsize(name, 22),
                     x: cx + cce_ui::layout::CONTROL_TEXT_INSET,
                     y: cy + 6.0,
                     font_size: 10.0,
@@ -5607,10 +5611,20 @@ impl Application for ClearEmailApp {
             if self.email_list.get_item_draw_y(idx, 0.0).is_some() {
                 cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.email_buttons[idx], &mut *quads.pc);
 
-                // Blue dot/unread indicator for this row
+                // Unread: the `circle` glyph in blue, a 6px dot (the glyph's
+                // disc is three quarters of its box) centred where the
+                // square quad it replaced stood.
                 if !filtered[idx].read {
                     if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                        quads.push((list_x + (pane_inner_pad() - 6.0) / 2.0, draw_y + 12.0, 6.0, 6.0, [0.20, 0.45, 0.85, 1.0]));
+                        let side = 8.0;
+                        let dot = cce_ui::scene::layout::Rect {
+                            x: list_x + (pane_inner_pad() - side) / 2.0,
+                            y: draw_y + 15.0 - side / 2.0,
+                            width: side,
+                            height: side,
+                        };
+                        // Prims take linear colour; a glyph is tinted in sRGB.
+                        quads.pc.icon("circle", dot, cce_ui::colors::to_srgb(UNREAD_DOT));
                     }
                 }
             }
@@ -5787,8 +5801,10 @@ impl Application for ClearEmailApp {
                 );
             }
 
-            // Attachment chips: control plates here, labels in the labels
-            // pass — both laid out by compose_chip_rects.
+            // Attachment chips: control plates and their `x` glyphs here,
+            // names in the labels pass — all laid out by compose_chip_rects.
+            // The glyph sits in the room the chip keeps past the name; the
+            // whole chip is still the remove target (handle_mouse_input).
             for (cx, cy, cw, ch) in compose_chip_rects(&self.compose_attachments, modal_x, modal_y) {
                 let r = cce_ui::layout::control_corner_radius();
                 quads.pc.bevel(
@@ -5796,6 +5812,17 @@ impl Application for ClearEmailApp {
                     (r, r, r, r),
                     &cce_ui::scene::Material::control(),
                     cce_ui::layout::bevel_width().min(ch * 0.2),
+                );
+                let side = 8.0;
+                quads.pc.icon(
+                    "x",
+                    cce_ui::scene::layout::Rect {
+                        x: cx + cw - cce_ui::layout::CONTROL_TEXT_INSET - side,
+                        y: cy + (ch - side) / 2.0,
+                        width: side,
+                        height: side,
+                    },
+                    [0xc8 as f32 / 255.0, 0xc8 as f32 / 255.0, 0xd2 as f32 / 255.0, 1.0],
                 );
             }
 
