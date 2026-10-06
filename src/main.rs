@@ -5965,29 +5965,22 @@ impl Application for ClearEmailApp {
 
 
 
-        // Popover pass (the data-editor pattern): geometry and labels on top of
-        // everything, exactly where they hit-test; labels carry bounds equal to
-        // the overlay rect (the is-overlay-text convention).
+        // Popover pass: on top of everything, exactly where they hit-test,
+        // painted into the frame's own PaintCtx (a RenderTarget) as the
+        // gallery and the designer paint theirs. A dropdown's labels carry
+        // the drawn popover rect as their bounds (the is-overlay-text
+        // convention). Until 2026-10-06 this went through a
+        // `PopoverCollector`, which keeps only rects and text: an open
+        // dropdown lost its arrow and its option marks, both cce-icons
+        // glyphs, and its plate came out flat and square-cornered.
         {
-            use cce_ui::scene::layout::Rect;
             for &pop_id in &self.ui_context.active_popovers {
                 let Some(pop_ptr) = self.ui_context.tree.get_ptr(pop_id) else { continue };
                 let popover = unsafe { &*pop_ptr };
-                let Some((px2, py2, pw2, ph2)) = popover.popover_rect() else { continue };
-                let mut coll = cce_ui::layout::PopoverCollector::new();
-                popover.render_popover(&mut coll);
-                for &(c, x, y, qw, qh) in &coll.rects {
-                    __pc.quad(Rect { x, y, width: qw, height: qh }, c);
+                if popover.popover_rect().is_none() {
+                    continue;
                 }
-                let pop_bounds = Some([px2, py2, px2 + pw2, py2 + ph2]);
-                for (content, size, tx, ty, color, font, _bounds) in coll.texts {
-                    let color_u8 = [
-                        (color[0] * 255.0).clamp(0.0, 255.0) as u8,
-                        (color[1] * 255.0).clamp(0.0, 255.0) as u8,
-                        (color[2] * 255.0).clamp(0.0, 255.0) as u8,
-                    ];
-                    __pc.text_with(content, tx, ty, size, color_u8, font, pop_bounds);
-                }
+                popover.render_popover(&mut __pc);
             }
         }
 
