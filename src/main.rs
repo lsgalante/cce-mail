@@ -409,11 +409,11 @@ struct ClearEmailApp {
     /// switching account mid-sync still ends up synced instead of silently
     /// skipped.
     resync_pending: bool,
-    /// Whether any folder in the pass now running still had history to come.
-    /// Accumulated across the per-folder results and read once the worker
-    /// leaves, because a later folder reporting nothing outstanding must not
-    /// cancel an earlier one that did.
-    backfill_pending: bool,
+    /// What each folder of the pass now running still had to come, as of its
+    /// latest report. Read once the worker leaves: a later folder reporting
+    /// nothing outstanding must not cancel an earlier one that did, while a
+    /// folder's own later report (its history batches) supersedes its first.
+    backfill_remaining: std::collections::HashMap<String, usize>,
     status_message: Option<StatusToast>,
     sender: calloop::channel::Sender<AppMessage>,
 
@@ -1079,9 +1079,11 @@ fn detail_chip_rects(atts: &[RemoteAttachment], detail_x: f32, origin_y: f32) ->
 /// text part come down the wire, so attachments never inflate a sync.
 const FETCH_COUNT: usize = 50;
 
-/// Ceiling on how much one sync pass downloads. A mailbox with years of
-/// history backfills across passes instead of stalling the first one, and
-/// each pass is committed to disk, so progress survives a restart.
+/// How much of a folder's missing mail one report carries. A pass syncs
+/// every folder's newest this-many first, so a mailbox with years of history
+/// does not hold up the others, then works through the rest in batches of
+/// it; each batch is merged and saved as it lands, so progress survives a
+/// restart.
 const MAX_FETCH_PER_SYNC: usize = 500;
 
 /// How many already-cached messages get their flags refreshed per pass, so
@@ -1089,8 +1091,9 @@ const MAX_FETCH_PER_SYNC: usize = 500;
 /// whole mailbox would be a needless round trip on every sync.
 const FLAG_REFRESH_WINDOW: usize = 200;
 
-/// Gap between backfill passes while history is still coming down. Short
-/// enough to feel continuous, long enough not to hammer the server.
+/// Gap before the next pass when one left history behind (a failed batch,
+/// or one cut short for a Sync Now). Short enough to feel continuous, long
+/// enough not to hammer the server.
 const BACKFILL_DELAY_SECS: u64 = 3;
 
 /// Byte cap on a fetched text part (pre-decode); the display model caps at
@@ -1719,16 +1722,152 @@ fn is_mock_account(account: &AccountInfo) -> bool {
     account.password == "mock_password" || account.email == "lsgalante@cce-ui.org"
 }
 
-/// Connect + authenticate an IMAP session; shared by the sync and
-/// server-delete workers (call from a worker thread — it blocks). Refreshed
-/// OAuth tokens are reported back via UpdateAccountTokens; every failure
-/// lands on stderr and (when `verbose`) as a sticky error toast, then
-/// yields None.
+type ImapSession = imap::Session<native_tls::TlsStream<std::net::TcpStream>>;
+
+/// A logged-in session, borrowed from [`IDLE_SESSIONS`] or freshly opened.
+/// Hand it back with [`Imap::release`] when the job is done; dropping it
+/// instead just closes the socket.
+struct Imap {
+    session: ImapSession,
+    /// The session's own socket (a `try_clone`), kept so the liveness probe
+    /// can bound its wait — the session itself does not expose its stream.
+    socket: std::net::TcpStream,
+    key: String,
+    /// The OAuth token expiry this session logged in under (unix seconds).
+    expires: Option<u64>,
+}
+
+impl std::ops::Deref for Imap {
+    type Target = ImapSession;
+    fn deref(&self) -> &ImapSession {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for Imap {
+    fn deref_mut(&mut self) -> &mut ImapSession {
+        &mut self.session
+    }
+}
+
+/// A released session waiting for the next job on the same account.
+struct IdleSession {
+    imap: Imap,
+    /// Wall clock, not `Instant`: Linux's monotonic clock stops during
+    /// suspend, and a session kept across one is exactly the dead kind.
+    since: std::time::SystemTime,
+}
+
+/// Sessions kept logged in between jobs. Opening one is TCP + TLS + the
+/// greeting + LOGIN (and on Gmail LOGIN alone is the slow part); every
+/// message open used to pay that once for the seen-flag push and again for
+/// its HTML, and every backfill pass paid it again. A kept session costs
+/// one NOOP to vouch for.
+static IDLE_SESSIONS: std::sync::Mutex<Vec<IdleSession>> = std::sync::Mutex::new(Vec::new());
+
+/// How long a released session is worth keeping. Long enough to cover a
+/// run of message opens; short of the point where the server, a NAT or a
+/// suspend has likely dropped it — past this it is discarded unprobed.
+const SESSION_IDLE_MAX: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Kept per account: the sync worker and one interactive job can each hold
+/// a session at once, and anything beyond that logs out on release.
+const SESSIONS_KEPT_PER_ACCOUNT: usize = 2;
+
+/// The NOOP that vouches for a kept session. A socket the network dropped
+/// accepts the write and never answers, so the read is bounded. A NOOP is
+/// one round trip; a probe that misses this only costs a fresh login.
+const SESSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Whether a kept session may still be used: not idle too long, and not
+/// logged in under an OAuth token that is about to lapse.
+fn idle_session_fresh(since: std::time::SystemTime, expires: Option<u64>, now: u64) -> bool {
+    // A clock stepped backwards reads as an error here: not fresh.
+    since.elapsed().is_ok_and(|idle| idle < SESSION_IDLE_MAX)
+        && expires.is_none_or(|e| e > now + 60)
+}
+
+/// Pool key: the account and the server it is for.
+fn session_key(account: &AccountInfo) -> String {
+    format!("{}\u{0}{}", account.email, account.imap)
+}
+
+impl Imap {
+    /// Done with this session: keep it for the next job on the account,
+    /// unless enough are kept already.
+    fn release(self) {
+        // Untagged responses the jobs never read (EXISTS, FETCH flag
+        // updates) queue on an unbounded channel for the session's life.
+        while self.session.unsolicited_responses.try_recv().is_ok() {}
+        let mut pool = IDLE_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let now = unix_now();
+        let stale: Vec<IdleSession> = {
+            let (keep, stale): (Vec<_>, Vec<_>) = std::mem::take(&mut *pool)
+                .into_iter()
+                .partition(|s| idle_session_fresh(s.since, s.imap.expires, now));
+            *pool = keep;
+            stale
+        };
+        let kept = pool.iter().filter(|s| s.imap.key == self.key).count();
+        let extra = if kept < SESSIONS_KEPT_PER_ACCOUNT {
+            pool.push(IdleSession { imap: self, since: std::time::SystemTime::now() });
+            None
+        } else {
+            Some(self)
+        };
+        drop(pool);
+        // Dropping closes the stale ones' sockets; no LOGOUT, which could
+        // block on exactly the dead connection that made them stale.
+        drop(stale);
+        if let Some(mut extra) = extra {
+            let _ = extra.session.logout();
+        }
+    }
+}
+
+/// A kept session for this account that still answers, if there is one.
+fn take_idle_session(key: &str) -> Option<Imap> {
+    loop {
+        let candidate = {
+            let mut pool = IDLE_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+            let idx = pool.iter().rposition(|s| s.imap.key == key)?;
+            pool.swap_remove(idx)
+        };
+        if !idle_session_fresh(candidate.since, candidate.imap.expires, unix_now()) {
+            continue;
+        }
+        let mut imap = candidate.imap;
+        let _ = imap.socket.set_read_timeout(Some(SESSION_PROBE_TIMEOUT));
+        let _ = imap.socket.set_write_timeout(Some(SESSION_PROBE_TIMEOUT));
+        let alive = imap.session.noop().is_ok();
+        // Back to blocking as every job has always run: a long UID SEARCH
+        // must not be cut off by the probe's bound.
+        let _ = imap.socket.set_read_timeout(None);
+        let _ = imap.socket.set_write_timeout(None);
+        if alive {
+            return Some(imap);
+        }
+        eprintln!("cce-mail: a kept IMAP session stopped answering; opening another");
+    }
+}
+
+/// Connect + authenticate an IMAP session; shared by every worker (call
+/// from a worker thread — it blocks). A session released by an earlier job
+/// on the same account is reused when it still answers. Refreshed OAuth
+/// tokens are reported back via UpdateAccountTokens; every failure lands on
+/// stderr and (when `verbose`) as a sticky error toast, then yields None.
 fn open_imap_session(
     account: &mut AccountInfo,
     sender: &calloop::channel::Sender<AppMessage>,
     verbose: bool,
-) -> Option<imap::Session<native_tls::TlsStream<std::net::TcpStream>>> {
+) -> Option<Imap> {
     // Everything mirrors to stderr regardless of `verbose` — the quiet
     // paths (seen-push, sent fetch) stay UI-silent but must not be
     // undebuggable. `err:` = sticky red toast, plain = timed green one.
@@ -1748,6 +1887,11 @@ fn open_imap_session(
             }
         }};
     }
+    let key = session_key(account);
+    if let Some(imap) = take_idle_session(&key) {
+        return Some(imap);
+    }
+
     let mut access_token = account.password.clone();
     if account.is_oauth {
         let mut acc = account.clone();
@@ -1788,7 +1932,17 @@ fn open_imap_session(
         }
     };
 
-    let client = match imap::connect((domain, port), domain, &tls) {
+    // `imap::connect`, opened by hand to keep a handle on the socket.
+    let connected = std::net::TcpStream::connect((domain, port))
+        .map_err(|e| e.to_string())
+        .and_then(|tcp| {
+            let socket = tcp.try_clone().map_err(|e| e.to_string())?;
+            let tls_stream = tls.connect(domain, tcp).map_err(|e| e.to_string())?;
+            let mut client = imap::Client::new(tls_stream);
+            client.read_greeting().map_err(|e| e.to_string())?;
+            Ok((client, socket))
+        });
+    let (client, socket) = match connected {
         Ok(c) => c,
         Err(e) => {
             say!(err: format!("IMAP Connection failed: {}", e));
@@ -1796,27 +1950,29 @@ fn open_imap_session(
         }
     };
 
-    if account.is_oauth {
+    let session = if account.is_oauth {
         let auth = ImapOAuth2 {
             user: account.email.clone(),
             access_token,
         };
         match client.authenticate("XOAUTH2", &auth) {
-            Ok(s) => Some(s),
+            Ok(s) => s,
             Err((e, _)) => {
                 say!(err: format!("IMAP OAuth Login failed: {}", e));
-                None
+                return None;
             }
         }
     } else {
         match client.login(&account.email, &account.password) {
-            Ok(s) => Some(s),
+            Ok(s) => s,
             Err((e, _)) => {
                 say!(err: format!("IMAP Login failed: {}", e));
-                None
+                return None;
             }
         }
-    }
+    };
+    let expires = if account.is_oauth { account.token_expiry } else { None };
+    Some(Imap { session, socket, key, expires })
 }
 
 /// Namespaces sent-folder ids away from inbox sequence numbers (both are
@@ -1831,12 +1987,26 @@ struct SyncScope {
     generation: u64,
     account: String,
     tags: Vec<String>,
-    /// When the worker left. The IMAP session carries no read timeout, so a
-    /// pass that stalls on a dead socket would otherwise hold the wire — and
-    /// the user's Sync Now — for as long as the kernel takes to give up on
-    /// the connection. Past [`SYNC_STUCK_AFTER`] the pass is presumed lost
-    /// and a new one may go out over it.
+    /// When the worker left, or last reported a folder. The IMAP session
+    /// carries no read timeout, so a pass that stalls on a dead socket would
+    /// otherwise hold the wire — and the user's Sync Now — for as long as
+    /// the kernel takes to give up on the connection. Past
+    /// [`SYNC_STUCK_AFTER`] without news the pass is presumed lost and a new
+    /// one may go out over it. Refreshed per report because a pass now
+    /// carries on into history for as long as there is some.
     started: std::time::Instant,
+    progress: SyncProgress,
+}
+
+/// Shared with the worker of one pass.
+#[derive(Debug, Clone, Default)]
+struct SyncProgress {
+    /// Set by the worker once every folder has been synced and what is left
+    /// is history: from then on a request the pass would otherwise cover is
+    /// better served by a fresh one.
+    backfilling: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the app: stop after the batch in hand.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// How long a pass may hold the wire before a forced sync overrides it. Well
@@ -1873,7 +2043,7 @@ struct FolderSync {
 /// numbers shift whenever anything is expunged, so they cannot identify a
 /// message across syncs.
 fn fetch_uid_batch(
-    session: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>,
+    session: &mut ImapSession,
     account_email: &str,
     folder_tag: &str,
     uids: &[u32],
@@ -2031,18 +2201,18 @@ fn fetch_uid_batch(
 ///
 /// This used to refetch the newest [`FETCH_COUNT`] every time and the merge
 /// replaced the folder wholesale, which pinned the cache at 50 messages
-/// however often it ran. Now a pass takes up to [`MAX_FETCH_PER_SYNC`] of the
-/// missing ones and reports the rest as `remaining`, so history backfills
-/// across passes instead of never arriving.
+/// however often it ran. Now it takes up to [`MAX_FETCH_PER_SYNC`] of the
+/// missing ones and hands back the rest, ascending, for [`sync_imap`] to
+/// work through once every folder has had its turn.
 fn sync_folder(
-    session: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>,
+    session: &mut ImapSession,
     sender: &calloop::channel::Sender<AppMessage>,
     account_email: &str,
     mailbox: &str,
     folder_tag: &str,
     known: &std::collections::HashSet<u32>,
     verbose: bool,
-) -> Option<FolderSync> {
+) -> Option<(FolderSync, Vec<u32>)> {
     macro_rules! say {
         (err: $msg:expr) => {{
             let msg: String = $msg;
@@ -2076,8 +2246,9 @@ fn sync_folder(
 
     let missing: Vec<u32> = server_uids.iter().copied().filter(|u| !known.contains(u)).collect();
     let take = missing.len().min(MAX_FETCH_PER_SYNC);
-    let batch_uids = &missing[missing.len() - take..]; // newest first come first
-    let remaining = missing.len() - take;
+    let mut backlog = missing;
+    let batch_uids = backlog.split_off(backlog.len() - take); // newest first come first
+    let remaining = backlog.len();
 
     if take > 0 {
         if remaining > 0 {
@@ -2094,14 +2265,7 @@ fn sync_folder(
         }
     };
 
-    let mut fetched = Vec::new();
-    for chunk in batch_uids.chunks(FETCH_COUNT) {
-        // Newest chunk first, so a long backfill still surfaces recent mail
-        // early. Each chunk is a separate round trip but one session.
-        let mut ordered: Vec<u32> = chunk.to_vec();
-        ordered.sort_unstable_by(|a, b| b.cmp(a));
-        fetched.extend(fetch_uid_batch(session, account_email, folder_tag, &ordered, &say_err));
-    }
+    let fetched = fetch_newest_first(session, account_email, folder_tag, &batch_uids, &say_err);
 
     // Flags for the recent window of already-cached mail, so a message read
     // on another client stops showing as unread here. Cheap: no bodies.
@@ -2130,13 +2294,35 @@ fn sync_folder(
         }
     }
 
-    Some(FolderSync {
-        folder: folder_tag.to_string(),
-        fetched,
-        server_uids,
-        seen_uids,
-        remaining,
-    })
+    Some((
+        FolderSync {
+            folder: folder_tag.to_string(),
+            fetched,
+            server_uids,
+            seen_uids,
+            remaining,
+        },
+        backlog,
+    ))
+}
+
+/// Download `uids` (ascending) in [`FETCH_COUNT`] chunks, newest chunk
+/// first, so a long backfill still surfaces recent mail early. Each chunk is
+/// a separate round trip but one session.
+fn fetch_newest_first(
+    session: &mut ImapSession,
+    account_email: &str,
+    folder_tag: &str,
+    uids: &[u32],
+    say_err: &dyn Fn(String),
+) -> Vec<Email> {
+    let mut fetched = Vec::new();
+    for chunk in uids.rchunks(FETCH_COUNT) {
+        let mut ordered: Vec<u32> = chunk.to_vec();
+        ordered.sort_unstable_by(|a, b| b.cmp(a));
+        fetched.extend(fetch_uid_batch(session, account_email, folder_tag, &ordered, say_err));
+    }
+    fetched
 }
 
 /// Fold one sync pass into the cached mail.
@@ -2275,7 +2461,7 @@ fn decode_imap_utf7(raw: &str) -> String {
 /// `None` means LIST itself failed — the caller falls back to the last saved
 /// discovery rather than the defaults, whose archive/sent have no mailbox yet.
 fn list_folders(
-    session: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>,
+    session: &mut ImapSession,
 ) -> Option<Vec<FolderInfo>> {
     let names = session.list(Some(""), Some("*")).ok()?;
 
@@ -2527,6 +2713,7 @@ fn sync_imap(
     known: std::collections::HashMap<String, std::collections::HashSet<u32>>,
     want_tags: Vec<String>,
     generation: u64,
+    progress: SyncProgress,
     sender: calloop::channel::Sender<AppMessage>,
 ) {
     /// Hands `sync_in_flight` back however the worker leaves — the early
@@ -2569,6 +2756,9 @@ fn sync_imap(
         };
 
         let empty = std::collections::HashSet::new();
+        // Folders with history still to download: (tag, the pass's
+        // `UID SEARCH` snapshot, the uids it is missing, ascending).
+        let mut backlogs: Vec<(String, Vec<u32>, Vec<u32>)> = Vec::new();
 
         for tag in &want_tags {
             let Some(info) = discovered.iter().find(|f| &f.tag == tag) else {
@@ -2582,7 +2772,7 @@ fn sync_imap(
             // nothing, which the merge reads as "no news about that folder"
             // rather than "that folder is empty".
             let verbose = info.tag == TAG_INBOX;
-            if let Some(synced) = sync_folder(
+            if let Some((synced, backlog)) = sync_folder(
                 &mut session,
                 &sender,
                 &account.email,
@@ -2597,6 +2787,9 @@ fn sync_imap(
                 // the entire account; batching meant new mail sat finished in
                 // this thread for the half-minute that took, which reads as a
                 // sync that did nothing.
+                if !backlog.is_empty() {
+                    backlogs.push((info.tag.clone(), synced.server_uids.clone(), backlog));
+                }
                 let _ = sender.send(AppMessage::EmailsSynced(
                     account.email.clone(),
                     vec![synced],
@@ -2604,8 +2797,47 @@ fn sync_imap(
             }
         }
 
+        // History, on the same session and against the same search. This
+        // used to be a pass of its own per MAX_FETCH_PER_SYNC messages, each
+        // a fresh login, LIST, and `UID SEARCH ALL` of every folder — All
+        // Mail's searching the whole account again for each 500 it brought
+        // down. Mail deleted elsewhere meanwhile is the next pass's to
+        // notice; mail arriving meanwhile is above the snapshot, which the
+        // merge leaves alone. Stops between batches when the app wants the
+        // wire for something the user asked for (`SyncProgress::cancel`).
+        progress.backfilling.store(true, std::sync::atomic::Ordering::Relaxed);
+        'history: for (tag, server_uids, mut backlog) in backlogs {
+            while !backlog.is_empty() {
+                if progress.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break 'history;
+                }
+                let take = backlog.len().min(MAX_FETCH_PER_SYNC);
+                let batch = backlog.split_off(backlog.len() - take);
+                let say_err = |m: String| eprintln!("cce-mail: {}", m);
+                let fetched =
+                    fetch_newest_first(&mut session, &account.email, &tag, &batch, &say_err);
+                if fetched.is_empty() {
+                    // A failed fetch, or a batch deleted since the search.
+                    // Either way the last report for this folder still says
+                    // what is outstanding, so the app schedules the next
+                    // pass, which searches afresh.
+                    break;
+                }
+                let _ = sender.send(AppMessage::EmailsSynced(
+                    account.email.clone(),
+                    vec![FolderSync {
+                        folder: tag.clone(),
+                        fetched,
+                        server_uids: server_uids.clone(),
+                        seen_uids: Vec::new(),
+                        remaining: backlog.len(),
+                    }],
+                ));
+            }
+        }
+
         let _ = sender.send(AppMessage::Status("Sync Complete".to_string()));
-        let _ = session.logout();
+        session.release();
     });
 }
 
@@ -2650,7 +2882,7 @@ fn delete_on_server(
             let msg = format!("Failed to select {}", mailbox);
             eprintln!("cce-mail: {}", msg);
             let _ = sender.send(AppMessage::StatusError(msg));
-            let _ = session.logout();
+            session.release();
             return;
         }
         let uid_set = uid.to_string();
@@ -2664,7 +2896,7 @@ fn delete_on_server(
         if let Err(e) = session.uid_store(&uid_set, "+FLAGS (\\Deleted)") {
             eprintln!("cce-mail: Server delete failed: {}", e);
             let _ = sender.send(AppMessage::StatusError(format!("Server delete failed: {}", e)));
-            let _ = session.logout();
+            session.release();
             return;
         }
         if session.uid_expunge(&uid_set).is_err() {
@@ -2673,7 +2905,7 @@ fn delete_on_server(
         let _ = sender.send(AppMessage::Status(
             if permanent { "Deleted permanently on server" } else { "Deleted on server" }.to_string(),
         ));
-        let _ = session.logout();
+        session.release();
     });
 }
 
@@ -2742,7 +2974,7 @@ fn fetch_attachment(
         let mailboxes: &[&str] = &[mailbox.as_str()];
         if !mailboxes.iter().any(|mb| session.select(mb).is_ok()) {
             report(&sender, Err("Cannot select mailbox".to_string()));
-            let _ = session.logout();
+            session.release();
             return;
         }
         let query = format!("(BODY.PEEK[{}])", section_str(&att.section));
@@ -2755,7 +2987,7 @@ fn fetch_attachment(
             Err(e) => Err(format!("Fetch failed: {}", e)),
         };
         report(&sender, outcome);
-        let _ = session.logout();
+        session.release();
     });
 }
 
@@ -2799,7 +3031,7 @@ fn fetch_html_part(
         };
         if let Err(e) = session.select(&mailbox) {
             report(None, &format!("cannot select mailbox: {e}"));
-            let _ = session.logout();
+            session.release();
             return;
         }
         // One structure fetch feeds both walks: the html part to render and
@@ -2821,7 +3053,7 @@ fn fetch_html_part(
             Ok(parts) => parts,
             Err(why) => {
                 report(None, &why);
-                let _ = session.logout();
+                session.release();
                 return;
             }
         };
@@ -2882,7 +3114,7 @@ fn fetch_html_part(
             }
             Err(why) => report(None, &why),
         }
-        let _ = session.logout();
+        session.release();
     });
 }
 
@@ -2910,7 +3142,7 @@ fn set_seen_on_server(mut account: AccountInfo, uid: u32, seen: bool, sender: ca
             let query = if seen { "+FLAGS (\\Seen)" } else { "-FLAGS (\\Seen)" };
             let _ = session.uid_store(uid.to_string(), query);
         }
-        let _ = session.logout();
+        session.release();
     });
 }
 
@@ -3347,7 +3579,14 @@ impl ClearEmailApp {
                 .get(self.selected_account_idx)
                 .is_some_and(|a| a.email == scope.account)
                 && scope.tags.contains(&self.current_folder);
-            if covered {
+            // Past its folders the pass is only downloading history, and a
+            // Sync Now wants what has arrived since it searched: stop it at
+            // the next batch and go again. History resumes from that pass.
+            let backfilling = scope.progress.backfilling.load(std::sync::atomic::Ordering::Relaxed);
+            if backfilling && (force || !covered) {
+                scope.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.resync_pending = true;
+            } else if covered {
                 if force {
                     self.status_message = Some(StatusToast::info("Already syncing...", 2.0));
                 }
@@ -3414,14 +3653,16 @@ impl ClearEmailApp {
         // a drop guard — so every early return and every panic still hands
         // the wire back.
         self.sync_generation = self.sync_generation.wrapping_add(1);
+        let progress = SyncProgress::default();
         self.sync_in_flight = Some(SyncScope {
             generation: self.sync_generation,
             account: account.email.clone(),
             tags: want_tags.clone(),
             started: std::time::Instant::now(),
+            progress: progress.clone(),
         });
-        self.backfill_pending = false;
-        sync_imap(account, known, want_tags, self.sync_generation, self.sender.clone());
+        self.backfill_remaining.clear();
+        sync_imap(account, known, want_tags, self.sync_generation, progress, self.sender.clone());
         self.last_sync_start = Some(std::time::Instant::now());
     }
 
@@ -4643,7 +4884,7 @@ impl Application for ClearEmailApp {
             backfill_at: None,
             sync_in_flight: None,
             sync_generation: 0,
-            backfill_pending: false,
+            backfill_remaining: std::collections::HashMap::new(),
             resync_pending: false,
             keys: EmailKeys::load(),
             mail_button,
@@ -5251,8 +5492,14 @@ impl Application for ClearEmailApp {
                 // the overlap `sync_in_flight` exists to prevent. A folder
                 // with nothing outstanding must not clear the flag either; the
                 // inbox being current says nothing about All Mail's history.
+                for f in &folders {
+                    self.backfill_remaining.insert(f.folder.clone(), f.remaining);
+                }
+                // News from the pass on the wire: it is not stuck.
+                if let Some(scope) = self.sync_in_flight.as_mut().filter(|s| s.account == email) {
+                    scope.started = std::time::Instant::now();
+                }
                 if remaining > 0 {
-                    self.backfill_pending = true;
                     self.status_message = Some(StatusToast::info(
                         format!("Fetched {} — {} older messages still to come...", fetched, remaining),
                         4.0,
@@ -5275,13 +5522,14 @@ impl Application for ClearEmailApp {
                 // and it supersedes backfilling history nobody asked for.
                 // `start_sync` cannot be turned away twice, the flag having
                 // just been cleared.
+                let backfill_pending =
+                    std::mem::take(&mut self.backfill_remaining).values().any(|&n| n > 0);
                 if std::mem::take(&mut self.resync_pending) {
-                    self.backfill_pending = false;
                     self.start_sync(true);
                     *needs_rebuild = true;
                     self.needs_rebuild = true;
                 } else {
-                    self.backfill_at = std::mem::take(&mut self.backfill_pending).then(|| {
+                    self.backfill_at = backfill_pending.then(|| {
                         std::time::Instant::now()
                             + std::time::Duration::from_secs(BACKFILL_DELAY_SECS)
                     });
@@ -7770,6 +8018,20 @@ mod tests {
         assert_eq!(out[0].subject, "just written");
         assert_eq!(out[1].subject, "newer");
         assert_eq!(out[2].subject, "older");
+    }
+
+    #[test]
+    fn a_kept_session_goes_stale_by_wall_clock_and_token() {
+        use std::time::{Duration, SystemTime};
+        let now = unix_now();
+        let just = SystemTime::now();
+        assert!(idle_session_fresh(just, None, now));
+        assert!(!idle_session_fresh(just - SESSION_IDLE_MAX - Duration::from_secs(1), None, now));
+        // A wall clock stepped backwards since the release: not trusted.
+        assert!(!idle_session_fresh(just + Duration::from_secs(3600), None, now));
+        // Logged in under an OAuth token about to lapse.
+        assert!(!idle_session_fresh(just, Some(now + 30), now));
+        assert!(idle_session_fresh(just, Some(now + 3600), now));
     }
 }
 
