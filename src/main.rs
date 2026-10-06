@@ -3547,9 +3547,8 @@ impl ClearEmailApp {
     /// the list's bar rides its plate's.
     fn detail_sb_lane(&self) -> (f32, f32) {
         let (px, _, pw, _) = self.detail_pane_geom();
-        // Page-level bar width (the settings page look), as `parameters_bg`
-        // and the settings pages widen theirs.
-        let sb_w = cce_ui::layout::scrollbar_width() * 1.6;
+        // The DE's centred-bar width, the list's and the params pane's.
+        let sb_w = cce_ui::layout::centred_scrollbar_width();
         (px + (pw - sb_w) / 2.0, sb_w)
     }
 
@@ -4007,8 +4006,8 @@ impl ClearEmailApp {
         if max_scroll <= 0.0 {
             return None;
         }
-        // The bar rides inside the pane plate, stood off ITS right edge by the
-        // configured inset — it belongs to the pane, not to the window.
+        // The bar rides the pane plate's centre line — it belongs to the
+        // pane, not to the window.
         let (sb_x, sb_w) = self.detail_sb_lane();
         // The track stops 4px short at each end, which is what every toolkit
         // bar does (`ScrollRegion::scrollbar_geom`, `paint_relief_scrollbar`,
@@ -4568,10 +4567,9 @@ impl Application for ClearEmailApp {
         search_box.font_size = 11.0;
 
         // Designer raise/sink treatment: idle the bar sinks under the list's
-        // translucent bg fill (dimly visible through it), a scroll raises it
-        // over the cards. It rides the plate's centre line, not its right rim
-        // — `edge_inset` is set from the band width in the layout pass below,
-        // because the splitter makes that width move.
+        // plate (dimly visible through it), a scroll raises it over the
+        // cards. Sinking is centring: the toolkit puts a sink-behind bar on
+        // the plate's centre line, wherever the splitter leaves it.
         let email_list = ScrollRegion::new(54.0, 4.0)
             // Frameless: the cards sit straight on the plate. Explicit because
             // the prim paint path below honors `draw_frame` (default true) and
@@ -5547,12 +5545,6 @@ impl Application for ClearEmailApp {
             let (list_top, list_h) = self.list_geom();
             self.email_list.set_rect(list_x, list_top, list_w, list_h);
             self.email_list.update_bounds(list_count, list_top, list_h);
-            // Centre the bar on the plate: `edge_inset` is measured in from the
-            // RIGHT rim, so half the width the bar does not occupy puts the
-            // bar's own centre line on the plate's. Recomputed here rather than
-            // fixed at construction because the splitter moves `list_w`.
-            self.email_list.edge_inset =
-                (list_w - cce_ui::layout::scrollbar_width()) / 2.0;
 
             if self.email_buttons.len() != list_count {
                 // Widget ids are globally monotonic and never reused, so the fresh buttons
@@ -5752,11 +5744,10 @@ impl Application for ClearEmailApp {
             }
         }
         quads.pc.pop_clip_rounded();
-        // Scrollbar after the rows so the thumb rides on top of them instead of
-        // peeking through the inter-row gaps. Frameless, so `push_prims` emits
-        // the raised layer alone — pills, the toolkit's own geometry and
-        // colors, rather than the square quads the tuple path drew.
-        self.email_list.push_prims(&mut *quads.pc);
+        // The bar's fore copy after the rows, so the thumb rides on top of
+        // them instead of peeking through the inter-row gaps — at the fade,
+        // over the idle copy that went down under the plates above.
+        self.email_list.push_scrollbar_fore(&mut *quads.pc);
 
         // The focused pane's highlight ring: cce-designer's flat-style pane
         // focus (`append_context_border`), at the plates' own radius. Both
@@ -5871,11 +5862,8 @@ impl Application for ClearEmailApp {
                         let max_scroll = (content_h - body_h).max(0.0);
                         self.body_scroll = self.body_scroll.clamp(0.0, max_scroll);
 
-                        // Scrollbar (ScrollRegion's colors) while raised: a
-                        // scroll shows it, 0.7s of quiet hides it (the window
-                        // bg is opaque — no plate for a sunk layer to show
-                        // through, so sunk is simply not drawn).
-                        // The fore copy, faded in over the body. Driven by the
+                        // The fore copy, faded in over the body (the idle copy
+                        // went down under the plates, above). Driven by the
                         // activity's fade rather than its latch, so it keeps
                         // drawing all the way out instead of being cut off the
                         // instant the bar stops counting as raised.
