@@ -3474,40 +3474,25 @@ impl ClearEmailApp {
     /// `render_widget`'s registration side effect. `email_buttons` is rebuilt on list
     /// refresh — per-frame registration follows the fresh allocations.
     fn register_dispatch_roots(&mut self) {
-        let (id, ptr) = (self.search_box.id(), self.search_box.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.detail_body.id(), self.detail_body.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.compose_to.id(), self.compose_to.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.compose_cc.id(), self.compose_cc.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.compose_bcc.id(), self.compose_bcc.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.compose_subject.id(), self.compose_subject.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.compose_body.id(), self.compose_body.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.mail_button.id(), self.mail_button.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.folder_dropdown.id(), self.folder_dropdown.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.account_dropdown.id(), self.account_dropdown.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_compose_send.id(), self.btn_compose_send.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_compose_cancel.id(), self.btn_compose_cancel.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
-        let (id, ptr) = (self.btn_compose_attach.id(), self.btn_compose_attach.as_ptr_mut());
-        self.ui_context.register_widget(id, ptr);
+        self.ui_context.register_host(&mut self.search_box);
+        self.ui_context.register_host(&mut self.detail_body);
+        self.ui_context.register_host(&mut self.compose_to);
+        self.ui_context.register_host(&mut self.compose_cc);
+        self.ui_context.register_host(&mut self.compose_bcc);
+        self.ui_context.register_host(&mut self.compose_subject);
+        self.ui_context.register_host(&mut self.compose_body);
+        self.ui_context.register_host(&mut self.mail_button);
+        self.ui_context.register_host(&mut self.folder_dropdown);
+        self.ui_context.register_host(&mut self.account_dropdown);
+        self.ui_context.register_host(&mut self.btn_compose_send);
+        self.ui_context.register_host(&mut self.btn_compose_cancel);
+        self.ui_context.register_host(&mut self.btn_compose_attach);
         #[cfg(feature = "wpe")]
         for btn in [&mut self.btn_html_view, &mut self.btn_html_images] {
-            let (id, ptr) = (btn.id(), btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
+            self.ui_context.register_host(btn);
         }
         for btn in self.email_buttons.iter_mut() {
-            let (id, ptr) = (btn.id(), btn.as_ptr_mut());
-            self.ui_context.register_widget(id, ptr);
+            self.ui_context.register_host(btn);
         }
     }
 
@@ -5818,8 +5803,7 @@ impl Application for ClearEmailApp {
                 // the list is dropped as a stale root (and nothing re-triggers a
                 // rebuild, so the list stays dead).
                 for btn in self.email_buttons.iter_mut() {
-                    let (id, ptr) = (btn.id(), btn.as_ptr_mut());
-                    self.ui_context.register_widget(id, ptr);
+                    self.ui_context.register_host(btn);
                 }
             }
 
