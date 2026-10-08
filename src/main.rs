@@ -5,7 +5,6 @@ mod wpe;
 mod accounts_file;
 use cce_ui::widget::Owned;
 use cce_ui::widget::ScrollRegion;
-use wayland_client::QueueHandle;
 use cce_ui::cosmic_text::FontSystem;
 use cce_ui::engine::{Application, CursorIcon, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
@@ -4764,7 +4763,9 @@ impl Application for ClearEmailApp {
         Some(&self.ui_context)
     }
 
-    fn new(_qh: &QueueHandle<EngineState<Self>>, _sender: calloop::channel::Sender<Self::Message>) -> Self {
+    fn create(_sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
+        // The app keeps calloop's sender; `AppSender` converts into it.
+        let _sender: calloop::channel::Sender<Self::Message> = _sender.into();
         cce_ui::scale::set_scale_factor(1.0);
         ipc::spawn_listener(_sender.clone());
 
