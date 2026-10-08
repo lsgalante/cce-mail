@@ -3,6 +3,7 @@
 mod ipc;
 mod wpe;
 mod accounts_file;
+use cce_ui::widget::Owned;
 use cce_ui::widget::ScrollRegion;
 use wayland_client::QueueHandle;
 use cce_ui::cosmic_text::FontSystem;
@@ -260,35 +261,35 @@ struct ClearEmailApp {
     /// The app menu trigger: the cce-icons `mail` glyph, plateless. Its
     /// rows fire through `context_menu_actions`, the same path as a card's
     /// right-click menu, so the bar owns no second menu implementation.
-    mail_button: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    mail_button: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
     /// Folder switcher: options[0] carries the live inbox unread count
     /// ("Inbox (6)"), refreshed each rebuild, so rows and trigger agree.
-    folder_dropdown: cce_ui::widget::Adapted<Dropdown>,
+    folder_dropdown: Owned<cce_ui::widget::Adapted<Dropdown>>,
     /// Account switcher beside the folder dropdown: options are the account
     /// emails plus a trailing "Manage Accounts…" pseudo-entry (management
     /// lives in cce-system-interface). Options refresh from accounts.json on
     /// every open — the job the retired Accounts page did on entry.
-    account_dropdown: cce_ui::widget::Adapted<Dropdown>,
+    account_dropdown: Owned<cce_ui::widget::Adapted<Dropdown>>,
 
     // Search and List View
-    search_box: cce_ui::widget::Adapted<TextBox>,
+    search_box: Owned<cce_ui::widget::Adapted<TextBox>>,
     email_list: ScrollRegion,
-    email_buttons: Vec<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    email_buttons: Vec<Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>>,
 
     // Details View (Reply/Delete/Mark Read/Unread live in the Message menu)
-    detail_body: cce_ui::widget::Adapted<TextBox>,
+    detail_body: Owned<cce_ui::widget::Adapted<TextBox>>,
 
     // Compose Dialog
-    compose_to: cce_ui::widget::Adapted<TextBox>,
-    compose_cc: cce_ui::widget::Adapted<TextBox>,
-    compose_bcc: cce_ui::widget::Adapted<TextBox>,
-    compose_subject: cce_ui::widget::Adapted<TextBox>,
-    compose_body: cce_ui::widget::Adapted<TextBox>,
+    compose_to: Owned<cce_ui::widget::Adapted<TextBox>>,
+    compose_cc: Owned<cce_ui::widget::Adapted<TextBox>>,
+    compose_bcc: Owned<cce_ui::widget::Adapted<TextBox>>,
+    compose_subject: Owned<cce_ui::widget::Adapted<TextBox>>,
+    compose_body: Owned<cce_ui::widget::Adapted<TextBox>>,
     /// Absolute paths queued for the next send; drawn as removable chips.
     compose_attachments: Vec<String>,
-    btn_compose_send: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    btn_compose_cancel: cce_ui::widget::Adapted<cce_ui::widget::Button>,
-    btn_compose_attach: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_compose_send: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    btn_compose_cancel: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    btn_compose_attach: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
 
     // Accounts (switch via the bar dropdown — management lives in cce-system-interface)
     accounts: Vec<AccountInfo>,
@@ -350,9 +351,9 @@ struct ClearEmailApp {
     /// HTML-view toggles in the detail header band (text/HTML, remote
     /// images); laid out each frame by `layout_html_buttons`.
     #[cfg(feature = "wpe")]
-    btn_html_view: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_html_view: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
     #[cfg(feature = "wpe")]
-    btn_html_images: cce_ui::widget::Adapted<cce_ui::widget::Button>,
+    btn_html_images: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
     /// Where the page was last drawn (logical px), for routing input to it.
     #[cfg(feature = "wpe")]
     webview_rect: (f32, f32, f32, f32),
@@ -4872,22 +4873,22 @@ impl Application for ClearEmailApp {
             backfill_remaining: std::collections::HashMap::new(),
             resync_pending: false,
             keys: EmailKeys::load(),
-            mail_button,
-            folder_dropdown,
-            account_dropdown,
-            search_box,
+            mail_button: Owned::new(mail_button),
+            folder_dropdown: Owned::new(folder_dropdown),
+            account_dropdown: Owned::new(account_dropdown),
+            search_box: Owned::new(search_box),
             email_list,
             email_buttons: Vec::new(),
-            detail_body,
-            compose_to,
-            compose_cc,
-            compose_bcc,
-            compose_subject,
-            compose_body,
+            detail_body: Owned::new(detail_body),
+            compose_to: Owned::new(compose_to),
+            compose_cc: Owned::new(compose_cc),
+            compose_bcc: Owned::new(compose_bcc),
+            compose_subject: Owned::new(compose_subject),
+            compose_body: Owned::new(compose_body),
             compose_attachments: Vec::new(),
-            btn_compose_send,
-            btn_compose_cancel,
-            btn_compose_attach,
+            btn_compose_send: Owned::new(btn_compose_send),
+            btn_compose_cancel: Owned::new(btn_compose_cancel),
+            btn_compose_attach: Owned::new(btn_compose_attach),
             accounts,
             selected_account_idx,
             emails,
@@ -4917,9 +4918,9 @@ impl Application for ClearEmailApp {
             #[cfg(feature = "wpe")]
             show_text: false,
             #[cfg(feature = "wpe")]
-            btn_html_view: Button::new(-9999.0, -9999.0, 0.0, 0.0).with_label("View: HTML"),
+            btn_html_view: Owned::new(Button::new(-9999.0, -9999.0, 0.0, 0.0).with_label("View: HTML")),
             #[cfg(feature = "wpe")]
-            btn_html_images: Button::new(-9999.0, -9999.0, 0.0, 0.0).with_label("Load Images"),
+            btn_html_images: Owned::new(Button::new(-9999.0, -9999.0, 0.0, 0.0).with_label("Load Images")),
             #[cfg(feature = "wpe")]
             webview_rect: (0.0, 0.0, 0.0, 0.0),
             #[cfg(feature = "wpe")]
@@ -5796,7 +5797,7 @@ impl Application for ClearEmailApp {
                     self.ui_context.unregister_widget(id);
                 }
                 self.email_buttons = (0..list_count)
-                    .map(|_| Button::new_list_row(0.0, 0.0, 0.0, 0.0))
+                    .map(|_| Owned::new(Button::new_list_row(0.0, 0.0, 0.0, 0.0)))
                     .collect();
                 // register_dispatch_roots() already ran this frame with the OLD
                 // buttons; the fresh ids must be registered now or every click on
