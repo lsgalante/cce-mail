@@ -6174,8 +6174,7 @@ impl Application for ClearEmailApp {
         // glyphs, and its plate came out flat and square-cornered.
         {
             for &pop_id in &self.ui_context.active_popovers {
-                let Some(pop_ptr) = self.ui_context.tree.get_ptr(pop_id) else { continue };
-                let popover = unsafe { &*pop_ptr };
+                let Some(popover) = self.ui_context.get_widget(pop_id) else { continue };
                 if popover.popover_rect().is_none() {
                     continue;
                 }
