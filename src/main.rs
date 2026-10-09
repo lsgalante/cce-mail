@@ -3,7 +3,7 @@
 mod ipc;
 mod wpe;
 mod accounts_file;
-use cce_ui::widget::Owned;
+use cce_ui::widget::Handle;
 use cce_ui::widget::ScrollRegion;
 use cce_ui::cosmic_text::FontSystem;
 use cce_ui::engine::{Application, CursorIcon, EngineState, LogicalPosition, LogicalSize, WindowSettings};
@@ -260,35 +260,35 @@ struct ClearEmailApp {
     /// The app menu trigger: the cce-icons `mail` glyph, plateless. Its
     /// rows fire through `context_menu_actions`, the same path as a card's
     /// right-click menu, so the bar owns no second menu implementation.
-    mail_button: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    mail_button: Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
     /// Folder switcher: options[0] carries the live inbox unread count
     /// ("Inbox (6)"), refreshed each rebuild, so rows and trigger agree.
-    folder_dropdown: Owned<cce_ui::widget::Adapted<Dropdown>>,
+    folder_dropdown: Handle<cce_ui::widget::Adapted<Dropdown>>,
     /// Account switcher beside the folder dropdown: options are the account
     /// emails plus a trailing "Manage Accounts…" pseudo-entry (management
     /// lives in cce-system-interface). Options refresh from accounts.json on
     /// every open — the job the retired Accounts page did on entry.
-    account_dropdown: Owned<cce_ui::widget::Adapted<Dropdown>>,
+    account_dropdown: Handle<cce_ui::widget::Adapted<Dropdown>>,
 
     // Search and List View
-    search_box: Owned<cce_ui::widget::Adapted<TextBox>>,
+    search_box: Handle<cce_ui::widget::Adapted<TextBox>>,
     email_list: ScrollRegion,
-    email_buttons: Vec<Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>>,
+    email_buttons: Vec<Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>>,
 
     // Details View (Reply/Delete/Mark Read/Unread live in the Message menu)
-    detail_body: Owned<cce_ui::widget::Adapted<TextBox>>,
+    detail_body: Handle<cce_ui::widget::Adapted<TextBox>>,
 
     // Compose Dialog
-    compose_to: Owned<cce_ui::widget::Adapted<TextBox>>,
-    compose_cc: Owned<cce_ui::widget::Adapted<TextBox>>,
-    compose_bcc: Owned<cce_ui::widget::Adapted<TextBox>>,
-    compose_subject: Owned<cce_ui::widget::Adapted<TextBox>>,
-    compose_body: Owned<cce_ui::widget::Adapted<TextBox>>,
+    compose_to: Handle<cce_ui::widget::Adapted<TextBox>>,
+    compose_cc: Handle<cce_ui::widget::Adapted<TextBox>>,
+    compose_bcc: Handle<cce_ui::widget::Adapted<TextBox>>,
+    compose_subject: Handle<cce_ui::widget::Adapted<TextBox>>,
+    compose_body: Handle<cce_ui::widget::Adapted<TextBox>>,
     /// Absolute paths queued for the next send; drawn as removable chips.
     compose_attachments: Vec<String>,
-    btn_compose_send: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
-    btn_compose_cancel: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
-    btn_compose_attach: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    btn_compose_send: Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    btn_compose_cancel: Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    btn_compose_attach: Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
 
     // Accounts (switch via the bar dropdown — management lives in cce-system-interface)
     accounts: Vec<AccountInfo>,
@@ -350,9 +350,9 @@ struct ClearEmailApp {
     /// HTML-view toggles in the detail header band (text/HTML, remote
     /// images); laid out each frame by `layout_html_buttons`.
     #[cfg(feature = "wpe")]
-    btn_html_view: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    btn_html_view: Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
     #[cfg(feature = "wpe")]
-    btn_html_images: Owned<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
+    btn_html_images: Handle<cce_ui::widget::Adapted<cce_ui::widget::Button>>,
     /// Where the page was last drawn (logical px), for routing input to it.
     #[cfg(feature = "wpe")]
     webview_rect: (f32, f32, f32, f32),
@@ -3410,14 +3410,14 @@ impl ClearEmailApp {
             if tb.editing { tb.edit_buffer.trim().to_string() } else { tb.text.trim().to_string() }
         }
         OutgoingMail {
-            to: val(&self.compose_to),
-            cc: val(&self.compose_cc),
-            bcc: val(&self.compose_bcc),
-            subject: val(&self.compose_subject),
-            body: if self.compose_body.editing {
-                self.compose_body.edit_buffer.clone()
+            to: val(&self.ui_context[self.compose_to]),
+            cc: val(&self.ui_context[self.compose_cc]),
+            bcc: val(&self.ui_context[self.compose_bcc]),
+            subject: val(&self.ui_context[self.compose_subject]),
+            body: if self.ui_context[self.compose_body].editing {
+                self.ui_context[self.compose_body].edit_buffer.clone()
             } else {
-                self.compose_body.text.clone()
+                self.ui_context[self.compose_body].text.clone()
             },
             attachments: self.compose_attachments.clone(),
         }
@@ -3427,12 +3427,13 @@ impl ClearEmailApp {
     /// picks a side by the editing flag, so they must always agree).
     fn clear_compose(&mut self) {
         for tb in [
-            &mut self.compose_to,
-            &mut self.compose_cc,
-            &mut self.compose_bcc,
-            &mut self.compose_subject,
-            &mut self.compose_body,
+            self.compose_to,
+            self.compose_cc,
+            self.compose_bcc,
+            self.compose_subject,
+            self.compose_body,
         ] {
+            let tb = &mut self.ui_context[tb];
             tb.text = String::new();
             tb.edit_buffer = String::new();
         }
@@ -3466,34 +3467,6 @@ impl ClearEmailApp {
             remote_attachments: Vec::new(),
         });
         self.save_emails();
-    }
-
-    /// Register every dispatch root in the ui_context (idempotent, runs each frame).
-    /// The id-rooted router (`propagate_event(event, WidgetId)`) resolves roots through
-    /// the registry; email assembles its frame by hand and never goes through
-    /// `render_widget`'s registration side effect. `email_buttons` is rebuilt on list
-    /// refresh — per-frame registration follows the fresh allocations.
-    fn register_dispatch_roots(&mut self) {
-        self.ui_context.register_host(&mut self.search_box);
-        self.ui_context.register_host(&mut self.detail_body);
-        self.ui_context.register_host(&mut self.compose_to);
-        self.ui_context.register_host(&mut self.compose_cc);
-        self.ui_context.register_host(&mut self.compose_bcc);
-        self.ui_context.register_host(&mut self.compose_subject);
-        self.ui_context.register_host(&mut self.compose_body);
-        self.ui_context.register_host(&mut self.mail_button);
-        self.ui_context.register_host(&mut self.folder_dropdown);
-        self.ui_context.register_host(&mut self.account_dropdown);
-        self.ui_context.register_host(&mut self.btn_compose_send);
-        self.ui_context.register_host(&mut self.btn_compose_cancel);
-        self.ui_context.register_host(&mut self.btn_compose_attach);
-        #[cfg(feature = "wpe")]
-        for btn in [&mut self.btn_html_view, &mut self.btn_html_images] {
-            self.ui_context.register_host(btn);
-        }
-        for btn in self.email_buttons.iter_mut() {
-            self.ui_context.register_host(btn);
-        }
     }
 
 
@@ -3739,7 +3712,7 @@ impl ClearEmailApp {
     /// lines sharing their band are ellipsized short of it.
     #[cfg(feature = "wpe")]
     fn html_buttons_left(&self) -> Option<f32> {
-        [&self.btn_html_view, &self.btn_html_images]
+        [&self.ui_context[self.btn_html_view], &self.ui_context[self.btn_html_images]]
             .into_iter()
             .map(|b| b.rect().0)
             .filter(|x| *x > -9000.0)
@@ -3926,10 +3899,10 @@ impl ClearEmailApp {
     /// filter plus the search box. A row index means nothing without this:
     /// it is what maps the card under the pointer to its message.
     fn filtered_emails(&self) -> Vec<&Email> {
-        let search_text = if self.search_box.editing {
-            &self.search_box.edit_buffer
+        let search_text = if self.ui_context[self.search_box].editing {
+            &self.ui_context[self.search_box].edit_buffer
         } else {
-            &self.search_box.text
+            &self.ui_context[self.search_box].text
         };
         filtered_from(&self.emails, self.emails_rev, &self.current_folder, search_text, &self.filter_cache)
     }
@@ -3939,7 +3912,7 @@ impl ClearEmailApp {
     /// labels to the toolkit, messages into the parallel
     /// `context_menu_actions`, fired by `context_menu_press`.
     fn open_mail_menu(&mut self) {
-        let (bx, _, _, _) = self.mail_button.rect();
+        let (bx, _, _, _) = self.ui_context[self.mail_button].rect();
         let options = vec!["New Message".to_string(), "Sync Now".to_string(), "Quit".to_string()];
         self.context_menu_actions = vec![
             Some(AppMessage::ComposeNew),
@@ -3952,8 +3925,8 @@ impl ClearEmailApp {
     /// Right-press on a message card: open its context menu at the pointer.
     /// Returns false when the press missed every card.
     fn open_card_context_menu(&mut self, px: f32, py: f32) -> bool {
-        let hit = self.email_buttons.iter().position(|b| {
-            let (bx, by, bw, bh) = b.rect();
+        let hit = self.email_buttons.iter().position(|&b| {
+            let (bx, by, bw, bh) = self.ui_context[b].rect();
             bx > -9000.0 && px >= bx && px <= bx + bw && py >= by && py <= by + bh
         });
         let Some(idx) = hit else { return false };
@@ -4103,9 +4076,10 @@ impl ClearEmailApp {
         let images_shown = shown && !self.show_text;
         // Built right-to-left: the view toggle holds the corner.
         for (btn, label, visible) in [
-            (&mut self.btn_html_view, view_label, shown),
-            (&mut self.btn_html_images, images_label, images_shown),
+            (self.btn_html_view, view_label, shown),
+            (self.btn_html_images, images_label, images_shown),
         ] {
+            let btn = &mut self.ui_context[btn];
             if !visible {
                 btn.set_rect(-9999.0, -9999.0, 0.0, 0.0);
                 continue;
@@ -4616,12 +4590,13 @@ impl ClearEmailApp {
     fn prefill_compose(&mut self, m: &MailtoPrefill) {
         self.clear_compose();
         for (tb, v) in [
-            (&mut self.compose_to, &m.to),
-            (&mut self.compose_cc, &m.cc),
-            (&mut self.compose_bcc, &m.bcc),
-            (&mut self.compose_subject, &m.subject),
-            (&mut self.compose_body, &m.body),
+            (self.compose_to, &m.to),
+            (self.compose_cc, &m.cc),
+            (self.compose_bcc, &m.bcc),
+            (self.compose_subject, &m.subject),
+            (self.compose_body, &m.body),
         ] {
+            let tb = &mut self.ui_context[tb];
             tb.text = v.clone();
             tb.edit_buffer = v.clone();
         }
@@ -4864,6 +4839,8 @@ impl Application for ClearEmailApp {
             .map(|a| load_folders(&a.email))
             .unwrap_or_else(default_folders);
 
+        // The context owns the widgets; the app keeps their handles.
+        let mut ui_context = cce_ui::context::UiContext::new();
         let mut app = Self {
             last_sync_start: None,
             secret_retry_at: None,
@@ -4874,22 +4851,22 @@ impl Application for ClearEmailApp {
             backfill_remaining: std::collections::HashMap::new(),
             resync_pending: false,
             keys: EmailKeys::load(),
-            mail_button: Owned::new(mail_button),
-            folder_dropdown: Owned::new(folder_dropdown),
-            account_dropdown: Owned::new(account_dropdown),
-            search_box: Owned::new(search_box),
+            mail_button: ui_context.insert(mail_button),
+            folder_dropdown: ui_context.insert(folder_dropdown),
+            account_dropdown: ui_context.insert(account_dropdown),
+            search_box: ui_context.insert(search_box),
             email_list,
             email_buttons: Vec::new(),
-            detail_body: Owned::new(detail_body),
-            compose_to: Owned::new(compose_to),
-            compose_cc: Owned::new(compose_cc),
-            compose_bcc: Owned::new(compose_bcc),
-            compose_subject: Owned::new(compose_subject),
-            compose_body: Owned::new(compose_body),
+            detail_body: ui_context.insert(detail_body),
+            compose_to: ui_context.insert(compose_to),
+            compose_cc: ui_context.insert(compose_cc),
+            compose_bcc: ui_context.insert(compose_bcc),
+            compose_subject: ui_context.insert(compose_subject),
+            compose_body: ui_context.insert(compose_body),
             compose_attachments: Vec::new(),
-            btn_compose_send: Owned::new(btn_compose_send),
-            btn_compose_cancel: Owned::new(btn_compose_cancel),
-            btn_compose_attach: Owned::new(btn_compose_attach),
+            btn_compose_send: ui_context.insert(btn_compose_send),
+            btn_compose_cancel: ui_context.insert(btn_compose_cancel),
+            btn_compose_attach: ui_context.insert(btn_compose_attach),
             accounts,
             selected_account_idx,
             emails,
@@ -4919,9 +4896,9 @@ impl Application for ClearEmailApp {
             #[cfg(feature = "wpe")]
             show_text: false,
             #[cfg(feature = "wpe")]
-            btn_html_view: Owned::new(Button::new(-9999.0, -9999.0, 0.0, 0.0).with_label("View: HTML")),
+            btn_html_view: ui_context.insert(Button::new(-9999.0, -9999.0, 0.0, 0.0).with_label("View: HTML")),
             #[cfg(feature = "wpe")]
-            btn_html_images: Owned::new(Button::new(-9999.0, -9999.0, 0.0, 0.0).with_label("Load Images")),
+            btn_html_images: ui_context.insert(Button::new(-9999.0, -9999.0, 0.0, 0.0).with_label("Load Images")),
             #[cfg(feature = "wpe")]
             webview_rect: (0.0, 0.0, 0.0, 0.0),
             #[cfg(feature = "wpe")]
@@ -4940,7 +4917,7 @@ impl Application for ClearEmailApp {
             scale_factor: 1.0,
             font_system: cce_ui::create_font_system(),
             needs_rebuild: true,
-            ui_context: UiContext::new(),
+            ui_context,
         };
 
         // A mailto: launch opens the compose dialog prefilled — the same
@@ -5035,12 +5012,13 @@ impl Application for ClearEmailApp {
                     self.save_emails();
                     self.clear_compose();
                     for (tb, v) in [
-                        (&mut self.compose_to, &draft.to),
-                        (&mut self.compose_cc, &draft.cc),
-                        (&mut self.compose_bcc, &draft.bcc),
-                        (&mut self.compose_subject, &draft.subject),
-                        (&mut self.compose_body, &draft.body),
+                        (self.compose_to, &draft.to),
+                        (self.compose_cc, &draft.cc),
+                        (self.compose_bcc, &draft.bcc),
+                        (self.compose_subject, &draft.subject),
+                        (self.compose_body, &draft.body),
                     ] {
+                        let tb = &mut self.ui_context[tb];
                         tb.text = v.clone();
                         tb.edit_buffer = v.clone();
                     }
@@ -5242,19 +5220,19 @@ impl Application for ClearEmailApp {
                         // Start from a clean slate: a Cc/Bcc/attachment left
                         // over from an earlier compose must not ride along.
                         self.clear_compose();
-                        self.compose_to.text = email.from.clone();
-                        self.compose_to.edit_buffer = email.from.clone();
-                        self.compose_subject.text = if email.subject.starts_with("Re:") {
+                        self.ui_context[self.compose_to].text = email.from.clone();
+                        self.ui_context[self.compose_to].edit_buffer = email.from.clone();
+                        self.ui_context[self.compose_subject].text = if email.subject.starts_with("Re:") {
                             email.subject.clone()
                         } else {
                             format!("Re: {}", email.subject)
                         };
-                        self.compose_subject.edit_buffer = self.compose_subject.text.clone();
+                        self.ui_context[self.compose_subject].edit_buffer = self.ui_context[self.compose_subject].text.clone();
 
                         let reply_intro = format!("\n\nOn {}, {} wrote:\n> {}", email.date, email.from, email.body.replace('\n', "\n> "));
-                        self.compose_body.text = reply_intro.clone();
-                        self.compose_body.edit_buffer = reply_intro;
-                        self.compose_body.cursor_idx = 0;
+                        self.ui_context[self.compose_body].text = reply_intro.clone();
+                        self.ui_context[self.compose_body].edit_buffer = reply_intro;
+                        self.ui_context[self.compose_body].cursor_idx = 0;
                         self.compose_title = "Reply".to_string();
                         self.compose_open = true;
                     }
@@ -5374,7 +5352,7 @@ impl Application for ClearEmailApp {
                 // The outgoing account's unsaved changes go first.
                 self.flush_emails();
                 self.selected_account_idx = idx;
-                self.account_dropdown.selected = idx.min(self.accounts.len().saturating_sub(1));
+                self.ui_context[self.account_dropdown].selected = idx.min(self.accounts.len().saturating_sub(1));
                 if let Some(email) = self.accounts.get(idx).map(|a| a.email.clone()) {
                     self.emails_rev = self.emails_rev.wrapping_add(1);
                     self.emails = load_emails_for_account(&email);
@@ -5693,7 +5671,6 @@ impl Application for ClearEmailApp {
     }
 
     fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<cce_ui::scene::paint::DisplayList> {
-        self.register_dispatch_roots();
         // Phase 6ai single paint path: the view() geometry (all plain quads) and the text
         // (the old rebuild_text_items assembly, now prims via emit_text_prims) are this one
         // list. The app FontSystem stays for the TextBoxes' prepare_text measurement, but is
@@ -5719,15 +5696,15 @@ impl Application for ClearEmailApp {
             // feeds the dl-text occlusion clamp, and the popover pass at the
             // end of this function draws it on top of everything.
             self.ui_context.clear_popovers();
-            if self.folder_dropdown.popover_rect().is_some() {
-                self.ui_context.register_popover(&mut self.folder_dropdown);
+            if self.ui_context[self.folder_dropdown].popover_rect().is_some() {
+                self.ui_context.register_popover_id(self.folder_dropdown.id());
             }
-            if self.account_dropdown.popover_rect().is_some() {
-                self.ui_context.register_popover(&mut self.account_dropdown);
+            if self.ui_context[self.account_dropdown].popover_rect().is_some() {
+                self.ui_context.register_popover_id(self.account_dropdown.id());
             }
             // Labels and the index the switcher reports both come from the
             // one list, so a discovered folder cannot leave them disagreeing.
-            self.folder_dropdown.options =
+            self.ui_context[self.folder_dropdown].options =
                 self.folders.iter().map(|f| f.label.clone()).collect();
 
             // Folder rows and trigger both carry the live inbox unread count.
@@ -5740,11 +5717,11 @@ impl Application for ClearEmailApp {
                 .count();
             if inbox_unread > 0 {
                 if let Some(i) = self.folders.iter().position(|f| f.tag == TAG_INBOX) {
-                    self.folder_dropdown.options[i] =
+                    self.ui_context[self.folder_dropdown].options[i] =
                         format!("{} ({})", self.folders[i].label, inbox_unread);
                 }
             }
-            self.folder_dropdown.selected = self
+            self.ui_context[self.folder_dropdown].selected = self
                 .folders
                 .iter()
                 .position(|f| f.tag == self.current_folder)
@@ -5763,10 +5740,10 @@ impl Application for ClearEmailApp {
             // Bottoms on the band's, should button and dropdown heights differ.
             let (btn_h, dd_h) = (cce_ui::layout::button_height(), cce_ui::layout::dropdown_height());
             let bottom = edge + bar_item_h();
-            self.mail_button.set_rect(edge, bottom - btn_h, btn_h, btn_h);
+            self.ui_context[self.mail_button].set_rect(edge, bottom - btn_h, btn_h, btn_h);
             let folder_x = w_f32 - edge - FOLDER_W;
-            self.folder_dropdown.set_rect(folder_x, bottom - dd_h, FOLDER_W, dd_h);
-            self.account_dropdown
+            self.ui_context[self.folder_dropdown].set_rect(folder_x, bottom - dd_h, FOLDER_W, dd_h);
+            self.ui_context[self.account_dropdown]
                 .set_rect(folder_x - gap - ACCOUNT_W, bottom - dd_h, ACCOUNT_W, dd_h);
 
             cce_ui::scale::set_scale_factor(scale as f32);
@@ -5775,9 +5752,9 @@ impl Application for ClearEmailApp {
             // when closed so a stale rect can't be hit by anything that still
             // routes to it.
             if self.search_open {
-                self.search_box.set_rect(list_x, menubar_h() + pane_pad(), list_w, cce_ui::layout::textbox_height());
+                self.ui_context[self.search_box].set_rect(list_x, menubar_h() + pane_pad(), list_w, cce_ui::layout::textbox_height());
             } else {
-                self.search_box.set_rect(-9999.0, -9999.0, 0.0, 0.0);
+                self.ui_context[self.search_box].set_rect(-9999.0, -9999.0, 0.0, 0.0);
             }
 
             // Get filtered emails count for bounds setup
@@ -5788,25 +5765,16 @@ impl Application for ClearEmailApp {
             self.email_list.update_bounds(list_count, list_top, list_h);
 
             if self.email_buttons.len() != list_count {
-                // Widget ids are globally monotonic and never reused, so the fresh buttons
-                // register under NEW ids — the outgoing ones would linger in the registry
-                // pointing into this Vec's freed buffer, and the engine walks the whole
-                // registry and derefs it on every left press
-                // (`close_popovers_missed_by_press`). Drop them before the reallocation.
-                let stale: Vec<_> = self.email_buttons.iter().map(|b| b.id()).collect();
-                for id in stale {
-                    self.ui_context.unregister_widget(id);
+                // The context owns the rows: the outgoing ones are taken out of it
+                // (ids are never reused) and the fresh ones put in, registered from
+                // the moment they exist.
+                for h in std::mem::take(&mut self.email_buttons) {
+                    self.ui_context.remove(h);
                 }
+                let ctx = &mut self.ui_context;
                 self.email_buttons = (0..list_count)
-                    .map(|_| Owned::new(Button::new_list_row(0.0, 0.0, 0.0, 0.0)))
+                    .map(|_| ctx.insert(Button::new_list_row(0.0, 0.0, 0.0, 0.0)))
                     .collect();
-                // register_dispatch_roots() already ran this frame with the OLD
-                // buttons; the fresh ids must be registered now or every click on
-                // the list is dropped as a stale root (and nothing re-triggers a
-                // rebuild, so the list stays dead).
-                for btn in self.email_buttons.iter_mut() {
-                    self.ui_context.register_host(btn);
-                }
             }
 
             // Get selected email state to avoid borrowing self while mutating
@@ -5824,11 +5792,12 @@ impl Application for ClearEmailApp {
                 .collect();
 
             for (idx, &(_email_id, is_selected)) in filtered_email_ids.iter().enumerate() {
-                self.email_buttons[idx].selected = is_selected;
+                let btn = &mut self.ui_context[self.email_buttons[idx]];
+                btn.selected = is_selected;
                 if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
-                    self.email_buttons[idx].set_rect(list_x, draw_y, list_w, 54.0);
+                    btn.set_rect(list_x, draw_y, list_w, 54.0);
                 } else {
-                    self.email_buttons[idx].set_rect(-9999.0, -9999.0, 0.0, 0.0);
+                    btn.set_rect(-9999.0, -9999.0, 0.0, 0.0);
                 }
             }
 
@@ -5836,8 +5805,8 @@ impl Application for ClearEmailApp {
             if let Some(body) = selected_email_state {
                 let detail_w = self.detail_content_w();
                 let (body_y, body_h) = self.detail_body_geom();
-                self.detail_body.set_rect(detail_x, body_y, detail_w, body_h);
-                self.detail_body.text = body;
+                self.ui_context[self.detail_body].set_rect(detail_x, body_y, detail_w, body_h);
+                self.ui_context[self.detail_body].text = body;
             }
 
             // Compose inputs layout
@@ -5846,17 +5815,17 @@ impl Application for ClearEmailApp {
                 let l = compose_layout(modal_x, modal_y);
 
                 let field_h = cce_ui::layout::textbox_height();
-                self.compose_to.set_rect(l.field_x, l.rows_y[0], l.field_w, field_h);
-                self.compose_cc.set_rect(l.field_x, l.rows_y[1], l.field_w, field_h);
-                self.compose_bcc.set_rect(l.field_x, l.rows_y[2], l.field_w, field_h);
-                self.compose_subject.set_rect(l.field_x, l.rows_y[3], l.field_w, field_h);
+                self.ui_context[self.compose_to].set_rect(l.field_x, l.rows_y[0], l.field_w, field_h);
+                self.ui_context[self.compose_cc].set_rect(l.field_x, l.rows_y[1], l.field_w, field_h);
+                self.ui_context[self.compose_bcc].set_rect(l.field_x, l.rows_y[2], l.field_w, field_h);
+                self.ui_context[self.compose_subject].set_rect(l.field_x, l.rows_y[3], l.field_w, field_h);
                 let (bx, by, bw, bh) = l.body;
-                self.compose_body.set_rect(bx, by, bw, bh);
+                self.ui_context[self.compose_body].set_rect(bx, by, bw, bh);
 
                 let btn_h = cce_ui::layout::button_height();
-                self.btn_compose_attach.set_rect(l.attach_x, l.buttons_y, COMPOSE_ATTACH_W, btn_h);
-                self.btn_compose_send.set_rect(l.send_x, l.buttons_y, COMPOSE_BTN_W, btn_h);
-                self.btn_compose_cancel.set_rect(l.cancel_x, l.buttons_y, COMPOSE_BTN_W, btn_h);
+                self.ui_context[self.btn_compose_attach].set_rect(l.attach_x, l.buttons_y, COMPOSE_ATTACH_W, btn_h);
+                self.ui_context[self.btn_compose_send].set_rect(l.send_x, l.buttons_y, COMPOSE_BTN_W, btn_h);
+                self.ui_context[self.btn_compose_cancel].set_rect(l.cancel_x, l.buttons_y, COMPOSE_BTN_W, btn_h);
             }
 
 
@@ -5870,7 +5839,7 @@ impl Application for ClearEmailApp {
 
         // Now compute `filtered` only for rendering (immutable borrow of self)
         let filtered: Vec<&Email> = {
-            let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
+            let search_text = if self.ui_context[self.search_box].editing { &self.ui_context[self.search_box].edit_buffer } else { &self.ui_context[self.search_box].text };
             filtered_from(&self.emails, self.emails_rev, &self.current_folder, search_text, &self.filter_cache)
         };
 
@@ -5897,9 +5866,9 @@ impl Application for ClearEmailApp {
         // the only thing marking the band. It used to be a plateau one step
         // down, carved with a single bottom wall (`recess_edges`, the
         // inherited MenuBar paint) — that wall is gone.
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.mail_button, &mut *quads.pc);
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.folder_dropdown, &mut *quads.pc);
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.account_dropdown, &mut *quads.pc);
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.mail_button], &mut *quads.pc);
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.folder_dropdown], &mut *quads.pc);
+        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.account_dropdown], &mut *quads.pc);
 
         // 3. The detail column's two plates: the header above, the preview
         // below. Same fill and same radius as the list: the three are one
@@ -5923,8 +5892,8 @@ impl Application for ClearEmailApp {
 
         // Search band (only while open) and the list
         if self.search_open {
-            self.search_box.prepare_text(&mut self.font_system);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.search_box, &mut *quads.pc);
+            self.ui_context[self.search_box].prepare_text(&mut self.font_system);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.search_box], &mut *quads.pc);
         }
         {
             // The list's behind copy is NOT emitted here — it goes down with
@@ -5965,7 +5934,7 @@ impl Application for ClearEmailApp {
         );
         for idx in 0..filtered.len() {
             if self.email_list.get_item_draw_y(idx, 0.0).is_some() {
-                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.email_buttons[idx], &mut *quads.pc);
+                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.email_buttons[idx]], &mut *quads.pc);
 
                 // Unread: the `circle` glyph in blue, a 6px dot (the glyph's
                 // disc is three quarters of its box) centred where the
@@ -6039,7 +6008,7 @@ impl Application for ClearEmailApp {
                         // (placed by layout_html_buttons; parked ones paint
                         // off-screen).
                         #[cfg(feature = "wpe")]
-                        for btn in [&self.btn_html_view, &self.btn_html_images] {
+                        for btn in [&self.ui_context[self.btn_html_view], &self.ui_context[self.btn_html_images]] {
                             cce_ui::scene::painter::paint_root_into(&self.ui_context, btn, &mut *quads.pc);
                         }
 
@@ -6178,19 +6147,19 @@ impl Application for ClearEmailApp {
                 );
             }
 
-            self.compose_to.prepare_text(&mut self.font_system);
-            self.compose_cc.prepare_text(&mut self.font_system);
-            self.compose_bcc.prepare_text(&mut self.font_system);
-            self.compose_subject.prepare_text(&mut self.font_system);
-            self.compose_body.prepare_text(&mut self.font_system);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_to, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_cc, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_bcc, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_subject, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.compose_body, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose_send, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose_cancel, &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.btn_compose_attach, &mut *quads.pc);
+            self.ui_context[self.compose_to].prepare_text(&mut self.font_system);
+            self.ui_context[self.compose_cc].prepare_text(&mut self.font_system);
+            self.ui_context[self.compose_bcc].prepare_text(&mut self.font_system);
+            self.ui_context[self.compose_subject].prepare_text(&mut self.font_system);
+            self.ui_context[self.compose_body].prepare_text(&mut self.font_system);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_to], &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_cc], &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_bcc], &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_subject], &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_body], &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.btn_compose_send], &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.btn_compose_cancel], &mut *quads.pc);
+            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.btn_compose_attach], &mut *quads.pc);
         }
 
 
@@ -6326,8 +6295,8 @@ impl Application for ClearEmailApp {
             // Hover scope for the detail-pane body scroll (wheel + keys).
             self.detail_hovered = px > separator_x;
 
-            for btn in &mut self.email_buttons {
-                if btn.rect().0 > -9000.0 {
+            for &btn in &self.email_buttons {
+                if ctx[btn].rect().0 > -9000.0 {
                     if ctx.propagate_event(&mv, btn.id()) { changed = true; }
                 }
             }
@@ -6480,9 +6449,9 @@ impl Application for ClearEmailApp {
         // an open menu overlays the panes, so a handled press must not fall
         // through to what's beneath it).
         {
-            let was_open = self.account_dropdown.open;
+            let was_open = ctx[self.account_dropdown].open;
             if ctx.propagate_event(&ev, self.account_dropdown.id()) {
-                if !was_open && self.account_dropdown.open {
+                if !was_open && ctx[self.account_dropdown].open {
                     // Freshly opened: re-read the shared accounts.json so
                     // cce-system-interface edits appear without a restart (the
                     // job the retired Accounts page did on entry). Keep the
@@ -6501,8 +6470,8 @@ impl Application for ClearEmailApp {
                         .unwrap_or(0);
                     let changed_account =
                         self.accounts.get(new_idx).map(|a| a.email.as_str()) != prev_email.as_deref();
-                    self.account_dropdown.options = account_dropdown_options(&self.accounts);
-                    self.account_dropdown.selected = new_idx;
+                    ctx[self.account_dropdown].options = account_dropdown_options(&self.accounts);
+                    ctx[self.account_dropdown].selected = new_idx;
                     if changed_account {
                         // The account under the selection vanished — switch to
                         // what the trigger now shows.
@@ -6512,8 +6481,8 @@ impl Application for ClearEmailApp {
                     }
                 }
                 let mut msg_out = None;
-                if self.account_dropdown.take_change() {
-                    let idx = self.account_dropdown.selected;
+                if ctx[self.account_dropdown].take_change() {
+                    let idx = ctx[self.account_dropdown].selected;
                     if idx < self.accounts.len() {
                         if idx != self.selected_account_idx {
                             msg_out = Some(AppMessage::SelectAccount(idx));
@@ -6521,7 +6490,7 @@ impl Application for ClearEmailApp {
                     } else {
                         // The trailing "Manage Accounts…" pseudo-entry: not an
                         // account — restore the trigger to the active one.
-                        self.account_dropdown.selected = self.selected_account_idx;
+                        ctx[self.account_dropdown].selected = self.selected_account_idx;
                         msg_out = Some(AppMessage::ManageAccounts);
                     }
                 }
@@ -6535,7 +6504,7 @@ impl Application for ClearEmailApp {
         // rows fire on the NEXT press, through the context-menu gate at the
         // top of this function.
         if ctx.propagate_event(&ev, self.mail_button.id()) {
-            if state == ElementState::Released && self.mail_button.take_click() {
+            if state == ElementState::Released && ctx[self.mail_button].take_click() {
                 self.open_mail_menu();
             }
             *needs_rebuild = true;
@@ -6544,8 +6513,8 @@ impl Application for ClearEmailApp {
         }
         // Folder switcher.
         if ctx.propagate_event(&ev, self.folder_dropdown.id()) {
-            if self.folder_dropdown.take_change() {
-                if let Some(f) = self.folders.get(self.folder_dropdown.selected) {
+            if ctx[self.folder_dropdown].take_change() {
+                if let Some(f) = self.folders.get(ctx[self.folder_dropdown].selected) {
                     msg_out = Some(AppMessage::SwitchFolder(f.tag.clone()));
                 }
             }
@@ -6557,40 +6526,40 @@ impl Application for ClearEmailApp {
         if self.compose_open {
             if ctx.propagate_event(&ev, self.compose_to.id()) {
                 changed = true;
-                if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_to); }
+                if state == ElementState::Pressed { ctx.set_focused_id(self.compose_to.id()); }
             }
             if ctx.propagate_event(&ev, self.compose_cc.id()) {
                 changed = true;
-                if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_cc); }
+                if state == ElementState::Pressed { ctx.set_focused_id(self.compose_cc.id()); }
             }
             if ctx.propagate_event(&ev, self.compose_bcc.id()) {
                 changed = true;
-                if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_bcc); }
+                if state == ElementState::Pressed { ctx.set_focused_id(self.compose_bcc.id()); }
             }
             if ctx.propagate_event(&ev, self.compose_subject.id()) {
                 changed = true;
-                if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_subject); }
+                if state == ElementState::Pressed { ctx.set_focused_id(self.compose_subject.id()); }
             }
             if ctx.propagate_event(&ev, self.compose_body.id()) {
                 changed = true;
-                if state == ElementState::Pressed { ctx.set_focused(&mut self.compose_body); }
+                if state == ElementState::Pressed { ctx.set_focused_id(self.compose_body.id()); }
             }
 
             if ctx.propagate_event(&ev, self.btn_compose_send.id()) {
                 changed = true;
-                if state == ElementState::Released && self.btn_compose_send.take_click() {
+                if state == ElementState::Released && ctx[self.btn_compose_send].take_click() {
                     msg_out = Some(AppMessage::ComposeSend);
                 }
             }
             if ctx.propagate_event(&ev, self.btn_compose_cancel.id()) {
                 changed = true;
-                if state == ElementState::Released && self.btn_compose_cancel.take_click() {
+                if state == ElementState::Released && ctx[self.btn_compose_cancel].take_click() {
                     msg_out = Some(AppMessage::ComposeCancel);
                 }
             }
             if ctx.propagate_event(&ev, self.btn_compose_attach.id()) {
                 changed = true;
-                if state == ElementState::Released && self.btn_compose_attach.take_click() {
+                if state == ElementState::Released && ctx[self.btn_compose_attach].take_click() {
                     msg_out = Some(AppMessage::ComposeAttach);
                 }
             }
@@ -6616,11 +6585,11 @@ impl Application for ClearEmailApp {
 
                 if px < modal_x || px > modal_x + COMPOSE_W || py < modal_y || py > modal_y + compose_h() {
                     ctx.clear_focus();
-                    self.compose_to.unfocus();
-                    self.compose_cc.unfocus();
-                    self.compose_bcc.unfocus();
-                    self.compose_subject.unfocus();
-                    self.compose_body.unfocus();
+                    ctx[self.compose_to].unfocus();
+                    ctx[self.compose_cc].unfocus();
+                    ctx[self.compose_bcc].unfocus();
+                    ctx[self.compose_subject].unfocus();
+                    ctx[self.compose_body].unfocus();
                     changed = true;
                 }
             }
@@ -6628,17 +6597,17 @@ impl Application for ClearEmailApp {
             // Search input — only reachable while the band is open.
             if self.search_open && ctx.propagate_event(&ev, self.search_box.id()) {
                 changed = true;
-                if state == ElementState::Pressed { ctx.set_focused(&mut self.search_box); }
-                if self.search_box.take_change() {
+                if state == ElementState::Pressed { ctx.set_focused_id(self.search_box.id()); }
+                if ctx[self.search_box].take_change() {
                     msg_out = Some(AppMessage::SearchChanged);
                 }
             } else if state == ElementState::Pressed && button == MouseButton::Left {
                 ctx.clear_focus();
-                self.search_box.unfocus();
+                ctx[self.search_box].unfocus();
                 // Clicking away from an EMPTY search collapses the band —
                 // an unfocused box with no query is dead chrome. One holding
                 // a query stays: it is the visible reason the list is short.
-                if self.search_open && self.search_box.text.is_empty() && self.search_box.edit_buffer.is_empty() {
+                if self.search_open && ctx[self.search_box].text.is_empty() && ctx[self.search_box].edit_buffer.is_empty() {
                     self.search_open = false;
                 }
                 changed = true;
@@ -6670,17 +6639,17 @@ impl Application for ClearEmailApp {
                 // email a row click lands on. No wildcard: a new folder
                 // absorbed into "inbox" here routes clicks to the wrong list
                 // (Drafts was, briefly).
-                let search_text = if self.search_box.editing { &self.search_box.edit_buffer } else { &self.search_box.text };
+                let search_text = if ctx[self.search_box].editing { &ctx[self.search_box].edit_buffer } else { &ctx[self.search_box].text };
                 let filtered: Vec<&Email> =
                     filtered_from(&self.emails, self.emails_rev, &self.current_folder, search_text, &self.filter_cache);
 
                 for (idx, email) in filtered.iter().enumerate() {
                     if idx < self.email_buttons.len() {
-                        let btn = &mut self.email_buttons[idx];
-                        if btn.rect().0 > -9000.0 {
+                        let btn = self.email_buttons[idx];
+                        if ctx[btn].rect().0 > -9000.0 {
                             if ctx.propagate_event(&ev, btn.id()) {
                                 changed = true;
-                                if state == ElementState::Released && btn.take_click() {
+                                if state == ElementState::Released && ctx[btn].take_click() {
                                     msg_out = Some(AppMessage::SelectEmail(email.id));
                                 }
                             }
@@ -6695,13 +6664,13 @@ impl Application for ClearEmailApp {
             {
                 if ctx.propagate_event(&ev, self.btn_html_view.id()) {
                     changed = true;
-                    if state == ElementState::Released && self.btn_html_view.take_click() {
+                    if state == ElementState::Released && ctx[self.btn_html_view].take_click() {
                         self.show_text = !self.show_text;
                     }
                 }
                 if ctx.propagate_event(&ev, self.btn_html_images.id()) {
                     changed = true;
-                    if state == ElementState::Released && self.btn_html_images.take_click() {
+                    if state == ElementState::Released && ctx[self.btn_html_images].take_click() {
                         let lift = !self.webview.images_allowed();
                         self.webview.set_images_allowed(lift);
                     }
@@ -6835,17 +6804,17 @@ impl Application for ClearEmailApp {
         // dropdown). No key ever reached these before: every propagate below
         // is gated on compose/search state that an open dropdown never
         // satisfies (the cce-files bug).
-        if self.account_dropdown.open {
+        if self.ui_context[self.account_dropdown].open {
             if self.ui_context.propagate_event(&kev, self.account_dropdown.id()) {
-                if self.account_dropdown.take_change() {
-                    let idx = self.account_dropdown.selected;
+                if self.ui_context[self.account_dropdown].take_change() {
+                    let idx = self.ui_context[self.account_dropdown].selected;
                     if idx < self.accounts.len() {
                         if idx != self.selected_account_idx {
                             msg_out = Some(AppMessage::SelectAccount(idx));
                         }
                     } else {
                         // The trailing "Manage Accounts…" pseudo-entry.
-                        self.account_dropdown.selected = self.selected_account_idx;
+                        self.ui_context[self.account_dropdown].selected = self.selected_account_idx;
                         msg_out = Some(AppMessage::ManageAccounts);
                     }
                 }
@@ -6853,10 +6822,10 @@ impl Application for ClearEmailApp {
                 self.needs_rebuild = true;
                 return msg_out;
             }
-        } else if self.folder_dropdown.open {
+        } else if self.ui_context[self.folder_dropdown].open {
             if self.ui_context.propagate_event(&kev, self.folder_dropdown.id()) {
-                if self.folder_dropdown.take_change() {
-                    if let Some(f) = self.folders.get(self.folder_dropdown.selected) {
+                if self.ui_context[self.folder_dropdown].take_change() {
+                    if let Some(f) = self.folders.get(self.ui_context[self.folder_dropdown].selected) {
                         msg_out = Some(AppMessage::SwitchFolder(f.tag.clone()));
                     }
                 }
@@ -6874,7 +6843,7 @@ impl Application for ClearEmailApp {
         // is. move_selection takes &mut self, so it cannot run while ctx is
         // borrowed anyway.
         if !self.compose_open
-            && !self.search_box.editing
+            && !self.ui_context[self.search_box].editing
             && event.state == ElementState::Pressed
         {
             // Pane focus first: the chords carry Ctrl, so they cannot be
@@ -6943,15 +6912,15 @@ impl Application for ClearEmailApp {
         let ctx = &mut self.ui_context;
 
         if self.compose_open {
-            if self.compose_to.editing {
+            if ctx[self.compose_to].editing {
                 if ctx.propagate_event(&kev, self.compose_to.id()) { handled = true; }
-            } else if self.compose_cc.editing {
+            } else if ctx[self.compose_cc].editing {
                 if ctx.propagate_event(&kev, self.compose_cc.id()) { handled = true; }
-            } else if self.compose_bcc.editing {
+            } else if ctx[self.compose_bcc].editing {
                 if ctx.propagate_event(&kev, self.compose_bcc.id()) { handled = true; }
-            } else if self.compose_subject.editing {
+            } else if ctx[self.compose_subject].editing {
                 if ctx.propagate_event(&kev, self.compose_subject.id()) { handled = true; }
-            } else if self.compose_body.editing {
+            } else if ctx[self.compose_body].editing {
                 if ctx.propagate_event(&kev, self.compose_body.id()) { handled = true; }
             }
 
@@ -6973,9 +6942,9 @@ impl Application for ClearEmailApp {
                 && event.logical_key == Key::Named(cce_ui::widget::NamedKey::Escape)
             {
                 ctx.clear_focus();
-                self.search_box.unfocus();
-                self.search_box.text.clear();
-                self.search_box.edit_buffer.clear();
+                ctx[self.search_box].unfocus();
+                ctx[self.search_box].text.clear();
+                ctx[self.search_box].edit_buffer.clear();
                 self.search_open = false;
                 msg_out = Some(AppMessage::SearchChanged);
                 handled = true;
@@ -6986,15 +6955,15 @@ impl Application for ClearEmailApp {
                 if cce_ui::widget::match_key_shortcut(event, &self.keys.compose) {
                     msg_out = Some(AppMessage::ComposeNew);
                     handled = true;
-                } else if !self.search_box.editing
+                } else if !ctx[self.search_box].editing
                     && cce_ui::widget::match_key_shortcut(event, &self.keys.open_search)
                 {
                     // The !editing guard is load-bearing now the chord is a
                     // bare "/": without it, typing a slash into the open box
                     // would re-match here and never reach the text.
                     self.search_open = true;
-                    ctx.set_focused(&mut self.search_box);
-                    self.search_box.focus();
+                    ctx.set_focused_id(self.search_box.id());
+                    ctx[self.search_box].focus();
                     handled = true;
                 }
             }
@@ -7006,7 +6975,7 @@ impl Application for ClearEmailApp {
             if !handled
                 && (self.detail_hovered || self.focused_pane == Pane::Detail)
                 && html_on_show
-                && !self.search_box.editing
+                && !ctx[self.search_box].editing
                 && event.state == ElementState::Pressed
             {
                 use cce_ui::widget::NamedKey;
@@ -7032,7 +7001,7 @@ impl Application for ClearEmailApp {
             if !handled
                 && (self.detail_hovered || self.focused_pane == Pane::Detail)
                 && self.selected_email_id.is_some()
-                && !self.search_box.editing
+                && !ctx[self.search_box].editing
                 && event.state == ElementState::Pressed
             {
                 let max = (self.body_content_h - body_h).max(0.0);
@@ -7066,14 +7035,14 @@ impl Application for ClearEmailApp {
             // hover-or-focus (a row click focuses the region, a press elsewhere
             // unfocuses); the search box owns the keys while editing, and a
             // body-scroll above wins when the detail pane is hovered.
-            if !handled && !self.search_box.editing && self.email_list.keyboard(event) {
+            if !handled && !ctx[self.search_box].editing && self.email_list.keyboard(event) {
                 handled = true;
             }
 
-            if !handled && self.search_box.editing {
+            if !handled && ctx[self.search_box].editing {
                 if ctx.propagate_event(&kev, self.search_box.id()) {
                     handled = true;
-                    if self.search_box.take_change() {
+                    if ctx[self.search_box].take_change() {
                         msg_out = Some(AppMessage::SearchChanged);
                     }
                 }
