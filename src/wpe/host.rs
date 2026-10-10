@@ -147,11 +147,16 @@ impl MailWebView {
 
             let pending = Rc::new(RefCell::new(Pending::default()));
             let sink = pending.clone();
-            FRAME_SINK = Some(Box::new(move |buffer: *mut WPEBuffer| {
+            // The frame is copied out here and not kept, so the sink answers
+            // `false` and cce-wpe hands the buffer back (rendered and
+            // released) at once. The damage goes unused: mail uploads whole
+            // frames.
+            FRAME_SINK = Some(Box::new(move |_view: *mut WPEView, buffer: *mut WPEBuffer, _damage: &[(i32, i32, i32, i32)]| {
                 if let Some(f) = read_shm(buffer) {
                     // Replace, never accumulate: the newest frame wins.
                     sink.borrow_mut().frame = Some(f);
                 }
+                false
             }));
 
             let toplevel = wpe_display_create_toplevel(display, 1);
