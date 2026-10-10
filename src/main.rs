@@ -3059,7 +3059,7 @@ impl Application for ClearEmailApp {
                             height: side,
                         };
                         // Prims take linear colour; a glyph is tinted in sRGB.
-                        quads.pc.icon("circle", dot, cce_ui::colors::to_srgb(UNREAD_DOT));
+                        quads.pc.icon("circle", dot, cce_ui::color::to_srgb(UNREAD_DOT));
                     }
                 }
             }
@@ -3080,7 +3080,7 @@ impl Application for ClearEmailApp {
                 Pane::List => (self.email_list.x, self.email_list.y, self.email_list.w, self.email_list.h),
                 Pane::Detail => self.detail_pane_geom(),
             };
-            let mut color = cce_ui::colors::highlight_primary_color();
+            let mut color = cce_ui::color::highlight_primary_color();
             color[3] = 0.9;
             let r = cce_ui::layout::list_corner_radius();
             quads.pc.border(
