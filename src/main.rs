@@ -2976,9 +2976,9 @@ impl Application for ClearEmailApp {
         // the only thing marking the band. It used to be a plateau one step
         // down, carved with a single bottom wall (`recess_edges`, the
         // inherited MenuBar paint) — that wall is gone.
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.mail_button], &mut *quads.pc);
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.folder_dropdown], &mut *quads.pc);
-        cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.account_dropdown], &mut *quads.pc);
+        cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.mail_button], &mut *quads.pc);
+        cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.folder_dropdown], &mut *quads.pc);
+        cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.account_dropdown], &mut *quads.pc);
 
         // 3. The detail column's two plates: the header above, the preview
         // below. Same fill and same radius as the list: the three are one
@@ -3003,7 +3003,7 @@ impl Application for ClearEmailApp {
         // Search band (only while open) and the list
         if self.search_open {
             self.ui_context[self.search_box].prepare_text(&mut self.font_system);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.search_box], &mut *quads.pc);
+            cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.search_box], &mut *quads.pc);
         }
         {
             // The list's behind copy is NOT emitted here — it goes down with
@@ -3044,7 +3044,7 @@ impl Application for ClearEmailApp {
         );
         for idx in 0..filtered.len() {
             if self.email_list.get_item_draw_y(idx, 0.0).is_some() {
-                cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.email_buttons[idx]], &mut *quads.pc);
+                cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.email_buttons[idx]], &mut *quads.pc);
 
                 // Unread: the `circle` glyph in blue, a 6px dot (the glyph's
                 // disc is three quarters of its box) centred where the
@@ -3119,7 +3119,7 @@ impl Application for ClearEmailApp {
                         // off-screen).
                         #[cfg(feature = "wpe")]
                         for btn in [&self.ui_context[self.btn_html_view], &self.ui_context[self.btn_html_images]] {
-                            cce_ui::scene::painter::paint_root_into(&self.ui_context, btn, &mut *quads.pc);
+                            cce_ui::widget::painter::paint_root_into(&self.ui_context, btn, &mut *quads.pc);
                         }
 
                         let body_w = self.detail_content_w();
@@ -3262,14 +3262,14 @@ impl Application for ClearEmailApp {
             self.ui_context[self.compose_bcc].prepare_text(&mut self.font_system);
             self.ui_context[self.compose_subject].prepare_text(&mut self.font_system);
             self.ui_context[self.compose_body].prepare_text(&mut self.font_system);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_to], &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_cc], &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_bcc], &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_subject], &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_body], &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.btn_compose_send], &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.btn_compose_cancel], &mut *quads.pc);
-            cce_ui::scene::painter::paint_root_into(&self.ui_context, &self.ui_context[self.btn_compose_attach], &mut *quads.pc);
+            cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_to], &mut *quads.pc);
+            cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_cc], &mut *quads.pc);
+            cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_bcc], &mut *quads.pc);
+            cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_subject], &mut *quads.pc);
+            cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.compose_body], &mut *quads.pc);
+            cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.btn_compose_send], &mut *quads.pc);
+            cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.btn_compose_cancel], &mut *quads.pc);
+            cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.btn_compose_attach], &mut *quads.pc);
         }
 
 
