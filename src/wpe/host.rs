@@ -711,29 +711,6 @@ unsafe extern "C" fn drop_links_ref(data: gpointer, _c: *mut GClosure) {
     drop(Rc::from_raw(data as *const RefCell<Vec<String>>));
 }
 
-/// Minimal %XX decoding for the `cid:` URI path — Content-IDs are almost
-/// always plain, but `@` does arrive as `%40` from some composers.
-fn percent_decode_bytes(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if let (Some(h), Some(l)) = (
-                bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
-                bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
-            ) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// Serves the page's `cid:` image requests from the inline store. Runs on
 /// the main thread (the cce-browser `cce:` handler's contract). A cid the
 /// message structure did not carry answers with an error — a broken-image
@@ -741,7 +718,7 @@ fn percent_decode_bytes(s: &str) -> String {
 unsafe extern "C" fn on_cid_request(request: *mut WebKitURISchemeRequest, data: gpointer) {
     let store = &*(data as *const RefCell<HashMap<String, (String, Vec<u8>)>>);
     let uri = from_cstr(webkit_uri_scheme_request_get_uri(request)).unwrap_or_default();
-    let cid = percent_decode_bytes(uri.strip_prefix("cid:").unwrap_or(""));
+    let cid = cce_ui::fmt::percent_decode(uri.strip_prefix("cid:").unwrap_or(""));
     match store.borrow().get(&cid) {
         Some((mime, bytes)) => {
             // g_bytes_new copies; the stream owns that copy outright.

@@ -3,6 +3,7 @@
 mod ipc;
 mod wpe;
 mod accounts_file;
+use cce_ui::fmt::percent_decode;
 use cce_ui::process::spawn_detached;
 use cce_ui::widget::Handle;
 use cce_ui::widget::ScrollRegion;
@@ -1525,31 +1526,6 @@ struct MailtoPrefill {
     bcc: String,
     subject: String,
     body: String,
-}
-
-/// RFC 6068 percent-decoding. Unlike form encoding, `+` is a literal plus in
-/// a mailto URL — spaces arrive as `%20` — so only `%XX` sequences decode.
-/// Decoding happens on bytes and re-validates as UTF-8, since an encoded
-/// subject/body may hold multi-byte sequences split across several `%XX`.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            // get() covers a trailing "%" or "%X"; a non-hex pair falls
-            // through and the '%' stays literal, matching lenient browsers.
-            let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok());
-            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Parse a `mailto:` URL (RFC 6068) into compose-dialog prefills.
