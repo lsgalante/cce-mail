@@ -3,6 +3,7 @@
 mod ipc;
 mod wpe;
 mod accounts_file;
+use cce_ui::process::spawn_detached;
 use cce_ui::widget::Handle;
 use cce_ui::widget::ScrollRegion;
 use cce_ui::cosmic_text::FontSystem;
@@ -424,18 +425,6 @@ struct ClearEmailApp {
     font_system: FontSystem,
     needs_rebuild: bool,
     ui_context: UiContext,
-}
-
-/// Spawn `cmd` and reap it from a background thread, so a viewer or the
-/// settings app launched from here never lingers as a zombie. This was
-/// `cce_ui::process::spawn_detached` until the toolkit dropped that module
-/// (cce-ui 4e94236) as caller-less — it had three callers here.
-fn spawn_detached(mut cmd: std::process::Command) -> std::io::Result<()> {
-    let mut child = cmd.spawn()?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
 }
 
 fn get_accounts_path() -> std::path::PathBuf {
