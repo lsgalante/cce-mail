@@ -1671,10 +1671,18 @@ impl imap::Authenticator for ImapOAuth2 {
     }
 }
 
+/// The runtime `main()` builds, for worker threads to block on.
+static RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
 /// Block on a future from a plain worker thread. `pollster::block_on` is NOT
 /// enough for reqwest/hyper futures — they need a live tokio reactor, and the
-/// `rt.enter()` guard in main() only covers the main thread.
+/// `rt.enter()` guard in main() only covers the main thread. The workers
+/// share main's runtime through its handle; one was built and torn down per
+/// call before. Only a run without that runtime (a test) builds its own.
 fn block_on_worker<F: std::future::Future>(fut: F) -> Result<F::Output, String> {
+    if let Some(handle) = RUNTIME.get() {
+        return Ok(handle.block_on(fut));
+    }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -7033,6 +7041,7 @@ fn main() {
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let _guard = rt.enter();
+    let _ = RUNTIME.set(rt.handle().clone());
 
     cce_ui::engine::run::<ClearEmailApp>();
     ipc::cleanup();
