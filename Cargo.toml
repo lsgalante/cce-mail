@@ -33,7 +33,7 @@ imap-proto = "0.10"
 rustix = { version = "0.38", features = ["event"], optional = true }
 # The WPE embedding shared with cce-browser (bindings, subclasses, GLib
 # source, input); only with the `wpe` feature.
-cce-wpe = { git = "https://github.com/lsgalante/cce-wpe.git", rev = "ec323a125f9d2c8f70c868f80d8ef7cdfb588f9d", optional = true }
+cce-wpe = { git = "https://github.com/lsgalante/cce-wpe.git", rev = "d2f700166ae0bbb5431f3e7660bd614a35672ede", optional = true }
 
 # Headless smoke test for the embedded webview (no Wayland session needed).
 [[example]]
