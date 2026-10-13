@@ -124,11 +124,6 @@ enum AppMessage {
     Reply,
     DeleteSelected,
     ToggleUnread,
-    /// A row of a card menu's Move To page: file email `0` in folder tag `1`.
-    MoveTo(usize, String),
-    /// A server move has answered: the uid the message was given in its new
-    /// folder (`None` when the server did not say), or why it failed.
-    MoveFinished(MoveJob, Result<Option<u32>, String>),
     SelectAccount(usize),
     /// Open cce-system-interface on its Accounts page — account add/remove/
     /// default/OAuth all live there now; this app only reads accounts.json.
