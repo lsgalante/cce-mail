@@ -1169,7 +1169,8 @@ pub(crate) fn merge_sync(prior: Vec<Email>, folders: &[FolderSync]) -> Vec<Email
 /// - Moved with no uid reported, the stand-in goes, and the folder's next
 ///   sync brings the message in under its own.
 /// - Failed, the row goes back where it was, with its old uid — or goes,
-///   if a sync has meanwhile downloaded it there again.
+///   if a sync has meanwhile downloaded it there again. A failed restore
+///   goes back to Trash, where it came from still noted.
 pub(crate) fn settle_move(
     emails: &mut Vec<Email>,
     job: &MoveJob,
@@ -1190,6 +1191,9 @@ pub(crate) fn settle_move(
         Err(_) if !held(&job.from, job.uid) => {
             emails[pos].folder = job.from.clone();
             emails[pos].uid = Some(job.uid);
+            if job.restore {
+                emails[pos].origin_folder = Some(job.to.clone());
+            }
         }
         _ => {
             emails.remove(pos);
@@ -1333,7 +1337,7 @@ pub(crate) fn sync_imap(
 
 /// Delete an INBOX message on the server, by UID. Best-effort trash-copy
 /// first: on Gmail a copy to [Gmail]/Trash removes the message everywhere,
-/// on generic servers a "Trash" copy keeps the conventional safety net; the
+/// elsewhere a copy in the server's Trash (`trash_mailboxes`) keeps the safety net; the
 /// STORE+expunge below is what actually removes it from INBOX either way.
 /// UIDPLUS uid_expunge targets just our message; plain EXPUNGE fallback also
 /// flushes any other \Deleted-flagged mail, which matches client convention.
@@ -1377,8 +1381,9 @@ pub(crate) fn delete_on_server(
         }
         let uid_set = uid.to_string();
         if !permanent {
-            for trash in ["[Gmail]/Trash", "Trash"] {
-                if session.uid_copy(&uid_set, trash).is_ok() {
+            for trash in trash_mailboxes(&mut session) {
+                let Some(quoted) = quote_mailbox(&trash) else { continue };
+                if session.uid_copy(&uid_set, &quoted).is_ok() {
                     break;
                 }
             }
@@ -1415,6 +1420,10 @@ pub(crate) struct MoveJob {
     pub(crate) uid: u32,
     /// Only file a copy in `to` ([`move_keeps_source`]): the row never left.
     pub(crate) copy_only: bool,
+    /// A restore out of Trash ([`restore_on_server`]): `from` is the local
+    /// Trash and `uid` the dead one the message had in `to` before it was
+    /// deleted, so a failed one goes back to Trash still remembering `to`.
+    pub(crate) restore: bool,
 }
 
 /// Whether a move out of folder `tag` (mailbox `mailbox`) must leave the
@@ -1503,9 +1512,22 @@ fn move_in_session(
     let to_quoted = quote_mailbox(to).ok_or_else(|| format!("Bad mailbox name {to:?}"))?;
     // The uid only means anything inside its own mailbox.
     session.select(from).map_err(|e| format!("Failed to select {from}: {e}"))?;
-    let uid = job.uid.to_string();
-    if job.copy_only {
-        session.uid_copy(&uid, &to_quoted).map_err(|e| format!("Copy failed: {e}"))?;
+    move_selected(session, job.uid, from, &to_quoted, job.copy_only)
+}
+
+/// Move message `uid` of the selected mailbox `from` to `to_quoted` (an
+/// IMAP quoted string) — or only copy it there — and report its uid there
+/// when the server says.
+fn move_selected(
+    session: &mut ImapSession,
+    uid: u32,
+    from: &str,
+    to_quoted: &str,
+    copy_only: bool,
+) -> Result<Option<u32>, String> {
+    let uid = uid.to_string();
+    if copy_only {
+        session.uid_copy(&uid, to_quoted).map_err(|e| format!("Copy failed: {e}"))?;
         return Ok(None);
     }
     if session.capabilities().is_ok_and(|c| c.has_str("MOVE")) {
@@ -1514,7 +1536,7 @@ fn move_in_session(
             .map_err(|e| format!("Move failed: {e}"))?;
         return Ok(copyuid_dest(&response));
     }
-    session.uid_copy(&uid, &to_quoted).map_err(|e| format!("Copy failed: {e}"))?;
+    session.uid_copy(&uid, to_quoted).map_err(|e| format!("Copy failed: {e}"))?;
     // Copied but still here: an error, so the row goes back where the
     // message still is. The copy the destination now holds comes in with
     // its next sync.
@@ -1525,6 +1547,135 @@ fn move_in_session(
         let _ = session.expunge();
     }
     Ok(None)
+}
+
+/// The mailboxes that may be the account's own Trash, likeliest first: the
+/// one LIST flags `\Trash` (RFC 6154), then the names guessed before that
+/// was asked. Discovery leaves it out of the switcher on purpose — Trash
+/// here is local — so it is asked for where it is needed. The name differs
+/// by provider (`[Gmail]/Trash`, `[Gmail]/Bin`, iCloud's `Deleted
+/// Messages`): with the guesses alone, an iCloud delete copied to a `Trash`
+/// that does not exist and then expunged the message outright.
+fn trash_mailboxes(session: &mut ImapSession) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(names) = session.list(Some(""), Some("*")) {
+        for n in names.iter() {
+            let flagged = n.attributes().iter().any(|a| {
+                matches!(a, imap::types::NameAttribute::Custom(c) if c.eq_ignore_ascii_case("\\Trash"))
+            });
+            if flagged {
+                out.push(n.name().to_string());
+            }
+        }
+    }
+    for guess in ["[Gmail]/Trash", "Trash"] {
+        if !out.iter().any(|m| m == guess) {
+            out.push(guess.to_string());
+        }
+    }
+    out
+}
+
+/// A message deleted from INBOX, as the server's Trash should hold it.
+/// Its uid there was never learned (the delete's COPYUID rides the tagged
+/// OK, which the imap crate drops), so [`restore_on_server`] finds it by
+/// what the sync parsed out of its header: the Date to the second, the
+/// subject and the sender, each made by the same code from the same bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct TrashedMail {
+    pub(crate) ts: i64,
+    pub(crate) subject: String,
+    pub(crate) from: String,
+}
+
+/// An IMAP `date` (RFC 3501 §9: `13-Oct-2026`) for the UTC day `ts` falls on.
+pub(crate) fn imap_date(ts: i64) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let d = mail_parser::DateTime::from_timestamp(ts);
+    format!("{}-{}-{}", d.day, MONTHS[(d.month.clamp(1, 12) - 1) as usize], d.year)
+}
+
+/// Whether a header the server holds is `mail`'s.
+pub(crate) fn is_trashed_mail(msg: &mail_parser::Message, mail: &TrashedMail) -> bool {
+    msg.date().map(|d| d.to_timestamp()) == Some(mail.ts)
+        && msg.subject().unwrap_or("(No Subject)") == mail.subject
+        && format_from(msg) == mail.from
+}
+
+/// The uid of `mail` in the selected mailbox, if it is there; the newest,
+/// should it be there twice.
+fn find_trashed(session: &mut ImapSession, mail: &TrashedMail) -> Result<Option<u32>, String> {
+    // SENTSINCE / SENTBEFORE read the Date header's own calendar day, in its
+    // own zone, which can be a day either side of the UTC one.
+    const DAY: i64 = 86_400;
+    let query = format!("SENTSINCE {} SENTBEFORE {}", imap_date(mail.ts - DAY), imap_date(mail.ts + 2 * DAY));
+    let uids = session.uid_search(&query).map_err(|e| format!("Search failed: {e}"))?;
+    if uids.is_empty() {
+        return Ok(None);
+    }
+    let set = uids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+    let fetches = session.uid_fetch(&set, "(UID RFC822.HEADER)").map_err(|e| format!("Fetch failed: {e}"))?;
+    let parser = mail_parser::MessageParser::default();
+    Ok(fetches
+        .iter()
+        .filter_map(|f| {
+            let msg = parser.parse(f.header()?)?;
+            is_trashed_mail(&msg, mail).then_some(f.uid?)
+        })
+        .max())
+}
+
+/// Find `mail` in the server's Trash and move it back to `to_mailbox`,
+/// reporting as a move does ([`AppMessage::MoveFinished`]): the uid it was
+/// given there, or why not — the commonest why being a Trash emptied since
+/// (Gmail empties its own after 30 days).
+pub(crate) fn restore_on_server(
+    mut account: AccountInfo,
+    job: MoveJob,
+    mail: TrashedMail,
+    to_mailbox: String,
+    sender: calloop::channel::Sender<AppMessage>,
+) {
+    std::thread::spawn(move || {
+        let report = |r: Result<Option<u32>, String>| {
+            if let Err(e) = &r {
+                eprintln!("cce-mail: restore to {}: {}", to_mailbox, e);
+            }
+            let _ = sender.send(AppMessage::MoveFinished(job.clone(), r));
+        };
+        if is_mock_account(&account) {
+            // No server: the uid is the mock's own and stays good.
+            report(Ok(Some(job.uid)));
+            return;
+        }
+        // Same guard as start_sync: dialing out with an empty password gets
+        // the server's baffling "Empty username or password" instead of the
+        // actual problem — the keyring never yielded the credential.
+        if !account.is_oauth && account.password.is_empty() {
+            report(Err("No password — is the keyring unlocked?".to_string()));
+            return;
+        }
+        let Some(mut session) = open_imap_session(&mut account, &sender, false) else {
+            report(Err("IMAP connection failed".to_string()));
+            return;
+        };
+        let result = restore_in_session(&mut session, &mail, &to_mailbox);
+        session.release();
+        report(result);
+    });
+}
+
+fn restore_in_session(session: &mut ImapSession, mail: &TrashedMail, to: &str) -> Result<Option<u32>, String> {
+    let to_quoted = quote_mailbox(to).ok_or_else(|| format!("Bad mailbox name {to:?}"))?;
+    for trash in trash_mailboxes(session) {
+        if session.select(&trash).is_err() {
+            continue;
+        }
+        if let Some(uid) = find_trashed(session, mail)? {
+            return move_selected(session, uid, &trash, &to_quoted, false);
+        }
+    }
+    Err("Not found in the server's Trash — emptied since?".to_string())
 }
 
 /// Write attachment bytes into ~/Downloads under a collision-safe name.

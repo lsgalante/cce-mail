@@ -129,6 +129,8 @@ enum AppMessage {
     /// A server move has answered: the uid the message was given in its new
     /// folder (`None` when the server did not say), or why it failed.
     MoveFinished(MoveJob, Result<Option<u32>, String>),
+    /// Put email `0`, in Trash, back in the folder it was deleted from.
+    Restore(usize),
     SelectAccount(usize),
     /// Open cce-system-interface on its Accounts page — account add/remove/
     /// default/OAuth all live there now; this app only reads accounts.json.
@@ -1111,8 +1113,89 @@ impl ClearEmailApp {
                 self.land_after_removal(row);
             }
         }
-        let job = MoveJob { account: account.email.clone(), id, from, to: to.to_string(), uid, copy_only };
+        let job = MoveJob { account: account.email.clone(), id, from, to: to.to_string(), uid, copy_only, restore: false };
         move_on_server(account, job, from_mailbox, to_mailbox, self.sender.clone());
+        self.status_message = Some(StatusToast::info(note.clone(), 4.0));
+        Ok(note)
+    }
+
+    /// Where Restore would put `e`, a row in Trash, as (tag, label, whether
+    /// the server has to move it back): the folder it was deleted from — or
+    /// why that is not known or not there. Only an INBOX delete reached the
+    /// server — it went to the server's own Trash — so only that one needs
+    /// the server, and the message's Date to find it there by
+    /// (`TrashedMail`). Every other delete was this app's alone and is
+    /// undone here.
+    fn restore_plan(&self, e: &Email) -> Result<(String, String, bool), String> {
+        if e.folder != TAG_TRASH {
+            return Err("it is not in Trash".to_string());
+        }
+        let Some(tag) = e.origin_folder.as_ref() else {
+            return Err("it was deleted before deletes noted where from".to_string());
+        };
+        let Some(origin) = self.folders.iter().find(|f| &f.tag == tag) else {
+            return Err(format!("the folder it came from, {tag:?}, is gone"));
+        };
+        let server = origin.tag == TAG_INBOX && e.uid.is_some();
+        if server && e.ts.is_none() {
+            return Err("it has no Date to find it by in the server's Trash".to_string());
+        }
+        Ok((origin.tag.clone(), origin.label.clone(), server))
+    }
+
+    /// Put message `id`, in Trash, back where it was deleted from, at once
+    /// in the list; `Ok` carries what the status line says. A message the
+    /// delete moved to the server's Trash goes back by the same road a move
+    /// takes — the row without a uid until the server says which one it got
+    /// back in INBOX (`MoveFinished`, `settle_move`).
+    fn restore_email(&mut self, id: usize) -> Result<String, String> {
+        let Some(email) = self.emails.iter().find(|e| e.id == id) else {
+            return Err(format!("no message with id {id}"));
+        };
+        let (to, label, server) = self.restore_plan(email)?;
+        let (uid, mail) = (
+            email.uid,
+            TrashedMail { ts: email.ts.unwrap_or_default(), subject: email.subject.clone(), from: email.from.clone() },
+        );
+        // Resolved before the row is touched: a row sent off without a uid
+        // and no server answer to come would sit in INBOX for good.
+        let server_job = match uid.filter(|_| server) {
+            None => None,
+            Some(uid) => {
+                let (Some(account), Some(to_mailbox)) =
+                    (self.accounts.get(self.selected_account_idx).cloned(), self.mailbox_for(&to))
+                else {
+                    return Err(format!("{label} is not on a server"));
+                };
+                let job = MoveJob {
+                    account: account.email.clone(),
+                    id,
+                    from: TAG_TRASH.to_string(),
+                    to: to.clone(),
+                    uid,
+                    copy_only: false,
+                    restore: true,
+                };
+                Some((account, job, to_mailbox))
+            }
+        };
+        let row = self.filtered_emails().iter().position(|e| e.id == id);
+        self.emails_rev = self.emails_rev.wrapping_add(1);
+        if let Some(e) = self.emails.iter_mut().find(|e| e.id == id) {
+            e.folder = to.clone();
+            e.origin_folder = None;
+            if server {
+                e.uid = None;
+            }
+        }
+        self.save_emails();
+        if self.selected_email_id == Some(id) {
+            self.land_after_removal(row);
+        }
+        if let Some((account, job, to_mailbox)) = server_job {
+            restore_on_server(account, job, mail, to_mailbox, self.sender.clone());
+        }
+        let note = format!("Restored to {label}");
         self.status_message = Some(StatusToast::info(note.clone(), 4.0));
         Ok(note)
     }
@@ -1168,11 +1251,11 @@ impl ClearEmailApp {
     /// (`CARD_MENU_SCALE`).
     fn show_card_menu(&mut self, id: usize, target: cce_ui::widget::WidgetId, at: (f32, f32), turned_back: bool) -> bool {
         use cce_ui::widget::context_menu;
-        let Some((read, folder, uid)) =
-            self.emails.iter().find(|e| e.id == id).map(|e| (e.read, e.folder.clone(), e.uid))
-        else {
+        let Some(email) = self.emails.iter().find(|e| e.id == id) else {
             return false;
         };
+        let (read, folder, uid) = (email.read, email.folder.clone(), email.uid);
+        let restore_to = self.restore_plan(email).ok().map(|(_, label, _)| label);
 
         // No header row: the card the menu opened on is selected under it,
         // so a subject repeated as the menu's first row said nothing new.
@@ -1191,22 +1274,25 @@ impl ClearEmailApp {
         let movable = uid.is_some()
             && self.mailbox_for(&folder).is_some()
             && !self.move_destinations(&folder).is_empty();
-        let (labels, actions): (Vec<&str>, Vec<Option<AppMessage>>) = if folder == "drafts" {
-            (
-                vec!["Edit", delete_label],
-                vec![Some(AppMessage::SelectEmail(id)), Some(AppMessage::DeleteSelected)],
-            )
+        let mut rows: Vec<(String, Option<AppMessage>)> = Vec::new();
+        if folder == "drafts" {
+            rows.push(("Edit".into(), Some(AppMessage::SelectEmail(id))));
+            rows.push((delete_label.into(), Some(AppMessage::DeleteSelected)));
         } else {
-            let mut rows = vec![("Reply", Some(AppMessage::Reply))];
-            if movable {
-                rows.push(("Move To", None));
+            // In Trash, putting it back is the likeliest reason for the menu,
+            // so it leads, and names where it goes.
+            if let Some(label) = restore_to {
+                rows.push((format!("Restore to {label}"), Some(AppMessage::Restore(id))));
             }
-            rows.push((delete_label, Some(AppMessage::DeleteSelected)));
-            rows.push((if read { "Mark Unread" } else { "Mark Read" }, Some(AppMessage::ToggleUnread)));
-            rows.into_iter().unzip()
-        };
-        let move_row = labels.iter().position(|&l| l == "Move To");
-        let options = labels.into_iter().map(str::to_string).collect();
+            rows.push(("Reply".into(), Some(AppMessage::Reply)));
+            if movable {
+                rows.push(("Move To".into(), None));
+            }
+            rows.push((delete_label.into(), Some(AppMessage::DeleteSelected)));
+            rows.push(((if read { "Mark Unread" } else { "Mark Read" }).into(), Some(AppMessage::ToggleUnread)));
+        }
+        let move_row = rows.iter().position(|(l, _)| l == "Move To");
+        let (options, actions): (Vec<String>, Vec<Option<AppMessage>>) = rows.into_iter().unzip();
         self.context_menu_actions = actions;
 
         if turned_back {
@@ -2087,6 +2173,14 @@ impl ClearEmailApp {
                 self.needs_rebuild = true;
                 ipc::ok(&format!("{id} marked {}", if read { "read" } else { "unread" }), json)
             }
+            Command::Restore(id) => match self.restore_email(id) {
+                Ok(note) => {
+                    *needs_rebuild = true;
+                    self.needs_rebuild = true;
+                    ipc::ok(&note, json)
+                }
+                Err(e) => ipc::error(&format!("cannot restore {id}: {e}")),
+            },
             Command::Move(id, name) => {
                 let Some(tag) = self.folder_by_name(&name).map(|f| f.tag.clone()) else {
                     return ipc::error(&format!("no folder {name:?} (see `folders`)"));
@@ -2723,9 +2817,9 @@ impl Application for ClearEmailApp {
                             // message is still there — and without this the
                             // next sync would see the uid missing from that
                             // folder, call it new, and download it back.
-                            if email.uid.is_some() {
-                                email.origin_folder = Some(email.folder.clone());
-                            }
+                            // Mail with no uid (a draft, a local sent copy)
+                            // records it too: it is where Restore puts it.
+                            email.origin_folder = Some(email.folder.clone());
                             email.folder = "trash".to_string();
                         }
                     }
@@ -2765,6 +2859,13 @@ impl Application for ClearEmailApp {
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
             }
+            AppMessage::Restore(id) => {
+                if let Err(e) = self.restore_email(id) {
+                    self.status_message = Some(StatusToast::error(format!("Cannot restore: {e}")));
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
             AppMessage::MoveFinished(job, result) => {
                 let active = self
                     .accounts
@@ -2797,7 +2898,10 @@ impl Application for ClearEmailApp {
                         self.synced_tags.remove(&job.to);
                     }
                     Ok(_) => {}
-                    Err(e) => self.status_message = Some(StatusToast::error(format!("Move failed: {e}"))),
+                    Err(e) => {
+                        let what = if job.restore { "Restore" } else { "Move" };
+                        self.status_message = Some(StatusToast::error(format!("{what} failed: {e}")));
+                    }
                 }
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
@@ -5255,6 +5359,7 @@ mod tests {
             to: "Receipts".to_string(),
             uid,
             copy_only: false,
+            restore: false,
         }
     }
 
@@ -5317,6 +5422,44 @@ mod tests {
         let mut emails = vec![msg(1, None, "Receipts", "moved", true), msg(2, Some(40), "inbox", "moved", true)];
         assert!(settle_move(&mut emails, &move_job(1, 40), &Err("NO".into())));
         assert_eq!(emails.iter().map(|e| e.id).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn a_failed_restore_goes_back_to_trash_remembering_inbox() {
+        let job = MoveJob { from: "trash".into(), to: "inbox".into(), restore: true, ..move_job(1, 40) };
+        let mut emails = vec![msg(1, None, "inbox", "restored", true)];
+        assert!(settle_move(&mut emails, &job, &Err("not in Trash".into())));
+        let e = &emails[0];
+        assert_eq!((e.folder.as_str(), e.uid, e.origin_folder.as_deref()), ("trash", Some(40), Some("inbox")));
+        // And a restore that lands takes its new INBOX uid like any move.
+        let mut emails = vec![msg(1, None, "inbox", "restored", true)];
+        assert!(settle_move(&mut emails, &job, &Ok(Some(7001))));
+        assert_eq!((emails[0].uid, emails[0].origin_folder.as_deref()), (Some(7001), None));
+    }
+
+    #[test]
+    fn imap_dates_are_utc_days() {
+        assert_eq!(imap_date(0), "1-Jan-1970");
+        // 2025-10-13 23:59:59 UTC, and a second later.
+        assert_eq!(imap_date(1_760_399_999), "13-Oct-2025");
+        assert_eq!(imap_date(1_760_400_000), "14-Oct-2025");
+    }
+
+    #[test]
+    fn trashed_mail_is_known_by_its_header() {
+        let header = b"From: Ann Example <ann@example.org>\r\nTo: me@example.org\r\n\
+Subject: Lunch on Friday?\r\nDate: Mon, 13 Oct 2025 09:30:00 -0700\r\n\r\n";
+        let msg = mail_parser::MessageParser::default().parse(&header[..]).unwrap();
+        // What the sync would have stored for it.
+        let mail = TrashedMail {
+            ts: msg.date().unwrap().to_timestamp(),
+            subject: msg.subject().unwrap().to_string(),
+            from: format_from(&msg),
+        };
+        assert_eq!(mail.ts, 1_760_373_000);
+        assert!(is_trashed_mail(&msg, &mail));
+        assert!(!is_trashed_mail(&msg, &TrashedMail { ts: mail.ts + 1, ..mail.clone() }));
+        assert!(!is_trashed_mail(&msg, &TrashedMail { subject: "Lunch?".into(), ..mail.clone() }));
     }
 
     #[test]

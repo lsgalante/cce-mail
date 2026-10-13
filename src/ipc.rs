@@ -52,6 +52,7 @@ cce-mail ctl <command> [--json]
   mark-read <id>                set the read flag; mirrored to the server for inbox mail
   mark-unread <id>
   move <id> <folder>            file a message in another server folder, by tag or label
+  restore <id>                  put a message in Trash back where it was deleted from
   select-account <email>
   switch-folder <folder>        by tag (inbox, sent, drafts, trash, …) or label
   sync                          start a sync now
@@ -183,6 +184,7 @@ pub enum Command {
     Open(usize),
     MarkRead(usize, bool),
     Move(usize, String),
+    Restore(usize),
     SelectAccount(String),
     SwitchFolder(String),
     Sync,
@@ -256,6 +258,7 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
         "open" => Command::Open(one_id(rest)?),
         "mark-read" => Command::MarkRead(one_id(rest)?, true),
         "mark-unread" => Command::MarkRead(one_id(rest)?, false),
+        "restore" => Command::Restore(one_id(rest)?),
         "move" => match rest {
             [id, folder @ ..] if !folder.is_empty() => Command::Move(
                 id.parse().map_err(|_| format!("bad message id {id:?}"))?,
@@ -541,6 +544,7 @@ mod tests {
         assert_eq!(parse("move 7 All Mail").unwrap().command, Command::Move(7, "All Mail".into()));
         assert!(parse("move 7").is_err());
         assert!(parse("move x inbox").is_err());
+        assert_eq!(parse("restore 9").unwrap().command, Command::Restore(9));
         assert_eq!(
             parse("select-account a@b.c").unwrap().command,
             Command::SelectAccount("a@b.c".into())
