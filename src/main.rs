@@ -21,7 +21,7 @@ use cce_ui::cosmic_text::FontSystem;
 use cce_ui::engine::{Application, CursorIcon, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, WidgetHost,
-    TextBox, Button, TextLabel, Key, Dropdown, Bounds, ScrollMotion, LINE_PX
+    TextBox, Button, TextLabel, Key, Dropdown, Bounds, ScrollMotion, LINE_PX, WidgetEvent
 };
 use cce_ui::context::UiContext;
 use native_tls::TlsConnector;
@@ -383,6 +383,11 @@ struct ClearEmailApp {
     /// Message per row of the open card context menu, built beside its
     /// labels — index 0 is the inert subject header, hence Option.
     context_menu_actions: Vec<Option<AppMessage>>,
+    /// The `context_menu::generation` of the `show` those actions were built
+    /// for. A menu of any other generation is not this app's — a text box's
+    /// Cut / Copy / Paste, or one shown after the runner closed ours on
+    /// Escape (which never reaches `handle_key_input` to clear the actions).
+    context_menu_generation: u64,
     /// Whether the search band is revealed. Closed is the resting state:
     /// the box is laid out, painted and routed only while this is set.
     search_open: bool,
@@ -1030,6 +1035,7 @@ impl ClearEmailApp {
             Some(AppMessage::Quit),
         ];
         cce_ui::widget::context_menu::show(bx, menubar_h(), options, 0, self.mail_button.id());
+        self.context_menu_generation = cce_ui::widget::context_menu::generation();
     }
 
     /// Right-press on a message card: open its context menu at the pointer.
@@ -1085,52 +1091,154 @@ impl ClearEmailApp {
         options.extend(labels.into_iter().map(str::to_string));
         self.context_menu_actions = std::iter::once(None).chain(actions).collect();
 
+        // Shown where the press was, unclamped: the runner hosts the menu in
+        // its own popup surface, which the compositor keeps on the output
+        // (flipped up, slid in from an edge), so near the window's right or
+        // bottom rim it may hang past the window; an in-window menu (no popup)
+        // is constrained to the window by the toolkit.
         let target = self.email_buttons[idx].id();
-        cce_ui::widget::context_menu::show(px, py, options.clone(), 1, target);
-
-        // Re-show clamped rather than duplicating the toolkit's sizing rule:
-        // `show` is what computes w/h, and this app publishes no overflow
-        // margin, so a menu opened near the right or bottom rim has to be
-        // pulled back inside the window.
-        let mw = cce_ui::widget::context_menu::w();
-        let mh = cce_ui::widget::context_menu::h();
-        let cx = (px).min(self.width as f32 - mw - 2.0).max(0.0);
-        let cy = (py).min(self.height as f32 - mh - 2.0).max(0.0);
-        if (cx - px).abs() > 0.5 || (cy - py).abs() > 0.5 {
-            cce_ui::widget::context_menu::show(cx, cy, options, 1, target);
-        }
+        cce_ui::widget::context_menu::show(px, py, options, 1, target);
+        self.context_menu_generation = cce_ui::widget::context_menu::generation();
         true
     }
 
-    /// A press while a card menu is open: an item fires its action, anything
-    /// else only dismisses. The row's message comes from the parallel
-    /// `context_menu_actions` built with the labels, so the two menu shapes
-    /// (mail vs draft) can't drift out of step with a positional map. The
-    /// toolkit's own `context_menu::mouse_input` is deliberately NOT used —
-    /// it dispatches labels through a fixed map into the target widget,
-    /// where "Delete" means DeleteKey, not this app's message.
+    /// A press while a menu is open: an item fires its action, anything
+    /// else only dismisses. Either mouse button (a right-press on a row runs
+    /// it too), hence the press handed on as a left one.
     ///
-    /// A menu with NO app actions behind it is the toolkit's own — the
-    /// Cut / Copy / Paste menu a text box opens — and that one dispatches
-    /// through `context_menu::mouse_input`, or its rows paint and do
-    /// nothing (which is what they did until 2026-09-22).
+    /// On this app's own menu (a card's, or the app menu) the row's message
+    /// comes from the parallel `context_menu_actions` built with the labels,
+    /// so the two menu shapes (mail vs draft) can't drift out of step with a
+    /// positional map. Its rows carry no toolkit action, so the menu records
+    /// the press as the host's (`take_picked`), and it is dispatched with no
+    /// context: with one, the menu's label fallback would also run "Delete"
+    /// into the card as DeleteKey.
+    ///
+    /// Any other menu is the toolkit's own — the Cut / Copy / Paste menu a
+    /// text box opens — and dispatches through `context_menu::mouse_input`
+    /// with the context, or its rows paint and do nothing (which is what they
+    /// did until 2026-09-22). Telling them apart by generation matters: our
+    /// actions outlive a menu the runner closed on Escape, and read against a
+    /// text box's rows they turned Paste into Delete.
     fn context_menu_press(&mut self, px: f32, py: f32) -> Option<AppMessage> {
-        if self.context_menu_actions.is_empty() {
-            cce_ui::widget::context_menu::mouse_input(
-                MouseButton::Left,
-                ElementState::Pressed,
-                px,
-                py,
-                Some(&mut self.ui_context),
-            );
-            cce_ui::widget::context_menu::hide();
+        use cce_ui::widget::context_menu;
+        let actions = std::mem::take(&mut self.context_menu_actions);
+        let ours = !actions.is_empty() && context_menu::generation() == self.context_menu_generation;
+        if !ours {
+            context_menu::mouse_input(MouseButton::Left, ElementState::Pressed, px, py, Some(&mut self.ui_context));
+            context_menu::hide();
             return None;
         }
-        let msg = cce_ui::widget::context_menu::row_at(px, py)
-            .and_then(|row| self.context_menu_actions.get(row).cloned().flatten());
-        cce_ui::widget::context_menu::hide();
-        self.context_menu_actions.clear();
+        let generation = self.context_menu_generation;
+        context_menu::mouse_input(MouseButton::Left, ElementState::Pressed, px, py, None);
+        context_menu::hide();
+        context_menu::take_picked()
+            .filter(|&(g, _)| g == generation)
+            .and_then(|(_, row)| actions.get(row).cloned().flatten())
+    }
+
+    /// What the widgets reported since the last sweep (`take_events`), as
+    /// messages — every one, in widget order; most dispatches make none or
+    /// one. What a click on the mail button or an HTML-view toggle does is
+    /// done here; it is no message.
+    fn drain_widget_events(&mut self) -> Vec<AppMessage> {
+        let mut out = Vec::new();
+        for (id, ev) in self.ui_context.take_events() {
+            match ev {
+                WidgetEvent::Changed if id == self.account_dropdown.id() => {
+                    let idx = self.ui_context[self.account_dropdown].selected;
+                    if idx < self.accounts.len() {
+                        if idx != self.selected_account_idx {
+                            out.push(AppMessage::SelectAccount(idx));
+                        }
+                    } else {
+                        // The trailing "Manage Accounts…" pseudo-entry: not an
+                        // account — restore the trigger to the active one.
+                        self.ui_context[self.account_dropdown].selected = self.selected_account_idx;
+                        out.push(AppMessage::ManageAccounts);
+                    }
+                }
+                WidgetEvent::Changed if id == self.folder_dropdown.id() => {
+                    if let Some(f) = self.folders.get(self.ui_context[self.folder_dropdown].selected) {
+                        out.push(AppMessage::SwitchFolder(f.tag.clone()));
+                    }
+                }
+                // The box commits on Enter, an undo, a paste. A commit because
+                // it lost focus is drained where that happens (`blur_search`).
+                WidgetEvent::Changed if id == self.search_box.id() => out.push(AppMessage::SearchChanged),
+                // The rows fire on the NEXT press, through the context-menu
+                // gate at the top of handle_mouse_input.
+                WidgetEvent::Clicked if id == self.mail_button.id() => self.open_mail_menu(),
+                WidgetEvent::Clicked if id == self.btn_compose_send.id() => out.push(AppMessage::ComposeSend),
+                WidgetEvent::Clicked if id == self.btn_compose_cancel.id() => out.push(AppMessage::ComposeCancel),
+                WidgetEvent::Clicked if id == self.btn_compose_attach.id() => out.push(AppMessage::ComposeAttach),
+                #[cfg(feature = "wpe")]
+                WidgetEvent::Clicked if id == self.btn_html_view.id() => self.show_text = !self.show_text,
+                #[cfg(feature = "wpe")]
+                WidgetEvent::Clicked if id == self.btn_html_images.id() => {
+                    let lift = !self.webview.images_allowed();
+                    self.webview.set_images_allowed(lift);
+                }
+                WidgetEvent::Clicked => {
+                    // A card: the row index maps through the list as it is
+                    // filtered now, the same list its click was routed by.
+                    if let Some(idx) = self.email_buttons.iter().position(|h| h.id() == id) {
+                        if let Some(email) = self.filtered_emails().get(idx) {
+                            out.push(AppMessage::SelectEmail(email.id));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// [`drain_widget_events`](Self::drain_widget_events) as a hook's one
+    /// message, joined to the one the hook already has: the first is
+    /// returned, the rest go through the sender to `update` rather than be
+    /// lost.
+    fn widget_message(&mut self, mut msg: Option<AppMessage>) -> Option<AppMessage> {
+        for m in self.drain_widget_events() {
+            if msg.is_none() {
+                msg = Some(m);
+            } else {
+                let _ = self.sender.send(m);
+            }
+        }
         msg
+    }
+
+    /// Take the keyboard from the search box. It commits what was typed as it
+    /// goes, and that commit's change is dropped here: the list already
+    /// filters by the typing, so it changes nothing on screen, and as a
+    /// SearchChanged it would clear the selection and scroll the list to the
+    /// top under the very press that left the box (or, polled, at the next
+    /// press into it).
+    fn blur_search(&mut self) {
+        self.ui_context.clear_focus();
+        self.ui_context[self.search_box].unfocus();
+        let _ = self.ui_context[self.search_box].take_change();
+    }
+
+    /// The account dropdown has just opened (a press on it, or Enter / Space
+    /// while the Tab walk has it): re-read the shared accounts.json so
+    /// cce-system-interface edits appear without a restart (the job the
+    /// retired Accounts page did on entry). Keep the selection by email; if
+    /// that account is gone, fall to the default, and say so: the switch to
+    /// what the trigger now shows.
+    fn account_dropdown_opened(&mut self) -> Option<AppMessage> {
+        let prev_email = self.accounts.get(self.selected_account_idx).map(|a| a.email.clone());
+        self.accounts = load_accounts();
+        let new_idx = prev_email
+            .as_deref()
+            .and_then(|e| self.accounts.iter().position(|a| a.email == e))
+            .or_else(|| self.accounts.iter().position(|a| a.is_default))
+            .unwrap_or(0);
+        let changed_account = self.accounts.get(new_idx).map(|a| a.email.as_str()) != prev_email.as_deref();
+        self.ui_context[self.account_dropdown].options = account_dropdown_options(&self.accounts);
+        self.ui_context[self.account_dropdown].selected = new_idx;
+        changed_account.then_some(AppMessage::SelectAccount(new_idx))
     }
 
     /// Whether the detail pane is showing (or about to show) the rendered
@@ -1848,6 +1956,30 @@ impl Application for ClearEmailApp {
         Some(&self.ui_context)
     }
 
+    /// The runner's Tab / Shift+Tab walk and its undo/redo routing to the
+    /// focused box go through this; while it returned `None`, Tab did nothing.
+    fn ui_context_mut(&mut self) -> Option<&mut cce_ui::context::UiContext> {
+        Some(&mut self.ui_context)
+    }
+
+    /// Tab and Shift+Tab walk the bar's controls, the open search box and
+    /// the compose dialog. The group chords are the panes' (`EmailKeys`): the
+    /// runner would take them first, so with Ctrl, Alt or Super held this
+    /// says no and the chord reaches `handle_key_input`. (The runner has
+    /// synced the modifiers into the context by the time it asks.)
+    fn plate_navigation(&self) -> bool {
+        let c = &self.ui_context;
+        !(c.ctrl_pressed || c.alt_pressed || c.logo_pressed)
+    }
+
+    /// A moved focus ring needs the cached geometry rebuilt. A walk out of
+    /// the search box committed what was typed there; the list already
+    /// filters by it, so that change is dropped (`blur_search`).
+    fn focus_stepped(&mut self) {
+        let _ = self.ui_context[self.search_box].take_change();
+        self.needs_rebuild = true;
+    }
+
     fn create(_sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
         // The app keeps calloop's sender; `AppSender` converts into it.
         let _sender: calloop::channel::Sender<Self::Message> = _sender.into();
@@ -1967,7 +2099,14 @@ impl Application for ClearEmailApp {
             search_box: ui_context.insert(search_box),
             email_list,
             email_buttons: Vec::new(),
-            detail_body: ui_context.insert(detail_body),
+            detail_body: {
+                // Laid out but never painted or routed (the body is painted
+                // by the app): hidden, so the Tab walk does not stop on it —
+                // it is a multi-line box, which keeps Tab once focused.
+                let h = ui_context.insert(detail_body);
+                ui_context[h].set_visible(false);
+                h
+            },
             compose_to: ui_context.insert(compose_to),
             compose_cc: ui_context.insert(compose_cc),
             compose_bcc: ui_context.insert(compose_bcc),
@@ -2017,6 +2156,7 @@ impl Application for ClearEmailApp {
             split_dragging: false,
             focused_pane: Pane::List,
             context_menu_actions: Vec::new(),
+            context_menu_generation: 0,
             search_open: false,
             compose_open: false,
             compose_title: String::new(),
@@ -2936,6 +3076,20 @@ impl Application for ClearEmailApp {
                 self.ui_context[self.btn_compose_attach].set_rect(l.attach_x, l.buttons_y, COMPOSE_ATTACH_W, btn_h);
                 self.ui_context[self.btn_compose_send].set_rect(l.send_x, l.buttons_y, COMPOSE_BTN_W, btn_h);
                 self.ui_context[self.btn_compose_cancel].set_rect(l.cancel_x, l.buttons_y, COMPOSE_BTN_W, btn_h);
+            } else {
+                // Parked while the dialog is closed, or the Tab walk stops on
+                // controls nobody can see — the buttons sit at their built
+                // (0, 0) until the first compose, everything at the dialog's
+                // last place after it — and Enter on the hidden Attach opens
+                // a file chooser.
+                for id in [self.compose_to.id(), self.compose_cc.id(), self.compose_bcc.id(), self.compose_subject.id(), self.compose_body.id(), self.btn_compose_attach.id(), self.btn_compose_send.id(), self.btn_compose_cancel.id()] {
+                    if let Some(w) = self.ui_context.get_widget_mut(id) {
+                        // Off-screen at its own size: a box re-wraps its
+                        // text to the width it is given.
+                        let (_, _, rw, rh) = w.rect();
+                        w.set_rect(-9999.0, -9999.0, rw, rh);
+                    }
+                }
             }
 
 
@@ -3445,7 +3599,10 @@ impl Application for ClearEmailApp {
             if state != ElementState::Pressed {
                 return None;
             }
+            // A text box's own menu edits the box (Paste into the search
+            // box is a new query): drained with the row's own message.
             let msg = self.context_menu_press(px, py);
+            let msg = self.widget_message(msg);
             *needs_rebuild = true;
             self.needs_rebuild = true;
             if msg.is_some() {
@@ -3552,85 +3709,36 @@ impl Application for ClearEmailApp {
             }
         }
 
-        let ctx = &mut self.ui_context;
-
         // Account dropdown (the bar dropdowns route before the pane content —
         // an open menu overlays the panes, so a handled press must not fall
         // through to what's beneath it).
-        {
-            let was_open = ctx[self.account_dropdown].open;
-            if ctx.propagate_event(&ev, self.account_dropdown.id()) {
-                if !was_open && ctx[self.account_dropdown].open {
-                    // Freshly opened: re-read the shared accounts.json so
-                    // cce-system-interface edits appear without a restart (the
-                    // job the retired Accounts page did on entry). Keep the
-                    // selection by email; if that account is gone, fall to the
-                    // default. Field-level accesses only — `ctx` still borrows
-                    // self.ui_context.
-                    let prev_email = self
-                        .accounts
-                        .get(self.selected_account_idx)
-                        .map(|a| a.email.clone());
-                    self.accounts = load_accounts();
-                    let new_idx = prev_email
-                        .as_deref()
-                        .and_then(|e| self.accounts.iter().position(|a| a.email == e))
-                        .or_else(|| self.accounts.iter().position(|a| a.is_default))
-                        .unwrap_or(0);
-                    let changed_account =
-                        self.accounts.get(new_idx).map(|a| a.email.as_str()) != prev_email.as_deref();
-                    ctx[self.account_dropdown].options = account_dropdown_options(&self.accounts);
-                    ctx[self.account_dropdown].selected = new_idx;
-                    if changed_account {
-                        // The account under the selection vanished — switch to
-                        // what the trigger now shows.
-                        *needs_rebuild = true;
-                        self.needs_rebuild = true;
-                        return Some(AppMessage::SelectAccount(new_idx));
-                    }
+        let was_open = self.ui_context[self.account_dropdown].open;
+        if self.ui_context.propagate_event(&ev, self.account_dropdown.id()) {
+            *needs_rebuild = true;
+            self.needs_rebuild = true;
+            if !was_open && self.ui_context[self.account_dropdown].open {
+                if let Some(msg) = self.account_dropdown_opened() {
+                    return Some(msg);
                 }
-                let mut msg_out = None;
-                if ctx[self.account_dropdown].take_change() {
-                    let idx = ctx[self.account_dropdown].selected;
-                    if idx < self.accounts.len() {
-                        if idx != self.selected_account_idx {
-                            msg_out = Some(AppMessage::SelectAccount(idx));
-                        }
-                    } else {
-                        // The trailing "Manage Accounts…" pseudo-entry: not an
-                        // account — restore the trigger to the active one.
-                        ctx[self.account_dropdown].selected = self.selected_account_idx;
-                        msg_out = Some(AppMessage::ManageAccounts);
-                    }
-                }
-                *needs_rebuild = true;
-                self.needs_rebuild = true;
-                return msg_out;
             }
+            return self.widget_message(None);
         }
 
-        // The mail-icon button: a click pops the app menu under it. The
-        // rows fire on the NEXT press, through the context-menu gate at the
-        // top of this function.
-        if ctx.propagate_event(&ev, self.mail_button.id()) {
-            if state == ElementState::Released && ctx[self.mail_button].take_click() {
-                self.open_mail_menu();
-            }
+        // The mail-icon button: a click pops the app menu under it
+        // (`drain_widget_events`).
+        if self.ui_context.propagate_event(&ev, self.mail_button.id()) {
             *needs_rebuild = true;
             self.needs_rebuild = true;
-            return None;
+            return self.widget_message(None);
         }
         // Folder switcher.
-        if ctx.propagate_event(&ev, self.folder_dropdown.id()) {
-            if ctx[self.folder_dropdown].take_change() {
-                if let Some(f) = self.folders.get(ctx[self.folder_dropdown].selected) {
-                    msg_out = Some(AppMessage::SwitchFolder(f.tag.clone()));
-                }
-            }
+        if self.ui_context.propagate_event(&ev, self.folder_dropdown.id()) {
             *needs_rebuild = true;
             self.needs_rebuild = true;
-            return msg_out;
+            return self.widget_message(None);
         }
+
+        let ctx = &mut self.ui_context;
 
         if self.compose_open {
             if ctx.propagate_event(&ev, self.compose_to.id()) {
@@ -3654,22 +3762,10 @@ impl Application for ClearEmailApp {
                 if state == ElementState::Pressed { ctx.set_focused_id(self.compose_body.id()); }
             }
 
-            if ctx.propagate_event(&ev, self.btn_compose_send.id()) {
-                changed = true;
-                if state == ElementState::Released && ctx[self.btn_compose_send].take_click() {
-                    msg_out = Some(AppMessage::ComposeSend);
-                }
-            }
-            if ctx.propagate_event(&ev, self.btn_compose_cancel.id()) {
-                changed = true;
-                if state == ElementState::Released && ctx[self.btn_compose_cancel].take_click() {
-                    msg_out = Some(AppMessage::ComposeCancel);
-                }
-            }
-            if ctx.propagate_event(&ev, self.btn_compose_attach.id()) {
-                changed = true;
-                if state == ElementState::Released && ctx[self.btn_compose_attach].take_click() {
-                    msg_out = Some(AppMessage::ComposeAttach);
+            // Their clicks are drained at the end (`drain_widget_events`).
+            for root in [self.btn_compose_send.id(), self.btn_compose_cancel.id(), self.btn_compose_attach.id()] {
+                if ctx.propagate_event(&ev, root) {
+                    changed = true;
                 }
             }
 
@@ -3707,20 +3803,18 @@ impl Application for ClearEmailApp {
             if self.search_open && ctx.propagate_event(&ev, self.search_box.id()) {
                 changed = true;
                 if state == ElementState::Pressed { ctx.set_focused_id(self.search_box.id()); }
-                if ctx[self.search_box].take_change() {
-                    msg_out = Some(AppMessage::SearchChanged);
-                }
             } else if state == ElementState::Pressed && button == MouseButton::Left {
-                ctx.clear_focus();
-                ctx[self.search_box].unfocus();
+                self.blur_search();
                 // Clicking away from an EMPTY search collapses the band —
                 // an unfocused box with no query is dead chrome. One holding
                 // a query stays: it is the visible reason the list is short.
-                if self.search_open && ctx[self.search_box].text.is_empty() && ctx[self.search_box].edit_buffer.is_empty() {
+                let sb = &self.ui_context[self.search_box];
+                if self.search_open && sb.text.is_empty() && sb.edit_buffer.is_empty() {
                     self.search_open = false;
                 }
                 changed = true;
             }
+            let ctx = &mut self.ui_context;
 
             // The scrollbar strip sits inside the row rects (rows span x 10..310, the strip
             // ~294..310), so a press the scrollbar consumed must not also reach the row
@@ -3752,17 +3846,11 @@ impl Application for ClearEmailApp {
                 let filtered: Vec<&Email> =
                     filtered_from(&self.emails, self.emails_rev, &self.current_folder, search_text, &self.filter_cache);
 
-                for (idx, email) in filtered.iter().enumerate() {
-                    if idx < self.email_buttons.len() {
-                        let btn = self.email_buttons[idx];
-                        if ctx[btn].rect().0 > -9000.0 {
-                            if ctx.propagate_event(&ev, btn.id()) {
-                                changed = true;
-                                if state == ElementState::Released && ctx[btn].take_click() {
-                                    msg_out = Some(AppMessage::SelectEmail(email.id));
-                                }
-                            }
-                        }
+                // A card's click is drained at the end (`drain_widget_events`).
+                for idx in 0..filtered.len().min(self.email_buttons.len()) {
+                    let btn = self.email_buttons[idx];
+                    if ctx[btn].rect().0 > -9000.0 && ctx.propagate_event(&ev, btn.id()) {
+                        changed = true;
                     }
                 }
             }
@@ -3771,17 +3859,9 @@ impl Application for ClearEmailApp {
             // never take a press).
             #[cfg(feature = "wpe")]
             {
-                if ctx.propagate_event(&ev, self.btn_html_view.id()) {
-                    changed = true;
-                    if state == ElementState::Released && ctx[self.btn_html_view].take_click() {
-                        self.show_text = !self.show_text;
-                    }
-                }
-                if ctx.propagate_event(&ev, self.btn_html_images.id()) {
-                    changed = true;
-                    if state == ElementState::Released && ctx[self.btn_html_images].take_click() {
-                        let lift = !self.webview.images_allowed();
-                        self.webview.set_images_allowed(lift);
+                for root in [self.btn_html_view.id(), self.btn_html_images.id()] {
+                    if ctx.propagate_event(&ev, root) {
+                        changed = true;
                     }
                 }
             }
@@ -3819,6 +3899,8 @@ impl Application for ClearEmailApp {
             }
         }
 
+        // A release on a button or a card commits its click.
+        let msg_out = self.widget_message(msg_out);
         if changed {
             *needs_rebuild = true;
             self.needs_rebuild = true;
@@ -3908,39 +3990,21 @@ impl Application for ClearEmailApp {
 
         // An open bar dropdown takes the keyboard — Escape closes it, arrows
         // move the hover, Enter selects — routed and drained exactly like its
-        // mouse events (see handle_mouse_input; the freshly-opened accounts
-        // reload stays mouse-only, since a key cannot open a closed
-        // dropdown). No key ever reached these before: every propagate below
-        // is gated on compose/search state that an open dropdown never
-        // satisfies (the cce-files bug).
-        if self.ui_context[self.account_dropdown].open {
-            if self.ui_context.propagate_event(&kev, self.account_dropdown.id()) {
-                if self.ui_context[self.account_dropdown].take_change() {
-                    let idx = self.ui_context[self.account_dropdown].selected;
-                    if idx < self.accounts.len() {
-                        if idx != self.selected_account_idx {
-                            msg_out = Some(AppMessage::SelectAccount(idx));
-                        }
-                    } else {
-                        // The trailing "Manage Accounts…" pseudo-entry.
-                        self.ui_context[self.account_dropdown].selected = self.selected_account_idx;
-                        msg_out = Some(AppMessage::ManageAccounts);
-                    }
-                }
-                *needs_rebuild = true;
-                self.needs_rebuild = true;
-                return msg_out;
-            }
+        // mouse events (see handle_mouse_input). No key ever reached these
+        // before: every propagate below is gated on compose/search state that
+        // an open dropdown never satisfies (the cce-files bug).
+        let open_dropdown = if self.ui_context[self.account_dropdown].open {
+            Some(self.account_dropdown.id())
         } else if self.ui_context[self.folder_dropdown].open {
-            if self.ui_context.propagate_event(&kev, self.folder_dropdown.id()) {
-                if self.ui_context[self.folder_dropdown].take_change() {
-                    if let Some(f) = self.folders.get(self.ui_context[self.folder_dropdown].selected) {
-                        msg_out = Some(AppMessage::SwitchFolder(f.tag.clone()));
-                    }
-                }
+            Some(self.folder_dropdown.id())
+        } else {
+            None
+        };
+        if let Some(dropdown) = open_dropdown {
+            if self.ui_context.propagate_event(&kev, dropdown) {
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
-                return msg_out;
+                return self.widget_message(None);
             }
         }
 
@@ -4054,6 +4118,9 @@ impl Application for ClearEmailApp {
                 ctx[self.search_box].unfocus();
                 ctx[self.search_box].text.clear();
                 ctx[self.search_box].edit_buffer.clear();
+                // The unfocus committed the query it then lost: this message
+                // is the change, not a second one from the sweep.
+                let _ = ctx[self.search_box].take_change();
                 self.search_open = false;
                 msg_out = Some(AppMessage::SearchChanged);
                 handled = true;
@@ -4148,17 +4215,37 @@ impl Application for ClearEmailApp {
                 handled = true;
             }
 
+            // Its commit (Enter) is a SearchChanged, drained below.
             if !handled && ctx[self.search_box].editing {
                 if ctx.propagate_event(&kev, self.search_box.id()) {
                     handled = true;
-                    if ctx[self.search_box].take_change() {
-                        msg_out = Some(AppMessage::SearchChanged);
-                    }
                 }
             }
 
         }
 
+        // A control the Tab walk focused — a bar button or dropdown, a
+        // compose button — has the key nobody above took: Enter / Space press
+        // it, and a closed dropdown opens. (The boxes that are editing were
+        // offered it above.)
+        let account_was_open = ctx[self.account_dropdown].open;
+        if !handled {
+            if let Some(focused) = ctx.focused_widget {
+                if ctx.propagate_event(&kev, focused) {
+                    handled = true;
+                }
+            }
+        }
+        if !account_was_open && self.ui_context[self.account_dropdown].open {
+            if let Some(msg) = self.account_dropdown_opened() {
+                if let Some(earlier) = msg_out.replace(msg) {
+                    let _ = self.sender.send(earlier);
+                }
+            }
+        }
+
+        // A press on a focused button, a commit in the search box.
+        let msg_out = self.widget_message(msg_out);
         if handled {
             *needs_rebuild = true;
             self.needs_rebuild = true;
