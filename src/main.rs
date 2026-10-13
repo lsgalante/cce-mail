@@ -124,6 +124,11 @@ enum AppMessage {
     Reply,
     DeleteSelected,
     ToggleUnread,
+    /// A row of a card menu's Move To page: file email `0` in folder tag `1`.
+    MoveTo(usize, String),
+    /// A server move has answered: the uid the message was given in its new
+    /// folder (`None` when the server did not say), or why it failed.
+    MoveFinished(MoveJob, Result<Option<u32>, String>),
     SelectAccount(usize),
     /// Open cce-system-interface on its Accounts page — account add/remove/
     /// default/OAuth all live there now; this app only reads accounts.json.
@@ -1046,10 +1051,10 @@ impl ClearEmailApp {
             bx > -9000.0 && px >= bx && px <= bx + bw && py >= by && py <= by + bh
         });
         let Some(idx) = hit else { return false };
-        let Some((id, read, subject, folder)) = self
+        let Some((id, read, folder)) = self
             .filtered_emails()
             .get(idx)
-            .map(|e| (e.id, e.read, e.subject.clone(), e.folder.clone()))
+            .map(|e| (e.id, e.read, e.folder.clone()))
         else {
             return false;
         };
@@ -1061,11 +1066,11 @@ impl ClearEmailApp {
         self.selected_email_id = Some(id);
         self.body_scroll = 0.0;
 
-        // Row 0 is the subject header (header_count = 1) — dimmed and inert,
-        // hence the leading None. A draft is not a message that arrived:
-        // there is nobody to reply to and no read state, so it gets Edit —
-        // which is SelectEmail, the same path a left-click takes to resume it
-        // in the compose dialog.
+        // No header row: the card the menu opened on is selected under it,
+        // so a subject repeated as the menu's first row said nothing new.
+        // A draft is not a message that arrived: there is nobody to reply
+        // to and no read state, so it gets Edit — which is SelectEmail, the
+        // same path a left-click takes to resume it in the compose dialog.
         // A delete that cannot be undone should say so where it is invoked.
         let delete_label = if folder == "trash" || folder == "archive" {
             "Delete Forever"
@@ -1087,17 +1092,17 @@ impl ClearEmailApp {
                 ],
             )
         };
-        let mut options = vec![ellipsize(&subject, 28)];
-        options.extend(labels.into_iter().map(str::to_string));
-        self.context_menu_actions = std::iter::once(None).chain(actions).collect();
+        let options = labels.into_iter().map(str::to_string).collect();
+        self.context_menu_actions = actions;
 
         // Shown where the press was, unclamped: the runner hosts the menu in
         // its own popup surface, which the compositor keeps on the output
         // (flipped up, slid in from an edge), so near the window's right or
         // bottom rim it may hang past the window; an in-window menu (no popup)
-        // is constrained to the window by the toolkit.
+        // is constrained to the window by the toolkit. Scaled up from the
+        // DE's menu size (`CARD_MENU_SCALE`).
         let target = self.email_buttons[idx].id();
-        cce_ui::widget::context_menu::show(px, py, options, 1, target);
+        cce_ui::widget::context_menu::show_scaled(px, py, options, 0, target, CARD_MENU_SCALE);
         self.context_menu_generation = cce_ui::widget::context_menu::generation();
         true
     }

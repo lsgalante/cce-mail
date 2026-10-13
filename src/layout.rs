@@ -98,9 +98,11 @@ pub(crate) const SPLIT_GRAB_SLOP: f32 = 4.0;
 /// self-healing, long enough that a vault left locked costs nothing.
 pub(crate) const SECRET_RETRY_SECS: u64 = 5;
 
-/// Row pitch of the toolkit context menu — its own layout constant
-/// (`ContextMenuState`), mirrored here because hit-testing is done app-side.
-pub(crate) const CONTEXT_ROW_H: f32 = 24.0;
+/// How much larger than the DE's menu font a card's right-click menu is
+/// drawn (`context_menu::show_scaled`): at the stock 12px it read small
+/// for a menu of three or so actions. Hit-testing scales with it inside
+/// the toolkit; nothing here steps rows by hand.
+pub(crate) const CARD_MENU_SCALE: f32 = 1.25;
 
 // The search band. It is not permanent chrome: the `open_search` chord
 // ("/" by default) reveals and focuses it, and closing hands its strip back
