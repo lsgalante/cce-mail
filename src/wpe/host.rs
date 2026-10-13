@@ -548,17 +548,28 @@ impl MailWebView {
     /// through unchanged — WPE inverts on the way to the DOM itself.
     pub fn wheel(&mut self, dx_px: f64, dy_px: f64, x_px: f32, y_px: f32) {
         let Some((_, view)) = self.webview else { return };
+        // cce-ui publishes the gesture phase of the wheel event being
+        // dispatched: a trackpad's finger lift arrives as a zero delta in
+        // FingerEnd, which is WebKit's scroll-stop — the signal its own
+        // kinetic scrolling keys off. Finger phases report the touchpad
+        // source so the engine treats the deltas as a gesture, not clicks.
+        // (cce-browser's `wheel` carries the same mapping.)
+        let (source, is_stop) = match cce_ui::widget::scroll_motion::current_scroll_phase() {
+            cce_ui::widget::ScrollPhase::Wheel => (WPEInputSource::WPE_INPUT_SOURCE_MOUSE, 0),
+            cce_ui::widget::ScrollPhase::Finger => (WPEInputSource::WPE_INPUT_SOURCE_TOUCHPAD, 0),
+            cce_ui::widget::ScrollPhase::FingerEnd => (WPEInputSource::WPE_INPUT_SOURCE_TOUCHPAD, 1),
+        };
         unsafe {
             let (x, y) = self.to_logical(x_px, y_px);
             let e = wpe_event_scroll_new(
                 view,
-                WPEInputSource::WPE_INPUT_SOURCE_MOUSE,
+                source,
                 input::now_ms(),
                 0,
                 dx_px / self.scale as f64,
                 dy_px / self.scale as f64,
                 1, // precise deltas: these are pixels, not notches
-                0, // not a scroll-stop event
+                is_stop,
                 x,
                 y,
             );
