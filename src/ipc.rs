@@ -51,6 +51,7 @@ cce-mail ctl <command> [--json]
   open <id>                     show a message in the window (marks it read, like a click)
   mark-read <id>                set the read flag; mirrored to the server for inbox mail
   mark-unread <id>
+  move <id> <folder>            file a message in another server folder, by tag or label
   select-account <email>
   switch-folder <folder>        by tag (inbox, sent, drafts, trash, …) or label
   sync                          start a sync now
@@ -181,6 +182,7 @@ pub enum Command {
     Get(usize),
     Open(usize),
     MarkRead(usize, bool),
+    Move(usize, String),
     SelectAccount(String),
     SwitchFolder(String),
     Sync,
@@ -254,6 +256,13 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
         "open" => Command::Open(one_id(rest)?),
         "mark-read" => Command::MarkRead(one_id(rest)?, true),
         "mark-unread" => Command::MarkRead(one_id(rest)?, false),
+        "move" => match rest {
+            [id, folder @ ..] if !folder.is_empty() => Command::Move(
+                id.parse().map_err(|_| format!("bad message id {id:?}"))?,
+                folder.join(" "),
+            ),
+            _ => return Err("move takes a message id and a folder".to_string()),
+        },
         "select-account" => match rest {
             [e] => Command::SelectAccount(e.to_string()),
             _ => return Err("select-account takes one email address".to_string()),
@@ -529,6 +538,9 @@ mod tests {
         );
         assert_eq!(parse("get 42").unwrap().command, Command::Get(42));
         assert_eq!(parse("mark-unread 7").unwrap().command, Command::MarkRead(7, false));
+        assert_eq!(parse("move 7 All Mail").unwrap().command, Command::Move(7, "All Mail".into()));
+        assert!(parse("move 7").is_err());
+        assert!(parse("move x inbox").is_err());
         assert_eq!(
             parse("select-account a@b.c").unwrap().command,
             Command::SelectAccount("a@b.c".into())

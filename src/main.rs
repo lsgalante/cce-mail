@@ -124,6 +124,11 @@ enum AppMessage {
     Reply,
     DeleteSelected,
     ToggleUnread,
+    /// A row of a card menu's Move To page: file email `0` in folder tag `1`.
+    MoveTo(usize, String),
+    /// A server move has answered: the uid the message was given in its new
+    /// folder (`None` when the server did not say), or why it failed.
+    MoveFinished(MoveJob, Result<Option<u32>, String>),
     SelectAccount(usize),
     /// Open cce-system-interface on its Accounts page — account add/remove/
     /// default/OAuth all live there now; this app only reads accounts.json.
@@ -169,6 +174,19 @@ enum AppMessage {
 struct HtmlMail {
     html: String,
     inline: Vec<(String, String, Vec<u8>)>,
+}
+
+/// The message card whose right-click menu is up: which message a page turn
+/// is for, and how to put the menu back when its Move To page turns back.
+#[derive(Debug, Clone, Copy)]
+struct CardMenu {
+    id: usize,
+    /// The card's button, the menu's target.
+    target: cce_ui::widget::WidgetId,
+    /// The row that turns to the Move To page, when the message can move.
+    move_row: Option<usize>,
+    /// The Move To page is showing rather than the menu.
+    on_page: bool,
 }
 
 /// The single status slot at the bottom of the window. Info toasts expire on
@@ -388,6 +406,9 @@ struct ClearEmailApp {
     /// Cut / Copy / Paste, or one shown after the runner closed ours on
     /// Escape (which never reaches `handle_key_input` to clear the actions).
     context_menu_generation: u64,
+    /// The card whose menu is up, for its page turns; `None` for the app
+    /// menu. Read only while `context_menu_generation` is the menu's.
+    card_menu: Option<CardMenu>,
     /// Whether the search band is revealed. Closed is the resting state:
     /// the box is laid out, painted and routed only while this is set.
     search_open: bool,
@@ -1022,6 +1043,80 @@ impl ClearEmailApp {
         filtered_from(&self.emails, self.emails_rev, &self.current_folder, search_text, &self.filter_cache)
     }
 
+    /// The selected message has left the list (deleted, moved) from row
+    /// `row`: land on whatever slid into its place, so a run of them needs
+    /// no reaching for the mouse. Set directly rather than through
+    /// SelectEmail: that marks a message read, and clearing past unread mail
+    /// should not quietly mark it read — nor resume the next draft.
+    fn land_after_removal(&mut self, row: Option<usize>) {
+        let rows: Vec<usize> = self.filtered_emails().iter().map(|e| e.id).collect();
+        self.selected_email_id = match row {
+            Some(i) => rows.get(i).or_else(|| rows.last()).copied(),
+            None => None,
+        };
+        self.body_scroll = 0.0;
+        // The webview still shows the message that left; swap to the new
+        // selection's HTML (request_html marks nothing read — that stays
+        // SelectEmail's job).
+        self.reset_html();
+        if let Some(next_id) = self.selected_email_id {
+            self.request_html(next_id);
+            if let Some(i) = rows.iter().position(|id| *id == next_id) {
+                self.scroll_row_into_view(i);
+            }
+        }
+    }
+
+    /// File message `id` in folder `to`, on the server and in the list at
+    /// once; `Ok` carries what the status line says.
+    ///
+    /// The row goes to `to` without a uid until the server says which one
+    /// the message was given there (`MoveFinished`, `settle_move`): its old
+    /// uid numbers another mailbox, and in this one could name some other
+    /// message — the next sync would skip fetching that one, or overwrite
+    /// this row with it. Out of Gmail's All Mail and Sent Mail a move is a
+    /// copy (`move_keeps_source`), and the row stays where it is.
+    fn move_email(&mut self, id: usize, to: &str) -> Result<String, String> {
+        let Some(account) = self.accounts.get(self.selected_account_idx).cloned() else {
+            return Err("no account".to_string());
+        };
+        let Some((from, uid)) = self.emails.iter().find(|e| e.id == id).map(|e| (e.folder.clone(), e.uid)) else {
+            return Err(format!("no message with id {id}"));
+        };
+        let label = |tag: &str| self.folders.iter().find(|f| f.tag == tag).map_or(tag.to_string(), |f| f.label.clone());
+        if from == to {
+            return Err(format!("it is already in {}", label(to)));
+        }
+        let (Some(uid), Some(from_mailbox)) = (uid, self.mailbox_for(&from)) else {
+            return Err(format!("{} is kept only here, not on the server", label(&from)));
+        };
+        let Some(to_mailbox) = self.mailbox_for(to) else {
+            return Err(format!("{} is not a server folder", label(to)));
+        };
+        let copy_only = move_keeps_source(&from, &from_mailbox);
+        let note = if copy_only {
+            format!("Added to {} — {} keeps it too", label(to), label(&from))
+        } else {
+            format!("Moved to {}", label(to))
+        };
+        if !copy_only {
+            let row = self.filtered_emails().iter().position(|e| e.id == id);
+            self.emails_rev = self.emails_rev.wrapping_add(1);
+            if let Some(e) = self.emails.iter_mut().find(|e| e.id == id) {
+                e.folder = to.to_string();
+                e.uid = None;
+            }
+            self.save_emails();
+            if self.selected_email_id == Some(id) {
+                self.land_after_removal(row);
+            }
+        }
+        let job = MoveJob { account: account.email.clone(), id, from, to: to.to_string(), uid, copy_only };
+        move_on_server(account, job, from_mailbox, to_mailbox, self.sender.clone());
+        self.status_message = Some(StatusToast::info(note.clone(), 4.0));
+        Ok(note)
+    }
+
     /// The app menu, hung off the bottom of the bar under the mail-icon
     /// button. Same context-menu plumbing as a card's right-click menu:
     /// labels to the toolkit, messages into the parallel
@@ -1036,6 +1131,7 @@ impl ClearEmailApp {
         ];
         cce_ui::widget::context_menu::show(bx, menubar_h(), options, 0, self.mail_button.id());
         self.context_menu_generation = cce_ui::widget::context_menu::generation();
+        self.card_menu = None;
     }
 
     /// Right-press on a message card: open its context menu at the pointer.
@@ -1046,11 +1142,7 @@ impl ClearEmailApp {
             bx > -9000.0 && px >= bx && px <= bx + bw && py >= by && py <= by + bh
         });
         let Some(idx) = hit else { return false };
-        let Some((id, read, folder)) = self
-            .filtered_emails()
-            .get(idx)
-            .map(|e| (e.id, e.read, e.folder.clone()))
-        else {
+        let Some(id) = self.filtered_emails().get(idx).map(|e| e.id) else {
             return false;
         };
 
@@ -1060,6 +1152,27 @@ impl ClearEmailApp {
         // click might be "Mark Unread".
         self.selected_email_id = Some(id);
         self.body_scroll = 0.0;
+
+        // Shown where the press was, unclamped: the runner hosts the menu in
+        // its own popup surface, which the compositor keeps on the output
+        // (flipped up, slid in from an edge), so near the window's right or
+        // bottom rim it may hang past the window; an in-window menu (no popup)
+        // is constrained to the window by the toolkit.
+        let target = self.email_buttons[idx].id();
+        self.show_card_menu(id, target, (px, py), false)
+    }
+
+    /// Put up message `id`'s card menu with its corner at `at`: at the
+    /// pointer as a menu opens, or — `turned_back` — where its Move To page
+    /// stood, turned back to from it. Scaled up from the DE's menu size
+    /// (`CARD_MENU_SCALE`).
+    fn show_card_menu(&mut self, id: usize, target: cce_ui::widget::WidgetId, at: (f32, f32), turned_back: bool) -> bool {
+        use cce_ui::widget::context_menu;
+        let Some((read, folder, uid)) =
+            self.emails.iter().find(|e| e.id == id).map(|e| (e.read, e.folder.clone(), e.uid))
+        else {
+            return false;
+        };
 
         // No header row: the card the menu opened on is selected under it,
         // so a subject repeated as the menu's first row said nothing new.
@@ -1072,33 +1185,89 @@ impl ClearEmailApp {
         } else {
             "Delete"
         };
+        // Move To is a page row: what it runs is the turn, not a message.
+        // Only mail with a server copy moves — Trash and Drafts are this
+        // app's own, and a local sent copy has no server folder to leave.
+        let movable = uid.is_some()
+            && self.mailbox_for(&folder).is_some()
+            && !self.move_destinations(&folder).is_empty();
         let (labels, actions): (Vec<&str>, Vec<Option<AppMessage>>) = if folder == "drafts" {
             (
                 vec!["Edit", delete_label],
                 vec![Some(AppMessage::SelectEmail(id)), Some(AppMessage::DeleteSelected)],
             )
         } else {
-            (
-                vec!["Reply", delete_label, if read { "Mark Unread" } else { "Mark Read" }],
-                vec![
-                    Some(AppMessage::Reply),
-                    Some(AppMessage::DeleteSelected),
-                    Some(AppMessage::ToggleUnread),
-                ],
-            )
+            let mut rows = vec![("Reply", Some(AppMessage::Reply))];
+            if movable {
+                rows.push(("Move To", None));
+            }
+            rows.push((delete_label, Some(AppMessage::DeleteSelected)));
+            rows.push((if read { "Mark Unread" } else { "Mark Read" }, Some(AppMessage::ToggleUnread)));
+            rows.into_iter().unzip()
         };
+        let move_row = labels.iter().position(|&l| l == "Move To");
         let options = labels.into_iter().map(str::to_string).collect();
         self.context_menu_actions = actions;
 
-        // Shown where the press was, unclamped: the runner hosts the menu in
-        // its own popup surface, which the compositor keeps on the output
-        // (flipped up, slid in from an edge), so near the window's right or
-        // bottom rim it may hang past the window; an in-window menu (no popup)
-        // is constrained to the window by the toolkit. Scaled up from the
-        // DE's menu size (`CARD_MENU_SCALE`).
-        let target = self.email_buttons[idx].id();
-        cce_ui::widget::context_menu::show_scaled(px, py, options, 0, target, CARD_MENU_SCALE);
-        self.context_menu_generation = cce_ui::widget::context_menu::generation();
+        if turned_back {
+            context_menu::show_page(at.0, at.1, None, options, 0, target);
+        } else {
+            context_menu::show_scaled(at.0, at.1, options, 0, target, CARD_MENU_SCALE);
+        }
+        if let Some(row) = move_row {
+            context_menu::set_row_page(row);
+        }
+        self.context_menu_generation = context_menu::generation();
+        self.card_menu = Some(CardMenu { id, target, move_row, on_page: false });
+        true
+    }
+
+    /// The folders mail in `from` can be moved to, as (tag, label), in
+    /// switcher order: every server folder but its own. Trash and Drafts are
+    /// local, so never among them — Delete is the way to Trash.
+    fn move_destinations(&self, from: &str) -> Vec<(String, String)> {
+        self.folders
+            .iter()
+            .filter(|f| f.is_server_backed() && f.tag != from)
+            .map(|f| (f.tag.clone(), f.label.clone()))
+            .collect()
+    }
+
+    /// Turn the card menu into its Move To page, its corner at `at`: a row
+    /// per folder the message can go to, under a back band to the menu
+    /// (which names the message, the menu having no title of its own).
+    fn show_move_page(&mut self, menu: CardMenu, at: (f32, f32)) {
+        use cce_ui::widget::context_menu;
+        let Some((subject, folder)) = self
+            .emails
+            .iter()
+            .find(|e| e.id == menu.id)
+            .map(|e| (e.subject.clone(), e.folder.clone()))
+        else {
+            context_menu::hide();
+            return;
+        };
+        let (tags, labels): (Vec<String>, Vec<String>) = self.move_destinations(&folder).into_iter().unzip();
+        context_menu::show_page(at.0, at.1, Some(&ellipsize(&subject, 28)), labels, 0, menu.target);
+        self.context_menu_actions = tags.into_iter().map(|tag| Some(AppMessage::MoveTo(menu.id, tag))).collect();
+        self.context_menu_generation = context_menu::generation();
+        self.card_menu = Some(CardMenu { on_page: true, ..menu });
+    }
+
+    /// Turn the open card menu: into its Move To page, or back from it to
+    /// the menu. `false` when it has no such turn, or is not a card's.
+    fn turn_card_menu(&mut self, turn: cce_ui::widget::context_menu::PageTurn) -> bool {
+        use cce_ui::widget::context_menu::{self, PageTurn};
+        let Some(menu) = self.card_menu.filter(|_| context_menu::generation() == self.context_menu_generation) else {
+            return false;
+        };
+        // The page's corner is where the plate it turns from stands.
+        let at = (context_menu::x(), context_menu::y());
+        match turn {
+            PageTurn::Into(row) if !menu.on_page && menu.move_row == Some(row) => self.show_move_page(menu, at),
+            PageTurn::Back if menu.on_page => return self.show_card_menu(menu.id, menu.target, at, true),
+            _ => return false,
+        }
         true
     }
 
@@ -1120,6 +1289,9 @@ impl ClearEmailApp {
     /// did until 2026-09-22). Telling them apart by generation matters: our
     /// actions outlive a menu the runner closed on Escape, and read against a
     /// text box's rows they turned Paste into Delete.
+    ///
+    /// A press on a page row (a card's Move To) or a page's back band runs
+    /// nothing: the menu asks for a turn, and stays up turned.
     fn context_menu_press(&mut self, px: f32, py: f32) -> Option<AppMessage> {
         use cce_ui::widget::context_menu;
         let actions = std::mem::take(&mut self.context_menu_actions);
@@ -1131,6 +1303,13 @@ impl ClearEmailApp {
         }
         let generation = self.context_menu_generation;
         context_menu::mouse_input(MouseButton::Left, ElementState::Pressed, px, py, None);
+        if let Some(turn) = context_menu::take_turn() {
+            self.context_menu_actions = actions;
+            if !self.turn_card_menu(turn) {
+                context_menu::hide();
+            }
+            return None;
+        }
         context_menu::hide();
         context_menu::take_picked()
             .filter(|&(g, _)| g == generation)
@@ -1908,6 +2087,19 @@ impl ClearEmailApp {
                 self.needs_rebuild = true;
                 ipc::ok(&format!("{id} marked {}", if read { "read" } else { "unread" }), json)
             }
+            Command::Move(id, name) => {
+                let Some(tag) = self.folder_by_name(&name).map(|f| f.tag.clone()) else {
+                    return ipc::error(&format!("no folder {name:?} (see `folders`)"));
+                };
+                match self.move_email(id, &tag) {
+                    Ok(note) => {
+                        *needs_rebuild = true;
+                        self.needs_rebuild = true;
+                        ipc::ok(&note, json)
+                    }
+                    Err(e) => ipc::error(&format!("cannot move {id}: {e}")),
+                }
+            }
             Command::SelectAccount(email) => {
                 let wanted = email.to_lowercase();
                 match self.accounts.iter().position(|a| a.email.to_lowercase() == wanted) {
@@ -2157,6 +2349,7 @@ impl Application for ClearEmailApp {
             focused_pane: Pane::List,
             context_menu_actions: Vec::new(),
             context_menu_generation: 0,
+            card_menu: None,
             search_open: false,
             compose_open: false,
             compose_title: String::new(),
@@ -2555,36 +2748,56 @@ impl Application for ClearEmailApp {
                         self.emails.retain(|e| e.id != id);
                     }
                     self.save_emails();
-
-                    // Land on whatever slid into the deleted row's place, so a
-                    // run of deletions needs no reaching for the mouse. Set
-                    // directly rather than through SelectEmail: that marks a
-                    // message read, and deleting past unread mail should not
-                    // quietly mark it read — nor resume the next draft.
-                    let rows: Vec<usize> =
-                        self.filtered_emails().iter().map(|e| e.id).collect();
-                    self.selected_email_id = match deleted_row {
-                        Some(i) => rows.get(i).or_else(|| rows.last()).copied(),
-                        None => None,
-                    };
-                    self.body_scroll = 0.0;
-                    // The webview still shows the deleted message; swap to
-                    // the new selection's HTML (request_html marks nothing
-                    // read — that stays SelectEmail's job).
-                    self.reset_html();
-                    if let Some(next_id) = self.selected_email_id {
-                        self.request_html(next_id);
-                    }
-                    if let Some(next_id) = self.selected_email_id {
-                        if let Some(i) = rows.iter().position(|id| *id == next_id) {
-                            self.scroll_row_into_view(i);
-                        }
-                    }
+                    self.land_after_removal(deleted_row);
 
                     self.status_message = Some(StatusToast::info(
                         if permanently_deleted { "Email Deleted Permanently" } else { "Moved to Trash" },
                         4.0,
                     ));
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::MoveTo(id, to) => {
+                if let Err(e) = self.move_email(id, &to) {
+                    self.status_message = Some(StatusToast::error(format!("Cannot move: {e}")));
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::MoveFinished(job, result) => {
+                let active = self
+                    .accounts
+                    .get(self.selected_account_idx)
+                    .is_some_and(|a| a.email == job.account);
+                if active {
+                    if settle_move(&mut self.emails, &job, &result) {
+                        self.emails_rev = self.emails_rev.wrapping_add(1);
+                        self.save_emails();
+                        if self.selected_email_id.is_some_and(|id| !self.emails.iter().any(|e| e.id == id)) {
+                            self.selected_email_id = None;
+                            self.reset_html();
+                        }
+                    }
+                } else {
+                    // Another account's now: settle its cache on disk, off
+                    // the UI thread, as a background account's sync does.
+                    let (job, result) = (job.clone(), result.clone());
+                    std::thread::spawn(move || {
+                        let mut emails = load_emails_for_account(&job.account);
+                        if settle_move(&mut emails, &job, &result) {
+                            save_emails_for_account(&job.account, emails);
+                        }
+                    });
+                }
+                match &result {
+                    // The destination holds mail its cache has not seen: the
+                    // next visit syncs it at once, past the throttle.
+                    Ok(None) if active => {
+                        self.synced_tags.remove(&job.to);
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.status_message = Some(StatusToast::error(format!("Move failed: {e}"))),
                 }
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
@@ -3608,8 +3821,9 @@ impl Application for ClearEmailApp {
             if msg.is_some() {
                 return msg;
             }
-            // A right-press elsewhere goes on to open another card's menu.
-            if button != MouseButton::Right {
+            // A right-press elsewhere goes on to open another card's menu —
+            // but not one that turned the menu, which is still up.
+            if button != MouseButton::Right || cce_ui::widget::context_menu::is_visible() {
                 return None;
             }
         }
@@ -3914,6 +4128,23 @@ impl Application for ClearEmailApp {
         let px = pos.x as f32;
         let py = pos.y as f32;
 
+        // Over an open menu the wheel is the menu's: a menu cut short to fit
+        // (a long Move To list) scrolls its rows, and a side swipe turns it
+        // into a page or back.
+        {
+            use cce_ui::widget::context_menu;
+            if context_menu::is_visible() && context_menu::hit_test(px, py) {
+                if context_menu::mouse_wheel(delta, px, py) {
+                    if let Some(turn) = context_menu::take_turn() {
+                        self.turn_card_menu(turn);
+                    }
+                    *needs_rebuild = true;
+                    self.needs_rebuild = true;
+                }
+                return;
+            }
+        }
+
         let separator_x = self.split_geom().1;
         if !self.compose_open {
             if px < separator_x {
@@ -3983,6 +4214,7 @@ impl Application for ClearEmailApp {
         {
             cce_ui::widget::context_menu::hide();
             self.context_menu_actions.clear();
+            self.card_menu = None;
             *needs_rebuild = true;
             self.needs_rebuild = true;
             return None;
@@ -5011,6 +5243,90 @@ mod tests {
         let draft = msg(1, None, "drafts", "draft", true);
         let local_sent = msg(2, None, "sent", "unsent copy", true);
         assert!(known_uids(&[draft, local_sent], &default_folders()).is_empty());
+    }
+
+    // ---- moves ------------------------------------------------------------
+
+    fn move_job(id: usize, uid: u32) -> MoveJob {
+        MoveJob {
+            account: "me@example.org".to_string(),
+            id,
+            from: "inbox".to_string(),
+            to: "Receipts".to_string(),
+            uid,
+            copy_only: false,
+        }
+    }
+
+    #[test]
+    fn copyuid_gives_the_destination_uid() {
+        // RFC 6851's example shape: untagged, ahead of the expunge.
+        let r = b"* OK [COPYUID 432432 42 1202] Moved\r\n* 3 EXPUNGE\r\n";
+        assert_eq!(copyuid_dest(r), Some(1202));
+        assert_eq!(copyuid_dest(b"* ok [copyuid 1 7 9]\r\n"), Some(9));
+        assert_eq!(copyuid_dest(b"* 3 EXPUNGE\r\n"), None, "no UIDPLUS, no uid");
+        assert_eq!(copyuid_dest(b"* OK [COPYUID 1 7]\r\n"), None);
+    }
+
+    #[test]
+    fn mailbox_names_are_quoted_for_the_wire() {
+        assert_eq!(quote_mailbox("Events &- Tickets").unwrap(), "\"Events &- Tickets\"");
+        assert_eq!(quote_mailbox(r#"a"b\c"#).unwrap(), r#""a\"b\\c""#);
+        assert!(quote_mailbox("bad\r\nname").is_none());
+    }
+
+    #[test]
+    fn gmail_all_mail_and_sent_only_copy_out() {
+        assert!(move_keeps_source("archive", "[Gmail]/All Mail"));
+        assert!(move_keeps_source("sent", "[Google Mail]/Sent Mail"));
+        assert!(!move_keeps_source("inbox", "INBOX"));
+        // Spam, Starred… are real labels a move takes off.
+        assert!(!move_keeps_source("[Gmail]/Spam", "[Gmail]/Spam"));
+        // Everyone else's Archive is a folder like any other.
+        assert!(!move_keeps_source("archive", "Archive"));
+    }
+
+    #[test]
+    fn a_settled_move_takes_its_new_uid() {
+        let mut emails = vec![msg(1, None, "Receipts", "moved", true)];
+        assert!(settle_move(&mut emails, &move_job(1, 40), &Ok(Some(900))));
+        assert_eq!((emails[0].folder.as_str(), emails[0].uid), ("Receipts", Some(900)));
+    }
+
+    #[test]
+    fn a_move_into_mail_already_held_drops_the_stand_in() {
+        // A sync got there first, or Gmail's All Mail already had it.
+        let mut emails = vec![msg(1, None, "Receipts", "moved", true), msg(2, Some(900), "Receipts", "moved", true)];
+        assert!(settle_move(&mut emails, &move_job(1, 40), &Ok(Some(900))));
+        assert_eq!(emails.iter().map(|e| e.id).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn a_move_with_no_uid_leaves_it_to_the_next_sync() {
+        let mut emails = vec![msg(1, None, "Receipts", "moved", true)];
+        assert!(settle_move(&mut emails, &move_job(1, 40), &Ok(None)));
+        assert!(emails.is_empty());
+    }
+
+    #[test]
+    fn a_failed_move_goes_back_with_its_old_uid() {
+        let mut emails = vec![msg(1, None, "Receipts", "moved", true)];
+        assert!(settle_move(&mut emails, &move_job(1, 40), &Err("NO".into())));
+        assert_eq!((emails[0].folder.as_str(), emails[0].uid), ("inbox", Some(40)));
+        // Unless a sync has meanwhile brought it back into the inbox.
+        let mut emails = vec![msg(1, None, "Receipts", "moved", true), msg(2, Some(40), "inbox", "moved", true)];
+        assert!(settle_move(&mut emails, &move_job(1, 40), &Err("NO".into())));
+        assert_eq!(emails.iter().map(|e| e.id).collect::<Vec<_>>(), [2]);
+    }
+
+    #[test]
+    fn settling_leaves_rows_it_did_not_move_alone() {
+        // Gone (deleted in flight), or a copy-only move that never moved it.
+        let mut emails = vec![msg(1, Some(40), "inbox", "kept", true)];
+        assert!(!settle_move(&mut emails, &move_job(1, 40), &Ok(Some(900))));
+        let job = MoveJob { copy_only: true, ..move_job(1, 40) };
+        assert!(!settle_move(&mut emails, &job, &Err("NO".into())));
+        assert_eq!(emails[0].uid, Some(40));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Talking IMAP: OAuth token refresh and the XOAUTH2 authenticator, pooled
-//! sessions, folder listing and sync, flags, deletes, attachment and HTML-part
+//! sessions, folder listing and sync, flags, deletes and moves, attachment and HTML-part
 //! fetches, and the fetch caps they share.
 //! Split out of main.rs on 2026-10-10.
 
@@ -1160,6 +1160,44 @@ pub(crate) fn merge_sync(prior: Vec<Email>, folders: &[FolderSync]) -> Vec<Email
     out
 }
 
+/// Put right the row a move took ahead of the server (`move_email`) once
+/// the server has answered. `true` when the rows changed.
+///
+/// - Given its new uid, the row takes it — unless the folder already holds
+///   that uid: a sync got there first, or the message was already in it
+///   (Gmail's All Mail holds the inbox too). Then the stand-in goes.
+/// - Moved with no uid reported, the stand-in goes, and the folder's next
+///   sync brings the message in under its own.
+/// - Failed, the row goes back where it was, with its old uid — or goes,
+///   if a sync has meanwhile downloaded it there again.
+pub(crate) fn settle_move(
+    emails: &mut Vec<Email>,
+    job: &MoveJob,
+    result: &Result<Option<u32>, String>,
+) -> bool {
+    if job.copy_only {
+        return false;
+    }
+    let Some(pos) = emails
+        .iter()
+        .position(|e| e.id == job.id && e.folder == job.to && e.uid.is_none())
+    else {
+        return false;
+    };
+    let held = |folder: &str, uid: u32| emails.iter().any(|e| e.folder == folder && e.uid == Some(uid));
+    match *result {
+        Ok(Some(uid)) if !held(&job.to, uid) => emails[pos].uid = Some(uid),
+        Err(_) if !held(&job.from, job.uid) => {
+            emails[pos].folder = job.from.clone();
+            emails[pos].uid = Some(job.uid);
+        }
+        _ => {
+            emails.remove(pos);
+        }
+    }
+    true
+}
+
 pub(crate) fn sync_imap(
     mut account: AccountInfo,
     known: std::collections::HashMap<String, std::collections::HashSet<u32>>,
@@ -1359,6 +1397,134 @@ pub(crate) fn delete_on_server(
         ));
         session.release();
     });
+}
+
+/// One message on its way between two of the account's server folders, as
+/// [`move_on_server`] hands it back: what [`settle_move`] needs to find the
+/// row the move took ahead of the server and put it right.
+#[derive(Debug, Clone)]
+pub(crate) struct MoveJob {
+    /// The account it belongs to: an answer landing after an account switch
+    /// settles that account's cache, not the rows on screen.
+    pub(crate) account: String,
+    /// The row's id. Until the answer it sits in `to` with no uid.
+    pub(crate) id: usize,
+    pub(crate) from: String,
+    pub(crate) to: String,
+    /// Its uid in `from` — it numbers nothing in `to`.
+    pub(crate) uid: u32,
+    /// Only file a copy in `to` ([`move_keeps_source`]): the row never left.
+    pub(crate) copy_only: bool,
+}
+
+/// Whether a move out of folder `tag` (mailbox `mailbox`) must leave the
+/// message where it is. Gmail's All Mail and Sent Mail are not folders but
+/// views over every message and every sent one, and expunging from All Mail
+/// deletes — it is the last label a message has (see `DeleteSelected`). Out
+/// of those a move can only add the destination's label: a copy.
+pub(crate) fn move_keeps_source(tag: &str, mailbox: &str) -> bool {
+    (tag == TAG_ARCHIVE || tag == TAG_SENT)
+        && (mailbox.starts_with("[Gmail]/") || mailbox.starts_with("[Google Mail]/"))
+}
+
+/// `name` as an IMAP quoted string. `uid_copy` sends its mailbox argument
+/// as given, which breaks on the first space ("Events &- Tickets"). `None`
+/// for a name carrying a line break, which no quoting can send.
+pub(crate) fn quote_mailbox(name: &str) -> Option<String> {
+    if name.contains(['\r', '\n']) {
+        return None;
+    }
+    Some(format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\"")))
+}
+
+/// The destination uid out of a `COPYUID` response code (RFC 4315 §3),
+/// `[COPYUID <uidvalidity> <source uids> <destination uids>]`, for a move or
+/// copy of one message.
+pub(crate) fn copyuid_dest(response: &[u8]) -> Option<u32> {
+    let text = String::from_utf8_lossy(response).to_ascii_uppercase();
+    let rest = &text[text.find("[COPYUID ")? + "[COPYUID ".len()..];
+    let mut fields = rest[..rest.find(']')?].split_ascii_whitespace();
+    let (_validity, _source) = (fields.next()?, fields.next()?);
+    fields.next()?.parse().ok()
+}
+
+/// Move a message between two of the account's server mailboxes, by UID,
+/// and report the uid it was given in the destination as
+/// [`AppMessage::MoveFinished`].
+///
+/// `UID MOVE` (RFC 6851) where the server has it — every major provider
+/// does — and with UIDPLUS it names the new uid in an untagged `COPYUID`.
+/// Without MOVE it is COPY, STORE \Deleted and EXPUNGE, as for a delete;
+/// that COPYUID rides the tagged OK, which the imap crate drops, so the uid
+/// comes back `None` and the destination's next sync brings the message in.
+/// A `copy_only` job stops at the COPY.
+pub(crate) fn move_on_server(
+    mut account: AccountInfo,
+    job: MoveJob,
+    from_mailbox: String,
+    to_mailbox: String,
+    sender: calloop::channel::Sender<AppMessage>,
+) {
+    std::thread::spawn(move || {
+        let report = |r: Result<Option<u32>, String>| {
+            if let Err(e) = &r {
+                eprintln!("cce-mail: move to {}: {}", to_mailbox, e);
+            }
+            let _ = sender.send(AppMessage::MoveFinished(job.clone(), r));
+        };
+        if is_mock_account(&account) {
+            // No server: the uid is the mock's own and stays good.
+            report(Ok(Some(job.uid)));
+            return;
+        }
+        // Same guard as start_sync: dialing out with an empty password gets
+        // the server's baffling "Empty username or password" instead of the
+        // actual problem — the keyring never yielded the credential.
+        if !account.is_oauth && account.password.is_empty() {
+            report(Err("No password — is the keyring unlocked?".to_string()));
+            return;
+        }
+        let Some(mut session) = open_imap_session(&mut account, &sender, false) else {
+            report(Err("IMAP connection failed".to_string()));
+            return;
+        };
+        let result = move_in_session(&mut session, &job, &from_mailbox, &to_mailbox);
+        session.release();
+        report(result);
+    });
+}
+
+fn move_in_session(
+    session: &mut ImapSession,
+    job: &MoveJob,
+    from: &str,
+    to: &str,
+) -> Result<Option<u32>, String> {
+    let to_quoted = quote_mailbox(to).ok_or_else(|| format!("Bad mailbox name {to:?}"))?;
+    // The uid only means anything inside its own mailbox.
+    session.select(from).map_err(|e| format!("Failed to select {from}: {e}"))?;
+    let uid = job.uid.to_string();
+    if job.copy_only {
+        session.uid_copy(&uid, &to_quoted).map_err(|e| format!("Copy failed: {e}"))?;
+        return Ok(None);
+    }
+    if session.capabilities().is_ok_and(|c| c.has_str("MOVE")) {
+        let response = session
+            .run_command_and_read_response(format!("UID MOVE {uid} {to_quoted}"))
+            .map_err(|e| format!("Move failed: {e}"))?;
+        return Ok(copyuid_dest(&response));
+    }
+    session.uid_copy(&uid, &to_quoted).map_err(|e| format!("Copy failed: {e}"))?;
+    // Copied but still here: an error, so the row goes back where the
+    // message still is. The copy the destination now holds comes in with
+    // its next sync.
+    session
+        .uid_store(&uid, "+FLAGS (\\Deleted)")
+        .map_err(|e| format!("Copied, but could not remove it from {from}: {e}"))?;
+    if session.uid_expunge(&uid).is_err() {
+        let _ = session.expunge();
+    }
+    Ok(None)
 }
 
 /// Write attachment bytes into ~/Downloads under a collision-safe name.
