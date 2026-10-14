@@ -5,7 +5,9 @@
 //!
 //! `cargo run --release -p cce-mail --example wpe_mail`
 
+// The app's module whole; an example uses only part of it.
 #[path = "../src/wpe/mod.rs"]
+#[allow(dead_code)]
 mod wpe;
 
 fn main() {

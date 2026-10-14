@@ -218,7 +218,7 @@ pub(crate) fn get_folders_path(email: &str) -> std::path::PathBuf {
     if !p.exists() {
         let _ = std::fs::create_dir_all(&p);
     }
-    let safe = email.replace('@', "_").replace('.', "_");
+    let safe = email.replace(['@', '.'], "_");
     p.join(format!("folders_{}.json", safe))
 }
 
@@ -236,6 +236,9 @@ pub(crate) fn save_folders(email: &str, folders: &[FolderInfo]) {
     }
 }
 
+/// `filtered_from`'s cache: (`rev`, folder, search) and the indices they gave.
+pub(crate) type FilterCache = std::cell::RefCell<Option<(u64, String, String, Vec<usize>)>>;
+
 /// The body of `ClearEmailApp::filtered_emails`, over the fields it reads, so
 /// a caller that also borrows other fields mutably can call it. The answer
 /// is cached under (`rev`, folder, search) — see `filter_cache`.
@@ -244,7 +247,7 @@ pub(crate) fn filtered_from<'a>(
     rev: u64,
     folder: &str,
     search: &str,
-    cache: &std::cell::RefCell<Option<(u64, String, String, Vec<usize>)>>,
+    cache: &FilterCache,
 ) -> Vec<&'a Email> {
     let mut cache = cache.borrow_mut();
     let fresh = cache.as_ref().is_some_and(|(r, f, q, _)| *r == rev && f == folder && q == search);
@@ -276,7 +279,7 @@ pub(crate) fn get_account_emails_path(email: &str) -> std::path::PathBuf {
     if !p.exists() {
         let _ = std::fs::create_dir_all(&p);
     }
-    let safe_email = email.replace('@', "_").replace('.', "_");
+    let safe_email = email.replace(['@', '.'], "_");
     p.join(format!("emails_{}.json", safe_email))
 }
 

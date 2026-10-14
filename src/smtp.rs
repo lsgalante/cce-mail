@@ -145,10 +145,7 @@ pub(crate) fn send_smtp(mut account: AccountInfo, mail: OutgoingMail, sender: ca
                 return;
             }
         };
-        let port = match account.smtp.split(':').nth(1).and_then(|p| p.parse::<u16>().ok()) {
-            Some(p) => p,
-            None => 465,
-        };
+        let port = account.smtp.split(':').nth(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(465);
 
         let _ = sender.send(AppMessage::Status("Sending SMTP mail...".to_string()));
 

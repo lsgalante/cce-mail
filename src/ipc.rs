@@ -630,7 +630,7 @@ mod tests {
             keyring_backed: false,
         };
         for json in [false, true] {
-            let out = render_accounts(&[acc.clone()], 0, json);
+            let out = render_accounts(std::slice::from_ref(&acc), 0, json);
             for secret in ["hunter2", "tok", "ref", "csec"] {
                 assert!(!out.contains(secret), "{out}");
             }

@@ -427,9 +427,6 @@ pub(crate) fn open_imap_session(
     Some(Imap { session, socket, key, expires })
 }
 
-/// Namespaces sent-folder ids away from inbox sequence numbers (both are
-/// fetch-time seq numbers; ids must stay unique across the merged list).
-
 /// What the pass on the wire covers: whose mail, and which folders. A second
 /// sync request is only worth queueing when it falls outside this.
 #[derive(Debug, Clone)]
@@ -1005,7 +1002,7 @@ pub(crate) fn resolve_folders(entries: Vec<(String, Option<&str>)>) -> Vec<Folde
         }
     }
 
-    custom.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    custom.sort_by_key(|a| a.label.to_lowercase());
     folders.extend(custom);
     folders
 }

@@ -9,7 +9,9 @@
 //!
 //! `cargo run --release -p cce-mail --example wpe_select`
 
+// The app's module whole; an example uses only part of it.
 #[path = "../src/wpe/mod.rs"]
+#[allow(dead_code)]
 mod wpe;
 
 use cce_ui::widget::MouseButton;
@@ -24,7 +26,7 @@ fn main() {
 
     let mut view = wpe::MailWebView::new((1200, 600));
     view.load_html(html);
-    let mut settle = |view: &mut wpe::MailWebView, n: u32| {
+    let settle = |view: &mut wpe::MailWebView, n: u32| {
         for _ in 0..n {
             view.pump();
             std::thread::sleep(std::time::Duration::from_millis(50));

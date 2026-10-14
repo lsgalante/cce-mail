@@ -220,7 +220,7 @@ pub(crate) struct RemoteAttachment {
 pub(crate) fn find_attachment_parts(bs: &imap_proto::types::BodyStructure<'_>) -> Vec<RemoteAttachment> {
     use imap_proto::types::BodyStructure as B;
 
-    fn param<'a>(params: &'a imap_proto::types::BodyParams<'_>, key: &str) -> Option<String> {
+    fn param(params: &imap_proto::types::BodyParams<'_>, key: &str) -> Option<String> {
         params.as_ref().and_then(|ps| {
             ps.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.to_string())
         })

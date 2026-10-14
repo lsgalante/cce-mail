@@ -73,6 +73,12 @@ const BLOCK_REMOTE_FILTER: &str = r#"[
 /// about than trusting it to notice changed source.
 const FILTER_ID: &str = "block-remote-v2";
 
+/// The `cid:` scheme's store: content-id → (mime type, decoded bytes).
+type InlineStore = Rc<RefCell<HashMap<String, (String, Vec<u8>)>>>;
+
+/// `decide-policy`'s handler, as `on_decide_policy` is declared.
+type DecidePolicy = unsafe extern "C" fn(*mut WebKitWebView, *mut WebKitPolicyDecision, WebKitPolicyDecisionType::Type, gpointer) -> gboolean;
+
 pub struct MailWebView {
     display: *mut WPEDisplay,
     toplevel: *mut WPEToplevel,
@@ -95,7 +101,7 @@ pub struct MailWebView {
     html: Option<CString>,
     /// The current message's inline attachments, served by the `cid:`
     /// scheme handler: content-id → (mime type, decoded bytes).
-    inline: Rc<RefCell<HashMap<String, (String, Vec<u8>)>>>,
+    inline: InlineStore,
     images_allowed: bool,
     /// Last uploaded frame in the image registry: (id, w px, h px).
     image: Option<(u32, u32, u32)>,
@@ -167,8 +173,7 @@ impl MailWebView {
             // The `cid:` scheme, served straight out of the inline store —
             // the same registration cce-browser uses for its `cce:` pages.
             // Process-wide and registered once, like the frame sink.
-            let inline: Rc<RefCell<HashMap<String, (String, Vec<u8>)>>> =
-                Rc::new(RefCell::new(HashMap::new()));
+            let inline: InlineStore = Rc::new(RefCell::new(HashMap::new()));
             let ctx = webkit_web_context_get_default();
             let scheme = cstr("cid");
             webkit_web_context_register_uri_scheme(
@@ -242,14 +247,8 @@ impl MailWebView {
             g_signal_connect_data(
                 wv as *mut _,
                 sig.as_ptr(),
-                Some(std::mem::transmute::<_, unsafe extern "C" fn()>(
-                    on_decide_policy
-                        as unsafe extern "C" fn(
-                            *mut WebKitWebView,
-                            *mut WebKitPolicyDecision,
-                            WebKitPolicyDecisionType::Type,
-                            gpointer,
-                        ) -> gboolean,
+                Some(std::mem::transmute::<DecidePolicy, unsafe extern "C" fn()>(
+                    on_decide_policy as DecidePolicy,
                 )),
                 Rc::into_raw(self.links.clone()) as gpointer,
                 Some(drop_links_ref),

@@ -283,7 +283,7 @@ struct ClearEmailApp {
     /// several times a frame, and each ask lowercased every message's sender,
     /// subject and BODY to match the search — the whole 13.5 MB cache per
     /// ask, per frame, while a query was typed.
-    filter_cache: std::cell::RefCell<Option<(u64, String, String, Vec<usize>)>>,
+    filter_cache: store::FilterCache,
 
     // Navigation / Sidebar (MenuBar retired): a mail-icon button on the
     // left whose click pops the app menu (New Message / Sync Now / Quit)
@@ -729,8 +729,8 @@ impl ClearEmailApp {
         // What the cache already holds, per server-backed folder. The worker
         // fetches only what is missing from this, which is what turns a sync
         // from "refetch the newest 50" into "download what I do not have".
-        let known: std::collections::HashMap<String, std::collections::HashSet<u32>>;
-        known = known_uids(&self.emails, &self.folders);
+        
+        let known: std::collections::HashMap<String, std::collections::HashSet<u32>> = known_uids(&self.emails, &self.folders);
 
         // The three the app always keeps current, plus whatever folder is on
         // show — a discovered folder is only fetched once you actually open
@@ -3513,14 +3513,14 @@ impl Application for ClearEmailApp {
             },
             cce_ui::layout::list_corner_radius(),
         );
-        for idx in 0..filtered.len() {
+        for (idx, email) in filtered.iter().enumerate() {
             if self.email_list.get_item_draw_y(idx, 0.0).is_some() {
                 cce_ui::widget::painter::paint_root_into(&self.ui_context, &self.ui_context[self.email_buttons[idx]], &mut *quads.pc);
 
                 // Unread: the `circle` glyph in blue, a 6px dot (the glyph's
                 // disc is three quarters of its box) centred where the
                 // square quad it replaced stood.
-                if !filtered[idx].read {
+                if !email.read {
                     if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
                         let side = 8.0;
                         let dot = cce_ui::scene::layout::Rect {
@@ -3798,8 +3798,8 @@ impl Application for ClearEmailApp {
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
         let mut changed = false;
-        let px = pos.x as f32;
-        let py = pos.y as f32;
+        let px = pos.x;
+        let py = pos.y;
 
         // An open card menu owns the pointer: it takes the hover highlight,
         // and nothing beneath it re-hovers under the covered rows.
@@ -3812,11 +3812,10 @@ impl Application for ClearEmailApp {
         }
         // Active scrollbar-thumb drag tracks the pointer — before the
         // ui_context borrow (the sb helper takes &mut self).
-        if !self.compose_open && self.body_sb_dragging {
-            if self.body_sb_drag_to(py) {
+        if !self.compose_open && self.body_sb_dragging
+            && self.body_sb_drag_to(py) {
                 changed = true;
             }
-        }
 
         // Detail-bar hover bookkeeping: hover only SUSTAINS a raised bar (the
         // hysteresis contract), so raw strip geometry is the right input.
@@ -3876,9 +3875,8 @@ impl Application for ClearEmailApp {
             self.detail_hovered = px > separator_x;
 
             for &btn in &self.email_buttons {
-                if ctx[btn].rect().0 > -9000.0 {
-                    if ctx.propagate_event(&mv, btn.id()) { changed = true; }
-                }
+                if ctx[btn].rect().0 > -9000.0
+                    && ctx.propagate_event(&mv, btn.id()) { changed = true; }
             }
 
             #[cfg(feature = "wpe")]
@@ -3907,8 +3905,8 @@ impl Application for ClearEmailApp {
     fn handle_mouse_input(&mut self, button: MouseButton, state: ElementState, pos: LogicalPosition, needs_rebuild: &mut bool) -> Option<Self::Message> {
         let mut changed = false;
         let mut msg_out = None;
-        let px = pos.x as f32;
-        let py = pos.y as f32;
+        let px = pos.x;
+        let py = pos.y;
         let ev = cce_ui::widget::Event::MouseButton { button, state, x: px, y: py, local_x: px, local_y: py };
 
         // An open card menu swallows the press before any widget routing.
@@ -4229,8 +4227,8 @@ impl Application for ClearEmailApp {
 
     fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, needs_rebuild: &mut bool) {
         let mut changed = false;
-        let px = pos.x as f32;
-        let py = pos.y as f32;
+        let px = pos.x;
+        let py = pos.y;
 
         // Over an open menu the wheel is the menu's: a menu cut short to fit
         // (a long Move To list) scrolls its rows, and a side swipe turns it
@@ -4250,19 +4248,17 @@ impl Application for ClearEmailApp {
         }
 
         let separator_x = self.split_geom().1;
-        if !self.compose_open {
-            if px < separator_x {
-                if self.email_list.wheel(delta, px, py) {
+        if !self.compose_open
+            && px < separator_x
+                && self.email_list.wheel(delta, px, py) {
                     changed = true;
                 }
-            }
-        }
 
         // Detail-pane body scroll — or, in the HTML view, the page's own
         // scrolling: the wheel goes to the engine (winit-signed device px,
         // the webview's convention) and WebKit moves the document.
-        if !self.compose_open && self.selected_email_id.is_some() {
-            if px > separator_x {
+        if !self.compose_open && self.selected_email_id.is_some()
+            && px > separator_x {
                 #[cfg(feature = "wpe")]
                 let html_wheel = self.html_on_show() && self.in_webview(px, py);
                 #[cfg(not(feature = "wpe"))]
@@ -4296,7 +4292,6 @@ impl Application for ClearEmailApp {
                     }
                 }
             }
-        }
 
         if changed {
             *needs_rebuild = true;
@@ -4429,9 +4424,8 @@ impl Application for ClearEmailApp {
                 if ctx.propagate_event(&kev, self.compose_bcc.id()) { handled = true; }
             } else if ctx[self.compose_subject].editing {
                 if ctx.propagate_event(&kev, self.compose_subject.id()) { handled = true; }
-            } else if ctx[self.compose_body].editing {
-                if ctx.propagate_event(&kev, self.compose_body.id()) { handled = true; }
-            }
+            } else if ctx[self.compose_body].editing
+                && ctx.propagate_event(&kev, self.compose_body.id()) { handled = true; }
 
             // Escape closes compose dialog
             if !handled && event.state == ElementState::Pressed && event.logical_key == Key::Named(cce_ui::widget::NamedKey::Escape) {
@@ -4552,11 +4546,10 @@ impl Application for ClearEmailApp {
             }
 
             // Its commit (Enter) is a SearchChanged, drained below.
-            if !handled && ctx[self.search_box].editing {
-                if ctx.propagate_event(&kev, self.search_box.id()) {
+            if !handled && ctx[self.search_box].editing
+                && ctx.propagate_event(&kev, self.search_box.id()) {
                     handled = true;
                 }
-            }
 
         }
 
@@ -5056,7 +5049,7 @@ mod tests {
                 location: None,
             },
             other: BodyContentSinglePart {
-                id: Some(cid.into()),
+                id: Some(cid),
                 md5: None,
                 description: None,
                 transfer_encoding: ContentEncoding::Base64,
@@ -5563,10 +5556,8 @@ Subject: Lunch on Friday?\r\nDate: Mon, 13 Oct 2025 09:30:00 -0700\r\n\r\n";
     fn discovered_folders_resolve_to_their_own_mailbox() {
         // A custom folder's uid only means anything in its own mailbox, so
         // the tag must never fall back to INBOX the way the old fixed map did.
-        let folders = vec![
-            FolderInfo { tag: TAG_INBOX.into(), label: "Inbox".into(), mailbox: "INBOX".into() },
-            FolderInfo { tag: "Finance".into(), label: "Finance".into(), mailbox: "Finance".into() },
-        ];
+        let folders = [FolderInfo { tag: TAG_INBOX.into(), label: "Inbox".into(), mailbox: "INBOX".into() },
+            FolderInfo { tag: "Finance".into(), label: "Finance".into(), mailbox: "Finance".into() }];
         let lookup = |tag: &str| {
             folders
                 .iter()
