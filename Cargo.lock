@@ -404,12 +404,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "cce-core"
+version = "0.1.0"
+source = "git+https://github.com/lsgalante/cce-core.git?rev=6333e4da15b5daa241919df1b057c94e52246391#6333e4da15b5daa241919df1b057c94e52246391"
+dependencies = [
+ "fluent-bundle",
+ "kdl",
+ "libc",
+ "log",
+ "serde_json",
+ "unic-langid",
+ "web-time",
+]
+
+[[package]]
 name = "cce-mail"
 version = "0.1.0"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
- "cce-ui 0.1.0 (git+https://github.com/lsgalante/cce-ui.git?rev=3bf5ec56d3c805c6fae308206427d194b19a901f)",
+ "cce-ui 0.1.0 (git+https://github.com/lsgalante/cce-ui.git?rev=87e8287f7240d46ba3340a6c2fe71d223d7f6bd1)",
  "cce-wpe",
  "imap",
  "imap-proto",
@@ -430,7 +444,7 @@ dependencies = [
 [[package]]
 name = "cce-ui"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-ui.git?rev=3bf5ec56d3c805c6fae308206427d194b19a901f#3bf5ec56d3c805c6fae308206427d194b19a901f"
+source = "git+https://github.com/lsgalante/cce-ui.git?rev=87e8287f7240d46ba3340a6c2fe71d223d7f6bd1#87e8287f7240d46ba3340a6c2fe71d223d7f6bd1"
 dependencies = [
  "accesskit",
  "ash",
@@ -438,7 +452,7 @@ dependencies = [
  "bytemuck",
  "calloop",
  "calloop-wayland-source",
- "cce-core",
+ "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=6333e4da15b5daa241919df1b057c94e52246391)",
  "chrono",
  "cosmic-text",
  "cursor-icon",
@@ -483,7 +497,7 @@ dependencies = [
  "bytemuck",
  "calloop",
  "calloop-wayland-source",
- "cce-core",
+ "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=2c8855460e2cbe4d5e90d095daebc4ad30c94b80)",
  "chrono",
  "cosmic-text",
  "cursor-icon",
