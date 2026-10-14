@@ -3622,26 +3622,16 @@ impl Application for ClearEmailApp {
                             use cce_ui::scene::layout::Rect;
                             let rect = Rect { x: px, y: py, width: pw, height: ph };
                             let r = cce_ui::layout::list_corner_radius();
-                            // White ground, at the plate's radius: frames lag
-                            // a resize by a beat, and mail HTML assumes a
-                            // white canvas.
-                            quads.pc.rounded_rect(rect, r, (true, true, true, true), [1.0, 1.0, 1.0, 1.0]);
-                            // The page spans the plate rim to rim, so it has
-                            // to stop at the plate's corners. An image prim
-                            // takes the scissor but not a rounded clip (the
-                            // toolkit's image pass has no rrect term), so the
-                            // page goes down under three scissors — the full-
-                            // height middle and the two side strips — and the
-                            // four r-by-r corner squares are the ground's
-                            // rounded corners. What that costs is the page's
-                            // own corner pixels, which are its margin.
-                            for clip in [
-                                Rect { x: px + r, y: py, width: pw - 2.0 * r, height: ph },
-                                Rect { x: px, y: py + r, width: r, height: ph - 2.0 * r },
-                                Rect { x: px + pw - r, y: py + r, width: r, height: ph - 2.0 * r },
-                            ] {
-                                quads.pc.clip(clip, |pc| pc.image(img_id, rect, 1.0));
-                            }
+                            // The page spans the plate rim to rim, so it is
+                            // cut at the plate's rounded corners — over a
+                            // white ground (frames lag a resize by a beat, and
+                            // mail HTML assumes a white canvas) cut by the
+                            // same clip, so no edge of the ground shows past
+                            // the page's.
+                            quads.pc.clip_rounded(rect, r, |pc| {
+                                pc.quad(rect, [1.0, 1.0, 1.0, 1.0]);
+                                pc.image(img_id, rect, 1.0);
+                            });
                         } else {
 
                         // Measure with the exact shaping the renderer will use, so the
