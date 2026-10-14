@@ -1,6 +1,6 @@
 /// Embedded WPE WebKit for the HTML mail view — see src/wpe/mod.rs.
-#[cfg(feature = "wpe")]
 mod ipc;
+#[cfg(feature = "wpe")]
 mod wpe;
 mod accounts_file;
 mod imap_client;
@@ -18,7 +18,9 @@ use cce_ui::process::spawn_detached;
 use cce_ui::widget::Handle;
 use cce_ui::widget::ScrollRegion;
 use cce_ui::cosmic_text::FontSystem;
-use cce_ui::engine::{Application, CursorIcon, EngineState, LogicalPosition, LogicalSize, WindowSettings};
+use cce_ui::engine::{Application, CursorIcon, LogicalPosition, LogicalSize, WindowSettings};
+#[cfg(feature = "wpe")]
+use cce_ui::engine::EngineState;
 use cce_ui::widget::{
     MouseButton, ElementState, MouseScrollDelta, KeyEvent, WidgetHost,
     TextBox, Button, TextLabel, Key, Dropdown, Bounds, ScrollMotion, LINE_PX, WidgetEvent
@@ -3227,14 +3229,14 @@ impl Application for ClearEmailApp {
     /// Not on the first renderer: nothing has been uploaded yet, and the
     /// webview has not rendered a frame.
     fn renderer_init(&mut self, _renderer: &mut cce_ui::vk::VkRenderer) {
-        if !std::mem::replace(&mut self.seen_renderer, true) {
-            return;
-        }
+        let replaced = std::mem::replace(&mut self.seen_renderer, true);
         #[cfg(feature = "wpe")]
-        if self.webview.reupload_frame() {
+        if replaced && self.webview.reupload_frame() {
             eprintln!("cce-mail: renderer replaced; re-uploaded the rendered message");
             self.needs_rebuild = true;
         }
+        #[cfg(not(feature = "wpe"))]
+        let _ = replaced;
     }
 
     fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<cce_ui::scene::paint::DisplayList> {
