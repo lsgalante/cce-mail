@@ -4703,20 +4703,28 @@ mod tests {
         assert_eq!(m.subject, "100%%2");
     }
 
+    /// Body parameters as plain `(key, value)` pairs.
+    type Pairs<'a> = Option<Vec<(&'a str, &'a str)>>;
+
+    /// Body parameters as imap-proto holds them (`Cow`s), from plain pairs.
+    fn body_params(pairs: Pairs<'_>) -> imap_proto::types::BodyParams<'_> {
+        pairs.map(|v| v.into_iter().map(|(k, v)| (k.into(), v.into())).collect())
+    }
+
     fn attach_part<'a>(
         ty: &'a str,
         subtype: &'a str,
-        ty_params: imap_proto::types::BodyParams<'a>,
-        disposition: Option<(&'a str, imap_proto::types::BodyParams<'a>)>,
+        ty_params: Pairs<'a>,
+        disposition: Option<(&'a str, Pairs<'a>)>,
         encoding: imap_proto::types::ContentEncoding<'a>,
         octets: u32,
     ) -> imap_proto::types::BodyStructure<'a> {
         use imap_proto::types::*;
         BodyStructure::Basic {
             common: BodyContentCommon {
-                ty: ContentType { ty, subtype, params: ty_params },
+                ty: ContentType { ty: ty.into(), subtype: subtype.into(), params: body_params(ty_params) },
                 disposition: disposition
-                    .map(|(t, params)| ContentDisposition { ty: t, params }),
+                    .map(|(t, params)| ContentDisposition { ty: t.into(), params: body_params(params) }),
                 language: None,
                 location: None,
             },
@@ -4738,7 +4746,7 @@ mod tests {
         // image w/ only a Content-Type name, csv w/ disposition but NO name].
         let text = BodyStructure::Text {
             common: BodyContentCommon {
-                ty: ContentType { ty: "TEXT", subtype: "PLAIN", params: None },
+                ty: ContentType { ty: "TEXT".into(), subtype: "PLAIN".into(), params: None },
                 disposition: None,
                 language: None,
                 location: None,
@@ -4779,7 +4787,7 @@ mod tests {
         );
         let root = BodyStructure::Multipart {
             common: BodyContentCommon {
-                ty: ContentType { ty: "MULTIPART", subtype: "MIXED", params: None },
+                ty: ContentType { ty: "MULTIPART".into(), subtype: "MIXED".into(), params: None },
                 disposition: None,
                 language: None,
                 location: None,
@@ -4919,9 +4927,9 @@ mod tests {
         BodyStructure::Text {
             common: BodyContentCommon {
                 ty: ContentType {
-                    ty: "TEXT",
-                    subtype,
-                    params: charset.map(|kv| vec![kv]),
+                    ty: "TEXT".into(),
+                    subtype: subtype.into(),
+                    params: charset.map(|(k, v)| vec![(k.into(), v.into())]),
                 },
                 disposition: None,
                 language: None,
@@ -4943,8 +4951,8 @@ mod tests {
         BodyStructure::Multipart {
             common: BodyContentCommon {
                 ty: ContentType {
-                    ty: "MULTIPART",
-                    subtype,
+                    ty: "MULTIPART".into(),
+                    subtype: subtype.into(),
                     params: None,
                 },
                 disposition: None,
@@ -4960,8 +4968,8 @@ mod tests {
         BodyStructure::Basic {
             common: BodyContentCommon {
                 ty: ContentType {
-                    ty,
-                    subtype,
+                    ty: ty.into(),
+                    subtype: subtype.into(),
                     params: None,
                 },
                 disposition: None,
@@ -5043,13 +5051,13 @@ mod tests {
     fn cid_part<'a>(ty: &'a str, subtype: &'a str, cid: &'a str) -> BodyStructure<'a> {
         BodyStructure::Basic {
             common: BodyContentCommon {
-                ty: ContentType { ty, subtype, params: None },
+                ty: ContentType { ty: ty.into(), subtype: subtype.into(), params: None },
                 disposition: None,
                 language: None,
                 location: None,
             },
             other: BodyContentSinglePart {
-                id: Some(cid),
+                id: Some(cid.into()),
                 md5: None,
                 description: None,
                 transfer_encoding: ContentEncoding::Base64,
@@ -5520,6 +5528,20 @@ Subject: Lunch on Friday?\r\nDate: Mon, 13 Oct 2025 09:30:00 -0700\r\n\r\n";
             let archive = f.iter().find(|f| f.tag == TAG_ARCHIVE).unwrap();
             assert_eq!(archive.mailbox, "Everything");
         }
+    }
+
+    /// A LIST line through imap-proto's own parser: the special-use flags
+    /// come out as their variants in any case; `\Noselect` and unknown
+    /// flags give none. Since imap-proto 0.16 a name match on an extension
+    /// flag would see none of them.
+    #[test]
+    fn list_attributes_map_to_special_use_in_any_case() {
+        use imap_proto::{MailboxDatum, Response};
+        let line = b"* LIST (\\HasNoChildren \\sent \\TRASH \\Noselect \\Drafts) \"/\" \"Sent Items\"\r\n";
+        let (_, resp) = imap_proto::parser::parse_response(line).unwrap();
+        let Response::MailboxData(MailboxDatum::List { name_attributes, .. }) = resp else { panic!("not a LIST: {resp:?}") };
+        let kinds: Vec<_> = name_attributes.iter().filter_map(special_use).collect();
+        assert_eq!(kinds, ["sent", "trash", "drafts"]);
     }
 
     #[test]

@@ -22,12 +22,12 @@ xkeysym = "0.2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-imap = { version = "2.4", features = ["native-tls"] }
+imap = { version = "3.0.0-alpha.15", default-features = false, features = ["native-tls"] }
 lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls"] }
 native-tls = "0.2"
 reqwest = { version = "0.12", features = ["json"] }
 mail-parser = "0.11.5"
-imap-proto = "0.10"
+imap-proto = "0.16"
 # Only used by the `wpe` backend, to hold GLib's changing pollfd set in one
 # epoll fd that calloop can watch (same bridge as cce-browser's).
 rustix = { version = "0.38", features = ["event"], optional = true }

@@ -4,6 +4,7 @@
 //! Split out of main.rs on 2026-10-10.
 
 use crate::*;
+use imap_proto::NameAttribute;
 
 /// Newest-N window fetched per sync. Only headers, structure, and the chosen
 /// text part come down the wire, so attachments never inflate a sync.
@@ -254,10 +255,10 @@ pub(crate) fn session_key(account: &AccountInfo) -> String {
 impl Imap {
     /// Done with this session: keep it for the next job on the account,
     /// unless enough are kept already.
-    fn release(self) {
+    fn release(mut self) {
         // Untagged responses the jobs never read (EXISTS, FETCH flag
-        // updates) queue on an unbounded channel for the session's life.
-        while self.session.unsolicited_responses.try_recv().is_ok() {}
+        // updates) queue in the session for its life.
+        drop(self.session.take_all_unsolicited());
         let mut pool = IDLE_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
         let now = unix_now();
         let stale: Vec<IdleSession> = {
@@ -919,23 +920,10 @@ pub(crate) fn list_folders(
         let mut noselect = false;
         let mut special: Option<&'static str> = None;
         for a in n.attributes() {
-            match a {
-                imap::types::NameAttribute::NoSelect => noselect = true,
-                imap::types::NameAttribute::Custom(c) => {
-                    let c = c.as_ref();
-                    for (flag, kind) in [
-                        ("\\All", "all"),
-                        ("\\Archive", "archive"),
-                        ("\\Sent", "sent"),
-                        ("\\Drafts", "drafts"),
-                        ("\\Trash", "trash"),
-                    ] {
-                        if c.eq_ignore_ascii_case(flag) {
-                            special = Some(kind);
-                        }
-                    }
-                }
-                _ => {}
+            if matches!(a, NameAttribute::NoSelect) {
+                noselect = true;
+            } else if let Some(kind) = special_use(a) {
+                special = Some(kind);
             }
         }
         if !noselect {
@@ -943,6 +931,20 @@ pub(crate) fn list_folders(
         }
     }
     Some(resolve_folders(entries))
+}
+
+/// A LIST attribute's RFC 6154 special use, as `resolve_folders` names it.
+/// imap-proto parses these into their own variants (case-insensitively);
+/// before 0.16 they arrived as `Custom("\\Sent")` and were matched by name.
+pub(crate) fn special_use(a: &NameAttribute) -> Option<&'static str> {
+    match a {
+        NameAttribute::All => Some("all"),
+        NameAttribute::Archive => Some("archive"),
+        NameAttribute::Sent => Some("sent"),
+        NameAttribute::Drafts => Some("drafts"),
+        NameAttribute::Trash => Some("trash"),
+        _ => None,
+    }
 }
 
 /// Fold the LIST reply into the default folder set: each entry is a selectable
@@ -1557,9 +1559,7 @@ fn trash_mailboxes(session: &mut ImapSession) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Ok(names) = session.list(Some(""), Some("*")) {
         for n in names.iter() {
-            let flagged = n.attributes().iter().any(|a| {
-                matches!(a, imap::types::NameAttribute::Custom(c) if c.eq_ignore_ascii_case("\\Trash"))
-            });
+            let flagged = n.attributes().iter().any(|a| matches!(a, NameAttribute::Trash));
             if flagged {
                 out.push(n.name().to_string());
             }
