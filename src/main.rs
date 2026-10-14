@@ -3459,9 +3459,9 @@ impl Application for ClearEmailApp {
         // advertises it now that nothing is painted there. Both are drawn
         // whether or not a message is on show, so the layout does not jump
         // on the first selection.
-        // Nothing here reaches the plates' corners (the body carries its own
-        // text bounds), so this needs no rounded clip the way the list — whose
-        // cards span its full width — does.
+        // The text body carries its own bounds and stays clear of the
+        // corners; the HTML view spans the preview plate rim to rim and
+        // cuts its own corners (see the detail view below).
         for (px, py, pw, ph) in [self.detail_header_geom(), self.detail_pane_geom()] {
             quads.pc.rounded_rect(
                 cce_ui::scene::layout::Rect { x: px, y: py, width: pw, height: ph },
@@ -3596,19 +3596,19 @@ impl Application for ClearEmailApp {
                         let body_w = self.detail_content_w();
                         let line_h = 12.0 * 1.4; // get_text_buffer_laid_out's placed-text metric
 
-                        // The rendered HTML view: one image quad where the
-                        // text body would go. WebKit owns scrolling inside
-                        // the page, so the app's body scroll state is
-                        // disarmed while this is up.
+                        // The rendered HTML view: one image filling the
+                        // whole preview plate, rim to rim — the page brings
+                        // its own margins, so the plate padding the text
+                        // body sits in would only frame it in a second
+                        // border. WebKit owns scrolling inside the page, so
+                        // the app's body scroll state is disarmed while
+                        // this is up.
+                        let (px, py, pw, ph) = self.detail_pane_geom();
                         #[cfg(feature = "wpe")]
                         let html_img = if self.html_active() {
                             let s = self.scale_factor as f32;
-                            self.webview.resize(
-                                (body_w * s) as u32,
-                                (body_h * s) as u32,
-                                s,
-                            );
-                            self.webview_rect = (detail_x, body_y, body_w, body_h);
+                            self.webview.resize((pw * s) as u32, (ph * s) as u32, s);
+                            self.webview_rect = (px, py, pw, ph);
                             self.webview.image()
                         } else {
                             None
@@ -3619,19 +3619,29 @@ impl Application for ClearEmailApp {
                         if let Some((img_id, ..)) = html_img {
                             self.body_content_h = 0.0;
                             self.body_scroll = 0.0;
-                            // White ground: frames lag a resize by a beat,
-                            // and mail HTML assumes a white canvas.
-                            quads.push((detail_x, body_y, body_w, body_h, [1.0, 1.0, 1.0, 1.0]));
-                            quads.pc.image(
-                                img_id,
-                                cce_ui::scene::layout::Rect {
-                                    x: detail_x,
-                                    y: body_y,
-                                    width: body_w,
-                                    height: body_h,
-                                },
-                                1.0,
-                            );
+                            use cce_ui::scene::layout::Rect;
+                            let rect = Rect { x: px, y: py, width: pw, height: ph };
+                            let r = cce_ui::layout::list_corner_radius();
+                            // White ground, at the plate's radius: frames lag
+                            // a resize by a beat, and mail HTML assumes a
+                            // white canvas.
+                            quads.pc.rounded_rect(rect, r, (true, true, true, true), [1.0, 1.0, 1.0, 1.0]);
+                            // The page spans the plate rim to rim, so it has
+                            // to stop at the plate's corners. An image prim
+                            // takes the scissor but not a rounded clip (the
+                            // toolkit's image pass has no rrect term), so the
+                            // page goes down under three scissors — the full-
+                            // height middle and the two side strips — and the
+                            // four r-by-r corner squares are the ground's
+                            // rounded corners. What that costs is the page's
+                            // own corner pixels, which are its margin.
+                            for clip in [
+                                Rect { x: px + r, y: py, width: pw - 2.0 * r, height: ph },
+                                Rect { x: px, y: py + r, width: r, height: ph - 2.0 * r },
+                                Rect { x: px + pw - r, y: py + r, width: r, height: ph - 2.0 * r },
+                            ] {
+                                quads.pc.clip(clip, |pc| pc.image(img_id, rect, 1.0));
+                            }
                         } else {
 
                         // Measure with the exact shaping the renderer will use, so the
