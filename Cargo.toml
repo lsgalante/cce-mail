@@ -13,7 +13,7 @@ wpe = ["dep:rustix", "dep:cce-wpe"]
 
 [dependencies]
 keyring = { version = "3", features = ["sync-secret-service"] }
-cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "a73d4efaaaf2f0b1559dc5664a5cd58e11b8c222", features = ["file_dialog"] }
+cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "3bf5ec56d3c805c6fae308206427d194b19a901f", features = ["file_dialog"] }
 smithay-client-toolkit = "0.19.2"
 calloop = "0.13.0"
 calloop-wayland-source = "0.3.0"
@@ -38,5 +38,10 @@ cce-wpe = { git = "https://github.com/lsgalante/cce-wpe.git", rev = "543c2b6e750
 # Headless smoke test for the embedded webview (no Wayland session needed).
 [[example]]
 name = "wpe_mail"
+required-features = ["wpe"]
+
+# Headless check that a press-drag-release over a message selects text.
+[[example]]
+name = "wpe_select"
 required-features = ["wpe"]
 
