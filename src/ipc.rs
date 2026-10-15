@@ -44,13 +44,15 @@ cce-mail ctl <command> [--json]
   status                        account, folder, counts, sync state
   accounts                      the configured accounts
   folders                       the selected account's folders, with counts
-  list [folder] [--limit N] [--unread]
+  list [folder] [--limit N] [--unread] [--flagged]
                                 messages in a folder (default: the open one), newest first
   search <words…> [--limit N]   messages whose from/subject/body contain the words, every folder
   get <id>                      one message: headers and the cached text body (a preview, up to 1200 chars)
   open <id>                     show a message in the window (marks it read, like a click)
   mark-read <id>                set the read flag; mirrored to the server for inbox mail
   mark-unread <id>
+  flag <id>                     flag a message for follow-up; mirrored to the server
+  unflag <id>
   move <id> <folder>            file a message in another server folder, by tag or label
   restore <id>                  put a message in Trash back where it was deleted from
   select-account <email>
@@ -59,7 +61,8 @@ cce-mail ctl <command> [--json]
   compose [mailto:…]            open the compose dialog, prefilled from the URL if given
   quit
 
-Text replies are tab-separated rows (list/search: id, read state, folder,
+Text replies are tab-separated rows (list/search: id, read state (with
+\" flagged\" when flagged), folder,
 date, from, subject); --json returns JSON instead. Message ids are the app's
 own and can change between syncs — take them from a fresh list.";
 
@@ -178,11 +181,12 @@ pub enum Command {
     Status,
     Accounts,
     Folders,
-    List { folder: Option<String>, limit: usize, unread: bool },
+    List { folder: Option<String>, limit: usize, unread: bool, flagged: bool },
     Search { query: String, limit: usize },
     Get(usize),
     Open(usize),
     MarkRead(usize, bool),
+    Flag(usize, bool),
     Move(usize, String),
     Restore(usize),
     SelectAccount(String),
@@ -199,11 +203,12 @@ pub struct Parsed {
     pub json: bool,
 }
 
-/// Parse one command line. Flags (`--json`, `--unread`, `--limit N`) may
+/// Parse one command line. Flags (`--json`, `--unread`, `--flagged`, `--limit N`) may
 /// sit anywhere; the remaining words are the command and its arguments.
 pub fn parse(line: &str) -> Result<Parsed, String> {
     let mut json = false;
     let mut unread = false;
+    let mut flagged = false;
     let mut limit = DEFAULT_LIMIT;
     let mut words: Vec<&str> = Vec::new();
     let mut it = line.split_whitespace();
@@ -211,6 +216,7 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
         match w {
             "--json" => json = true,
             "--unread" => unread = true,
+            "--flagged" => flagged = true,
             "--limit" | "-n" => {
                 let v = it.next().ok_or("--limit needs a number")?;
                 limit = v.parse().map_err(|_| format!("bad limit {v:?}"))?;
@@ -247,6 +253,7 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
             folder: (!rest.is_empty()).then(|| rest.join(" ")),
             limit,
             unread,
+            flagged,
         },
         "search" => {
             if rest.is_empty() {
@@ -258,6 +265,8 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
         "open" => Command::Open(one_id(rest)?),
         "mark-read" => Command::MarkRead(one_id(rest)?, true),
         "mark-unread" => Command::MarkRead(one_id(rest)?, false),
+        "flag" => Command::Flag(one_id(rest)?, true),
+        "unflag" => Command::Flag(one_id(rest)?, false),
         "restore" => Command::Restore(one_id(rest)?),
         "move" => match rest {
             [id, folder @ ..] if !folder.is_empty() => Command::Move(
@@ -330,6 +339,7 @@ fn row_json(e: &Email) -> serde_json::Value {
         "id": e.id,
         "folder": e.folder,
         "read": e.read,
+        "flagged": e.flagged,
         "date": e.date,
         "ts": e.ts,
         "from": e.from,
@@ -347,9 +357,10 @@ pub fn render_rows(rows: &[&Email], json: bool) -> String {
     rows.iter()
         .map(|e| {
             format!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}{}\t{}\t{}\t{}\t{}",
                 e.id,
                 if e.read { "read" } else { "unread" },
+                if e.flagged { " flagged" } else { "" },
                 cell(&e.folder),
                 cell(&e.date),
                 cell(&e.from),
@@ -379,6 +390,9 @@ pub fn render_email(e: &Email, json: bool) -> String {
     out.push_str(&format!("date: {}\n", cell(&e.date)));
     out.push_str(&format!("subject: {}\n", cell(&e.subject)));
     out.push_str(&format!("read: {}\n", if e.read { "yes" } else { "no" }));
+    if e.flagged {
+        out.push_str("flagged: yes\n");
+    }
     let names = attachment_names(e);
     if !names.is_empty() {
         out.push_str(&format!("attachments: {}\n", cell(&names.join(", "))));
@@ -522,16 +536,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn flag_commands_parse() {
+        assert_eq!(parse("flag 7").unwrap().command, Command::Flag(7, true));
+        assert_eq!(parse("unflag 7").unwrap().command, Command::Flag(7, false));
+        assert!(parse("flag").is_err() && parse("flag x").is_err());
+        assert_eq!(
+            parse("list --flagged").unwrap().command,
+            Command::List { folder: None, limit: DEFAULT_LIMIT, unread: false, flagged: true }
+        );
+    }
+
+    #[test]
     fn commands_parse() {
         assert_eq!(parse("help").unwrap().command, Command::Help);
         assert_eq!(
             parse("list").unwrap().command,
-            Command::List { folder: None, limit: DEFAULT_LIMIT, unread: false }
+            Command::List { folder: None, limit: DEFAULT_LIMIT, unread: false, flagged: false }
         );
         assert_eq!(
             parse("--json list All Mail --limit 5 --unread").unwrap(),
             Parsed {
-                command: Command::List { folder: Some("All Mail".into()), limit: 5, unread: true },
+                command: Command::List { folder: Some("All Mail".into()), limit: 5, unread: true, flagged: false },
                 json: true
             }
         );
@@ -580,6 +605,7 @@ mod tests {
             body: "hello\nworld".into(),
             date: "2026-09-24".into(),
             read,
+            flagged: false,
             folder: "inbox".into(),
             cc: String::new(),
             bcc: String::new(),

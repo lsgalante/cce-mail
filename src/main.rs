@@ -65,6 +65,10 @@ struct Email {
     body: String,
     date: String,
     read: bool,
+    /// Flagged for follow-up: IMAP `\Flagged` (a star in Gmail), mirrored
+    /// both ways for mail with a server copy.
+    #[serde(default)]
+    flagged: bool,
     folder: String, // "inbox", "sent", "drafts", "trash"
     /// Cc line of locally-composed mail (sent copies and drafts); fetched
     /// mail leaves it empty. Defaults keep pre-existing caches loading.
@@ -127,6 +131,8 @@ enum AppMessage {
     Reply,
     DeleteSelected,
     ToggleUnread,
+    /// Flag or unflag the selected message (the card menu's row).
+    ToggleFlag,
     /// A row of a card menu's Move To page: file email `0` in folder tag `1`.
     MoveTo(usize, String),
     /// A server move has answered: the uid the message was given in its new
@@ -481,6 +487,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             body: "Welcome to the Clear Computing Environment (CCE) email client!\n\nThis application is built entirely using the cce-ui Rust framework, running on top of Wayland and wgpu. It provides a premium, responsive dark slate interface.\n\nEnjoy the clean lines and micro-animations!\n\nBest,\nSystem Daemon".to_string(),
             date: "12:15 PM".to_string(),
             read: false,
+            flagged: false,
             folder: "inbox".to_string(),
             uid: None,
             ts: None,
@@ -498,6 +505,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             body: "Hi Lucas,\n\nWe have finalized the core Slate Dark styling color values for CCE application builders:\n- Window Background: [0.05, 0.05, 0.07, 1.0] (deep slate blue)\n- Sidebar Background: [0.08, 0.08, 0.12, 1.0]\n- Selection Highlight: [0.20, 0.45, 0.85, 0.50] (high contrast premium blue)\n- Text Bright: [0.88, 0.88, 0.92, 1.0]\n- Text Muted: [0.51, 0.51, 0.54, 1.0]\n\nPlease align all interface panels and layouts to use these values.\n\nThanks,\nDesign Team".to_string(),
             date: "Yesterday".to_string(),
             read: false,
+            flagged: false,
             folder: "inbox".to_string(),
             uid: None,
             ts: None,
@@ -515,6 +523,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             body: "Repository: lsgalante/cce-mail\nBranch: main\nCommit: da8cf20fcb2c993c1c048ced4020\nStatus: SUCCESS\n\nAll unit tests passed. Binary compiled in 48.2s.\n\n---\nCodeberg Actions".to_string(),
             date: "June 3".to_string(),
             read: true,
+            flagged: false,
             folder: "inbox".to_string(),
             uid: None,
             ts: None,
@@ -532,6 +541,7 @@ fn get_default_mock_emails() -> Vec<Email> {
             body: "Thanks for sending the palette! I am implementing the email client right now using these specifications. The three-pane layout feels very premium.\n\n- Lucas".to_string(),
             date: "Yesterday".to_string(),
             read: true,
+            flagged: false,
             folder: "sent".to_string(),
             uid: None,
             ts: None,
@@ -600,6 +610,7 @@ impl ClearEmailApp {
             body: mail.body.clone(),
             date: "Draft".to_string(),
             read: true,
+            flagged: false,
             folder: "drafts".to_string(),
             uid: None,
             ts: None,
@@ -1259,7 +1270,7 @@ impl ClearEmailApp {
         let Some(email) = self.emails.iter().find(|e| e.id == id) else {
             return false;
         };
-        let (read, folder, uid) = (email.read, email.folder.clone(), email.uid);
+        let (read, flagged, folder, uid) = (email.read, email.flagged, email.folder.clone(), email.uid);
         let restore_to = self.restore_plan(email).ok().map(|(_, label, _)| label);
 
         // No header row: the card the menu opened on is selected under it,
@@ -1295,6 +1306,7 @@ impl ClearEmailApp {
             }
             rows.push((delete_label.into(), Some(AppMessage::DeleteSelected)));
             rows.push(((if read { "Mark Unread" } else { "Mark Read" }).into(), Some(AppMessage::ToggleUnread)));
+            rows.push(((if flagged { "Unflag" } else { "Flag" }).into(), Some(AppMessage::ToggleFlag)));
         }
         let move_row = rows.iter().position(|(l, _)| l == "Move To");
         let (options, actions): (Vec<String>, Vec<Option<AppMessage>>) = rows.into_iter().unzip();
@@ -2050,6 +2062,28 @@ impl ClearEmailApp {
             .find(|f| f.tag.to_lowercase() == n || f.label.to_lowercase() == n)
     }
 
+    /// Flag or unflag one message, mirrored to the server for mail with a
+    /// server copy (its uid lives in its folder's mailbox). False when no
+    /// message has that id.
+    fn set_flagged(&mut self, id: usize, flagged: bool) -> bool {
+        let Some(email) = self.emails.iter().find(|e| e.id == id) else {
+            return false;
+        };
+        if email.flagged == flagged {
+            return true;
+        }
+        let push = email.uid.zip(self.mailbox_for(&email.folder));
+        self.emails_rev = self.emails_rev.wrapping_add(1);
+        if let Some(e) = self.emails.iter_mut().find(|e| e.id == id) {
+            e.flagged = flagged;
+        }
+        self.save_emails();
+        if let (Some((uid, mailbox)), Some(acc)) = (push, self.accounts.get(self.selected_account_idx)) {
+            set_flagged_on_server(acc.clone(), mailbox, uid, flagged, self.sender.clone());
+        }
+        true
+    }
+
     /// Set one message's read flag, mirrored to the server for inbox mail
     /// (only inbox uids are known to be the INBOX's). False when no message
     /// has that id.
@@ -2125,7 +2159,7 @@ impl ClearEmailApp {
             }
             Command::Accounts => ipc::render_accounts(&self.accounts, self.selected_account_idx, json),
             Command::Folders => ipc::render_folders(&self.folders, &self.emails, &self.current_folder, json),
-            Command::List { folder, limit, unread } => {
+            Command::List { folder, limit, unread, flagged } => {
                 let tag = match folder {
                     None => self.current_folder.clone(),
                     Some(name) => match self.folder_by_name(&name) {
@@ -2136,7 +2170,7 @@ impl ClearEmailApp {
                 let rows: Vec<&Email> = self
                     .emails
                     .iter()
-                    .filter(|e| e.folder == tag && (!unread || !e.read))
+                    .filter(|e| e.folder == tag && (!unread || !e.read) && (!flagged || e.flagged))
                     .take(limit)
                     .collect();
                 ipc::render_rows(&rows, json)
@@ -2177,6 +2211,14 @@ impl ClearEmailApp {
                 *needs_rebuild = true;
                 self.needs_rebuild = true;
                 ipc::ok(&format!("{id} marked {}", if read { "read" } else { "unread" }), json)
+            }
+            Command::Flag(id, flagged) => {
+                if !self.set_flagged(id, flagged) {
+                    return ipc::error(&format!("no message with id {id}"));
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+                ipc::ok(&format!("{id} {}", if flagged { "flagged" } else { "unflagged" }), json)
             }
             Command::Restore(id) => match self.restore_email(id) {
                 Ok(note) => {
@@ -2725,6 +2767,7 @@ impl Application for ClearEmailApp {
                             body: mail.body,
                             date: "Just now".to_string(),
                             read: true,
+                            flagged: false,
                             folder: "sent".to_string(),
                             uid: None,
                             ts: None,
@@ -2907,6 +2950,15 @@ impl Application for ClearEmailApp {
                     Err(e) => {
                         let what = if job.restore { "Restore" } else { "Move" };
                         self.status_message = Some(StatusToast::error(format!("{what} failed: {e}")));
+                    }
+                }
+                *needs_rebuild = true;
+                self.needs_rebuild = true;
+            }
+            AppMessage::ToggleFlag => {
+                if let Some(id) = self.selected_email_id {
+                    if let Some(flagged) = self.emails.iter().find(|e| e.id == id).map(|e| !e.flagged) {
+                        self.set_flagged(id, flagged);
                     }
                 }
                 *needs_rebuild = true;
@@ -3538,6 +3590,20 @@ impl Application for ClearEmailApp {
                         };
                         // Prims take linear colour; a glyph is tinted in sRGB.
                         quads.pc.icon("circle", dot, cce_ui::color::to_srgb(UNREAD_DOT));
+                    }
+                }
+                // Flagged: the `flag` glyph in amber in the same gutter, on
+                // the subject's line, under where the unread dot sits.
+                if email.flagged {
+                    if let Some(draw_y) = self.email_list.get_item_draw_y(idx, 0.0) {
+                        let side = 10.0;
+                        let mark = cce_ui::scene::layout::Rect {
+                            x: list_x + (pane_inner_pad() - side) / 2.0,
+                            y: draw_y + 26.0 - side / 2.0,
+                            width: side,
+                            height: side,
+                        };
+                        quads.pc.icon("flag", mark, cce_ui::color::to_srgb(FLAG_MARK));
                     }
                 }
             }
@@ -5153,6 +5219,7 @@ mod tests {
             body: String::new(),
             date: "today".to_string(),
             read,
+            flagged: false,
             folder: folder.to_string(),
             cc: String::new(),
             bcc: String::new(),
@@ -5169,6 +5236,8 @@ mod tests {
             fetched,
             server_uids: server,
             seen_uids: Vec::new(),
+            flag_window: Vec::new(),
+            flagged_uids: Vec::new(),
             remaining: 0,
         }
     }
@@ -5187,6 +5256,28 @@ mod tests {
         assert_eq!(out.len(), 2, "prior mail must survive the merge");
         assert!(out.iter().any(|e| e.subject == "old"));
         assert!(out.iter().any(|e| e.subject == "new"));
+    }
+
+    #[test]
+    fn flags_follow_the_server_inside_the_refreshed_window_only() {
+        let mut flagged_here = msg(1, Some(100), "inbox", "flagged here", true);
+        flagged_here.flagged = true;
+        let unflagged = msg(2, Some(101), "inbox", "flagged elsewhere", true);
+        let mut outside = msg(3, Some(50), "inbox", "older than the window", true);
+        outside.flagged = true;
+        let mut local = msg(4, None, "inbox", "kept only here", true);
+        local.flagged = true;
+        let mut f = folder_sync("inbox", Vec::new(), vec![50, 100, 101]);
+        // The pass read flags for 100 and 101: 101 is flagged on the server,
+        // 100 no longer is (unflagged on the phone).
+        f.flag_window = vec![100, 101];
+        f.flagged_uids = vec![101];
+        let out = merge_sync(vec![flagged_here, unflagged, outside, local], &[f]);
+        let flag = |subject: &str| out.iter().find(|e| e.subject == subject).unwrap().flagged;
+        assert!(!flag("flagged here"), "the server's unflag wins");
+        assert!(flag("flagged elsewhere"), "the server's flag arrives");
+        assert!(flag("older than the window"), "a uid whose flags were not read keeps its state");
+        assert!(flag("kept only here"), "local-only mail is not the server's business");
     }
 
     #[test]

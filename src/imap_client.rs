@@ -483,6 +483,11 @@ pub(crate) struct FolderSync {
     /// Of the recent window, the uids the server marks \Seen. Read state set
     /// on another client reaches already-cached mail through this.
     pub(crate) seen_uids: Vec<u32>,
+    /// The uids whose flags this pass read (the recent window), and of
+    /// those the ones marked \Flagged. Unlike read state the server's
+    /// answer wins both ways here, so a flag cleared on the phone clears.
+    pub(crate) flag_window: Vec<u32>,
+    pub(crate) flagged_uids: Vec<u32>,
     /// Still missing after this pass — drives the backfill continuation.
     pub(crate) remaining: usize,
 }
@@ -507,6 +512,7 @@ pub(crate) fn fetch_uid_batch(
     struct Pending {
         uid: u32,
         read: bool,
+        flagged: bool,
         from: String,
         to: String,
         subject: String,
@@ -530,6 +536,7 @@ pub(crate) fn fetch_uid_batch(
                     .flags()
                     .iter()
                     .any(|f| matches!(f, imap::types::Flag::Seen));
+                let flagged = fetch.flags().iter().any(|f| matches!(f, imap::types::Flag::Flagged));
                 let (from, to, subject, date, ts) = match fetch.header().and_then(|h| parser.parse(h)) {
                     Some(msg) => (
                         format_from(&msg),
@@ -549,6 +556,7 @@ pub(crate) fn fetch_uid_batch(
                 pending.push(Pending {
                     uid,
                     read,
+                    flagged,
                     from,
                     to,
                     subject,
@@ -636,6 +644,7 @@ pub(crate) fn fetch_uid_batch(
             date: p.date,
             ts: p.ts,
             read: p.read,
+            flagged: p.flagged,
             folder: folder_tag.to_string(),
             cc: String::new(),
             bcc: String::new(),
@@ -720,6 +729,8 @@ pub(crate) fn sync_folder(
     // Flags for the recent window of already-cached mail, so a message read
     // on another client stops showing as unread here. Cheap: no bodies.
     let mut seen_uids = Vec::new();
+    let mut flagged_uids = Vec::new();
+    let mut flag_window = Vec::new();
     let recent_known: Vec<u32> = {
         let mut v: Vec<u32> = server_uids.iter().copied().filter(|u| known.contains(u)).collect();
         let keep = v.len().min(FLAG_REFRESH_WINDOW);
@@ -731,8 +742,12 @@ pub(crate) fn sync_folder(
             Ok(fetches) => {
                 for fetch in fetches.iter() {
                     if let Some(uid) = fetch.uid {
+                        flag_window.push(uid);
                         if fetch.flags().iter().any(|f| matches!(f, imap::types::Flag::Seen)) {
                             seen_uids.push(uid);
+                        }
+                        if fetch.flags().iter().any(|f| matches!(f, imap::types::Flag::Flagged)) {
+                            flagged_uids.push(uid);
                         }
                     }
                 }
@@ -750,6 +765,8 @@ pub(crate) fn sync_folder(
             fetched,
             server_uids,
             seen_uids,
+            flag_window,
+            flagged_uids,
             remaining,
         },
         backlog,
@@ -1057,6 +1074,8 @@ pub(crate) fn merge_sync(prior: Vec<Email>, folders: &[FolderSync]) -> Vec<Email
     for f in folders {
         let server: HashSet<u32> = f.server_uids.iter().copied().collect();
         let seen: HashSet<u32> = f.seen_uids.iter().copied().collect();
+        let flag_window: HashSet<u32> = f.flag_window.iter().copied().collect();
+        let flagged: HashSet<u32> = f.flagged_uids.iter().copied().collect();
 
         // Deleted from another client. Scoped to this folder and to mail that
         // came from the server: locally-created rows (uid None) and anything
@@ -1084,6 +1103,12 @@ pub(crate) fn merge_sync(prior: Vec<Email>, folders: &[FolderSync]) -> Vec<Email
         for e in out.iter_mut() {
             if e.folder == f.folder && e.uid.is_some_and(|u| seen.contains(&u)) {
                 e.read = true;
+            }
+            // Flagged or not elsewhere: for the uids whose flags were read,
+            // the server's answer stands (a push made here has landed by the
+            // next pass; one that failed is undone rather than kept stale).
+            if let Some(u) = e.uid.filter(|u| e.folder == f.folder && flag_window.contains(u)) {
+                e.flagged = flagged.contains(&u);
             }
         }
 
@@ -1323,6 +1348,8 @@ pub(crate) fn sync_imap(
                         fetched,
                         server_uids: server_uids.clone(),
                         seen_uids: Vec::new(),
+                        flag_window: Vec::new(),
+                        flagged_uids: Vec::new(),
                         remaining: backlog.len(),
                     }],
                 ));
@@ -1938,5 +1965,37 @@ pub(crate) fn create_on_server(mut account: AccountInfo, name: String, sender: c
             let _ = sender.send(AppMessage::Status(format!("Created {name}")));
         }
         let _ = sender.send(AppMessage::SyncNow);
+    });
+}
+
+/// Push a message's flagged state to the server: `UID STORE ±FLAGS
+/// (\Flagged)` in `mailbox`, where `uid` lives. Best-effort like the seen
+/// push; a failure is reported in the status line, and the next sync's flag
+/// refresh brings the server's state back.
+pub(crate) fn set_flagged_on_server(
+    mut account: AccountInfo,
+    mailbox: String,
+    uid: u32,
+    flagged: bool,
+    sender: calloop::channel::Sender<AppMessage>,
+) {
+    std::thread::spawn(move || {
+        if is_mock_account(&account) {
+            return;
+        }
+        if !account.is_oauth && account.password.is_empty() {
+            eprintln!("cce-mail: flag push: no password (keyring locked or entry missing); not connecting");
+            return;
+        }
+        let Some(quoted) = quote_mailbox(&mailbox) else { return };
+        let Some(mut session) = open_imap_session(&mut account, &sender, false) else {
+            return;
+        };
+        let query = if flagged { "+FLAGS (\\Flagged)" } else { "-FLAGS (\\Flagged)" };
+        let pushed = session.select(&quoted).map(|_| ()).and_then(|()| session.uid_store(uid.to_string(), query).map(|_| ()));
+        session.release();
+        if let Err(e) = pushed {
+            let _ = sender.send(AppMessage::Status(format!("Could not {} it on the server: {e}", if flagged { "flag" } else { "unflag" })));
+        }
     });
 }

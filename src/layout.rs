@@ -86,6 +86,9 @@ pub(crate) fn pane_inner_pad() -> f32 {
 }
 /// The unread mark on a list row (the `circle` glyph), linear like a prim.
 pub(crate) const UNREAD_DOT: [f32; 4] = [0.20, 0.45, 0.85, 1.0];
+/// A flagged message's `flag` glyph on its card (linear): the warm amber
+/// mail clients give a flag, apart from the unread dot's blue.
+pub(crate) const FLAG_MARK: [f32; 4] = [0.95, 0.55, 0.10, 1.0];
 pub(crate) const LIST_W_DEFAULT: f32 = 300.0;
 pub(crate) const LIST_W_MIN: f32 = 180.0;
 /// The detail pane never gets squeezed below this by a drag or a narrow window.
