@@ -5,6 +5,7 @@ mod wpe;
 mod accounts_file;
 mod imap_client;
 mod layout;
+mod mcp;
 mod mime;
 mod smtp;
 mod store;
@@ -141,6 +142,8 @@ enum AppMessage {
     /// One line from the control socket (`cce-mail ctl …`), answered from
     /// the app's live state and written back on the request's own stream.
     Ipc(ipc::Request),
+    /// An MCP tool call (`mcp.rs`), answered over its own channel.
+    Mcp(cce_ui::mcp::McpToolCall),
     Quit,
     Status(String),
     /// A failure a user must not miss: shown as a sticky red toast (no
@@ -2273,6 +2276,7 @@ impl Application for ClearEmailApp {
         let _sender: calloop::channel::Sender<Self::Message> = _sender.into();
         cce_ui::scale::set_scale_factor(1.0);
         ipc::spawn_listener(_sender.clone());
+        mcp::start(_sender.clone());
 
         // The bar: the mail-icon app-menu button (its commands pop as a
         // context menu, see `open_mail_menu`) and two selection dropdowns
@@ -2955,6 +2959,7 @@ impl Application for ClearEmailApp {
                 let reply = self.handle_ipc(&req.line, needs_rebuild, exit);
                 req.respond(&reply);
             }
+            AppMessage::Mcp(call) => self.mcp_call(call, needs_rebuild, exit),
             AppMessage::Quit => {
                 *exit = true;
             }

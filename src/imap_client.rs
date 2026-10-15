@@ -1911,3 +1911,32 @@ pub(crate) fn set_seen_on_server(mut account: AccountInfo, uid: u32, seen: bool,
         session.release();
     });
 }
+
+/// Create a folder (a Gmail label) on the server, then sync so the folder
+/// list picks it up ([`AppMessage::SyncNow`]); a failure is shown in the
+/// status line. The mock account only syncs.
+pub(crate) fn create_on_server(mut account: AccountInfo, name: String, sender: calloop::channel::Sender<AppMessage>) {
+    std::thread::spawn(move || {
+        if !is_mock_account(&account) {
+            if !account.is_oauth && account.password.is_empty() {
+                let _ = sender.send(AppMessage::Status(format!("Could not create {name}: no password (keyring locked?)")));
+                return;
+            }
+            let Some(quoted) = quote_mailbox(&name) else {
+                let _ = sender.send(AppMessage::Status(format!("Could not create {name:?}: not a usable folder name")));
+                return;
+            };
+            let Some(mut session) = open_imap_session(&mut account, &sender, false) else {
+                return;
+            };
+            let created = session.create(&quoted);
+            session.release();
+            if let Err(e) = created {
+                let _ = sender.send(AppMessage::Status(format!("Could not create {name}: {e}")));
+                return;
+            }
+            let _ = sender.send(AppMessage::Status(format!("Created {name}")));
+        }
+        let _ = sender.send(AppMessage::SyncNow);
+    });
+}
