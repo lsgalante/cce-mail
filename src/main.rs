@@ -368,6 +368,9 @@ struct ClearEmailApp {
     /// The window bg behind the pane is opaque, so "sunk" here is fully
     /// hidden — an overlay bar that appears on scroll and idles away.
     body_sb_activity: cce_ui::widget::ScrollbarActivity,
+    /// Who the body (its text, or the HTML view) is to the scroll-gesture
+    /// rule, beside the list's own (`ScrollRegion::wheel_in`).
+    body_gesture_id: cce_ui::widget::WidgetId,
 
     // HTML mail view (feature `wpe`). The host boots at startup (cheap: no
     // WebKit processes until the first message renders); the fetched HTML is
@@ -2467,6 +2470,7 @@ impl Application for ClearEmailApp {
             body_sb_dragging: false,
             body_sb_drag_offset: 0.0,
             body_sb_activity: cce_ui::widget::ScrollbarActivity::new(),
+            body_gesture_id: cce_ui::widget::Widget::new().id(),
             #[cfg(feature = "wpe")]
             webview: wpe::MailWebView::new((800, 600)),
             seen_renderer: false,
@@ -4320,18 +4324,21 @@ impl Application for ClearEmailApp {
             }
         }
 
+        // The list and the body take part in the scroll-gesture rule: the
+        // one a gesture first moves keeps it, across the separator too, and
+        // the other stays put under it.
         let separator_x = self.split_geom().1;
-        if !self.compose_open
-            && px < separator_x
-                && self.email_list.wheel(delta, px, py) {
-                    changed = true;
-                }
+        if !self.compose_open && self.email_list.wheel_in(delta, px, py, &mut self.ui_context) {
+            changed = true;
+        }
 
         // Detail-pane body scroll — or, in the HTML view, the page's own
         // scrolling: the wheel goes to the engine (winit-signed device px,
         // the webview's convention) and WebKit moves the document.
+        let body = self.body_gesture_id;
         if !self.compose_open && self.selected_email_id.is_some()
-            && px > separator_x {
+            && self.ui_context.may_take_wheel(body)
+            && (px > separator_x || self.ui_context.owns_scroll_gesture(body)) {
                 #[cfg(feature = "wpe")]
                 let html_wheel = self.html_on_show() && self.in_webview(px, py);
                 #[cfg(not(feature = "wpe"))]
@@ -4348,6 +4355,8 @@ impl Application for ClearEmailApp {
                         };
                         let (wx, wy) = self.webview_px(px, py);
                         self.webview.wheel(dx, dy, wx, wy);
+                        // Whether the page moved is WebKit's to know.
+                        self.ui_context.claim_scroll_gesture(body);
                     }
                 } else {
                     let (_, body_h) = self.detail_body_geom();
@@ -4358,6 +4367,7 @@ impl Application for ClearEmailApp {
                     let moved = self.body_motion.apply(delta, (LINE_PX, LINE_PX), Bounds::max(0.0), Bounds::max(max));
                     self.body_scroll = self.body_motion.y.pos();
                     if moved {
+                        self.ui_context.claim_scroll_gesture(body);
                         // The scroll raises the bar in the same frame.
                         self.body_sb_activity.bump();
                         self.body_sb_activity.recompute(true, self.body_sb_dragging);
