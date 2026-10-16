@@ -1,4 +1,4 @@
-//! MCP tools, so an agent (the cce-claude popup) can read and sort mail in
+//! MCP tools, so an agent (the cce-code-agent popup) can read and sort mail in
 //! the running window. cce-ui's tools-only server, filed in its MCP
 //! registry; the OS picks the port unless `CCE_MAIL_MCP_PORT` names one (for
 //! a client configured by hand in `~/.claude.json`).
